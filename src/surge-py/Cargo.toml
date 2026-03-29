@@ -1,0 +1,38 @@
+[package]
+name = "surge-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Python bindings for the Surge power flow solver"
+publish = false
+
+[lib]
+name = "_surge"
+crate-type = ["cdylib"]
+
+[dependencies]
+surge-network.workspace = true
+surge-solution.workspace = true
+surge-dc.workspace = true
+surge-ac.workspace = true
+surge-io.workspace = true
+surge-contingency.workspace = true
+surge-opf.workspace = true
+surge-hvdc.workspace = true
+surge-topology.workspace = true
+surge-transfer.workspace = true
+
+faer.workspace = true
+num-complex.workspace = true
+pyo3 = { version = "0.28", features = ["extension-module", "multiple-pymethods"] }
+numpy = "0.28"
+chrono.workspace = true
+rayon.workspace = true
+serde_json.workspace = true
+zstd = "0.13"
+tracing.workspace = true
+tracing-subscriber.workspace = true

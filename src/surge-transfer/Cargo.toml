@@ -1,0 +1,33 @@
+[package]
+name = "surge-transfer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Surge Transfer — Transfer capability analysis (ATC/TTC/AFC, DFAX)"
+readme = "README.md"
+keywords = ["power-systems", "transfer", "atc", "ptdf", "lodf"]
+categories = ["science", "simulation", "algorithms"]
+
+[dependencies]
+surge-network.workspace = true
+surge-solution.workspace = true
+surge-dc.workspace = true
+surge-ac.workspace = true
+surge-opf.workspace = true
+surge-sparse.workspace = true
+faer.workspace = true
+rayon.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+surge-io.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+serde-value = "0.7"
+zstd = "0.13"

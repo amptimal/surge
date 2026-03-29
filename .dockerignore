@@ -1,0 +1,15 @@
+target/
+benchmarks/opf/.venv/
+benchmarks/opf/results/
+benchmarks/instances/
+data/
+*.db
+*.db-wal
+*.db-shm
+.git/
+.github/
+docs/
+research/
+vendor/
+*.md
+!src/

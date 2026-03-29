@@ -1,0 +1,35 @@
+[package]
+name = "surge-bindings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Surge CLI integration crate for the Surge power flow solver"
+keywords = ["power-systems", "cli", "power-flow", "solver"]
+categories = ["science", "simulation", "command-line-utilities"]
+publish = false
+
+[[bin]]
+name = "surge-solve"
+path = "src/main.rs"
+
+[dependencies]
+surge-network.workspace = true
+surge-solution.workspace = true
+surge-dc.workspace = true
+surge-ac.workspace = true
+surge-io.workspace = true
+surge-contingency.workspace = true
+surge-opf.workspace = true
+surge-hvdc.workspace = true
+surge-transfer.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zstd = "0.13"

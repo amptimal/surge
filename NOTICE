@@ -1,0 +1,63 @@
+Surge — AC/DC Power Flow Solver
+Copyright (C) 2026 Amptimal LLC
+
+This product may use software developed by third parties, including:
+
+--------------------------------------------------------------------------------
+faer (https://github.com/sarah-ek/faer-rs)
+Copyright (C) 2022-2024 Sarah El Kazdadi
+Licensed under the MIT License.
+
+--------------------------------------------------------------------------------
+HiGHS (https://github.com/ERGO-Code/HiGHS)
+Copyright (C) 2019-2024 The HiGHS Project Contributors
+Licensed under the MIT License.
+HiGHS is a high-performance linear and mixed-integer programming solver.
+
+--------------------------------------------------------------------------------
+Ipopt (https://github.com/coin-or/Ipopt)
+Copyright (C) 2004-2024 COIN-OR Foundation
+Licensed under the Eclipse Public License 2.0.
+Ipopt (Interior Point OPTimizer) is a software package for large-scale nonlinear optimization.
+
+--------------------------------------------------------------------------------
+SuiteSparse / KLU (https://github.com/DrTimothyAldenDavis/SuiteSparse)
+Copyright (C) 2004-2024 Timothy A. Davis
+Licensed under the GNU Lesser General Public License v2.1 or later.
+KLU is a sparse LU factorization algorithm for circuit simulation problems.
+
+--------------------------------------------------------------------------------
+rayon (https://github.com/rayon-rs/rayon)
+Copyright (C) 2010 The Rust Project Developers
+Licensed under the MIT License and Apache License, Version 2.0.
+
+--------------------------------------------------------------------------------
+Test Case Data
+
+Example network cases in examples/cases/ are derived from public reference
+datasets. No upstream source files are shipped verbatim; all cases are
+converted to Surge's native format. Per-case provenance is documented in
+each directory's PROVENANCE.md file.
+
+MATPOWER (https://github.com/MATPOWER/matpower)
+Copyright (C) 1996-2024 Power Systems Engineering Research Center (PSERC)
+Reference: R. D. Zimmerman, C. E. Murillo-Sanchez, and R. J. Thomas,
+"MATPOWER: Steady-State Operations, Planning, and Analysis Tools for Power
+Systems Research and Education," IEEE Transactions on Power Systems, vol. 26,
+no. 1, pp. 12-19, Feb. 2011.
+
+The following cases originate from the MATPOWER case library and are licensed
+under the Creative Commons Attribution 4.0 International License (CC-BY-4.0):
+case13659pegase, case6470rte, case6515rte, case9241pegase, case_ACTIVSg2000,
+case_ACTIVSg10k.
+
+The Polish system cases (case2383wp, case3120sp) originate from the MATPOWER
+case library. Case-specific rights come from the underlying data source as
+noted in each case's file header.
+
+Texas A&M Electric Grid Test Case Repository
+(https://electricgrids.engr.tamu.edu)
+The following cases are sourced from the Texas A&M repository, which states
+that its test cases are free for commercial or non-commercial use: case9,
+case14, case30, case57, case118, case300. These cases share common lineage
+with the corresponding MATPOWER case files.

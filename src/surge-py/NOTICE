@@ -1,0 +1,32 @@
+Surge - AC/DC Power Flow Solver
+Copyright (C) 2026 Amptimal LLC
+
+This product may use software developed by third parties, including:
+
+--------------------------------------------------------------------------------
+faer (https://github.com/sarah-ek/faer-rs)
+Copyright (C) 2022-2024 Sarah El Kazdadi
+Licensed under the MIT License.
+
+--------------------------------------------------------------------------------
+HiGHS (https://github.com/ERGO-Code/HiGHS)
+Copyright (C) 2019-2024 The HiGHS Project Contributors
+Licensed under the MIT License.
+HiGHS is a high-performance linear and mixed-integer programming solver.
+
+--------------------------------------------------------------------------------
+Ipopt (https://github.com/coin-or/Ipopt)
+Copyright (C) 2004-2024 COIN-OR Foundation
+Licensed under the Eclipse Public License 2.0.
+Ipopt (Interior Point OPTimizer) is a software package for large-scale nonlinear optimization.
+
+--------------------------------------------------------------------------------
+SuiteSparse / KLU (https://github.com/DrTimothyAldenDavis/SuiteSparse)
+Copyright (C) 2004-2024 Timothy A. Davis
+Licensed under the GNU Lesser General Public License v2.1 or later.
+KLU is a sparse LU factorization algorithm for circuit simulation problems.
+
+--------------------------------------------------------------------------------
+rayon (https://github.com/rayon-rs/rayon)
+Copyright (C) 2010 The Rust Project Developers
+Licensed under the MIT License and Apache License, Version 2.0.

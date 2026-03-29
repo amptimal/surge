@@ -1,0 +1,24 @@
+[package]
+name = "surge-solution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Surge solution types — shared power flow and OPF result contracts"
+readme = "README.md"
+keywords = ["power-systems", "power-flow", "opf", "results"]
+categories = ["science", "simulation"]
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+surge-network.workspace = true
+
+[dev-dependencies]
+surge-dc.workspace = true
+serde_json.workspace = true
+serde-value = "0.7"
+zstd = "0.13"

@@ -1,0 +1,29 @@
+[package]
+name = "surge-dc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Surge DC — DC power flow solver (linear approximation, B-theta formulation)"
+readme = "README.md"
+keywords = ["power-systems", "dc-power-flow", "ptdf", "lodf"]
+categories = ["science", "simulation", "algorithms"]
+
+[dependencies]
+surge-network.workspace = true
+surge-solution.workspace = true
+surge-topology.workspace = true
+surge-sparse.workspace = true
+faer.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+surge-io.workspace = true
+serde_json.workspace = true
+serde-value = "0.7"
+zstd = "0.13"

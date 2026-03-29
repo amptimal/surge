@@ -1,0 +1,37 @@
+[package]
+name = "surge-contingency"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Surge Contingency — Parallel N-1 contingency analysis with LODF screening"
+readme = "README.md"
+keywords = ["power-systems", "contingency", "n-1", "screening"]
+categories = ["science", "simulation", "algorithms"]
+
+[dependencies]
+surge-network.workspace = true
+surge-solution.workspace = true
+surge-dc.workspace = true
+surge-ac.workspace = true
+surge-sparse.workspace = true
+surge-hvdc.workspace = true
+surge-opf.workspace = true
+faer.workspace = true
+surge-topology.workspace = true
+rayon.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+num-complex.workspace = true
+
+[dev-dependencies]
+surge-io.workspace = true
+anyhow.workspace = true
+
+[[example]]
+name = "contingency_screening"

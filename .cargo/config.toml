@@ -1,0 +1,8 @@
+# Workspace-level Cargo config is intentionally kept portable.
+#
+# Put machine-local settings in your shell environment instead of this file,
+# for example:
+#   CARGO_TARGET_DIR
+#   RUSTFLAGS
+#   HIGHS_LIB_DIR
+#   GUROBI_HOME / COPT_HOME / IPOPT_LIB_DIR / CPLEX_STUDIO_HOME

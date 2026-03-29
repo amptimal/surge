@@ -1,0 +1,29 @@
+[package]
+name = "surge-hvdc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "HVDC power flow: LCC and VSC converters, multi-terminal DC (MTDC)"
+readme = "README.md"
+keywords = ["power-systems", "hvdc", "ac-dc", "mtdc"]
+categories = ["science", "simulation", "algorithms"]
+
+[dependencies]
+surge-network = { workspace = true }
+surge-solution = { workspace = true }
+surge-ac = { workspace = true }
+surge-sparse = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+num-complex.workspace = true
+faer = { workspace = true }
+
+[dev-dependencies]
+surge-io = { workspace = true }
+serde_json = { workspace = true }
+num-complex = { workspace = true }

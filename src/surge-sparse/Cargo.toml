@@ -1,0 +1,22 @@
+[package]
+name = "surge-sparse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Sparse matrix infrastructure: KLU solver, COO-to-CSC conversion, complex sparse utilities"
+readme = "README.md"
+keywords = ["sparse", "linear-algebra", "power-systems"]
+categories = ["algorithms", "mathematics", "science"]
+
+[features]
+default = ["faer"]
+faer = ["dep:faer"]
+
+[dependencies]
+num-complex = { workspace = true }
+faer = { workspace = true, optional = true }
+thiserror = { workspace = true }
