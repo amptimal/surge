@@ -1,0 +1,42 @@
+[package]
+name = "surge-opf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Surge OPF — Optimal Power Flow solvers (DC-OPF, AC-OPF, SCOPF)"
+readme = "README.md"
+keywords = ["power-systems", "opf", "ac-opf", "dc-opf", "scopf"]
+categories = ["science", "simulation", "mathematics"]
+
+[dependencies]
+surge-network.workspace = true
+surge-solution.workspace = true
+surge-dc.workspace = true
+surge-ac.workspace = true
+surge-sparse.workspace = true
+surge-hvdc.workspace = true
+faer.workspace = true
+rayon.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+num-complex.workspace = true
+serde.workspace = true
+libloading.workspace = true
+clarabel.workspace = true
+
+[dev-dependencies]
+surge-io.workspace = true
+surge-ac.workspace = true
+serde_json.workspace = true
+
+[[example]]
+name = "dc_opf"
+
+[[test]]
+name = "opf_slow"
+path = "tests/opf_slow.rs"

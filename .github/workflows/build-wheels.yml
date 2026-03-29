@@ -1,0 +1,552 @@
+name: Build Wheels
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      artifact_profile:
+        description: "Which artifact profile to build"
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - public
+          - targeted
+      platforms:
+        description: "Which platforms to build (default: all)"
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - linux-x86_64
+          - linux-aarch64
+          - macos-aarch64
+          - windows-x86_64
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  COPT_VERSION: "8.0.3"
+  COPT_LINUX_X86_64_URL: "https://pub.shanshu.ai/download/copt/8.0.3/linux64/CardinalOptimizer-8.0.3-lnx64.tar.gz"
+  COPT_LINUX_AARCH64_URL: "https://pub.shanshu.ai/download/copt/8.0.3/aarch64/CardinalOptimizer-8.0.3-aarch64_lnx.tar.gz"
+  COPT_MACOS_URL: "https://pub.shanshu.ai/download/copt/8.0.3/osx64/CardinalOptimizer-8.0.3-universal_mac.tar.gz"
+  COPT_WINDOWS_URL: "https://pub.shanshu.ai/download/copt/8.0.3/win64/CardinalOptimizer-8.0.3-win64.zip"
+
+jobs:
+  public-linux-x86_64:
+    name: Public Linux x86_64
+    if: github.event_name == 'push' || ((inputs.artifact_profile == 'all' || inputs.artifact_profile == 'public') && (inputs.platforms == 'all' || inputs.platforms == 'linux-x86_64'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build generic wheels (manylinux)
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64
+          args: >-
+            --release
+            --out dist
+            --find-interpreter
+          manylinux: 2_28
+          working-directory: src/surge-py
+          before-script-linux: |
+            git config --global --add safe.directory '*'
+            dnf install -y epel-release || true
+            dnf install -y suitesparse-devel clang-devel glibc-devel curl tar || true
+            CLANG_LIB=$(find /usr/lib64 /usr/lib -maxdepth 4 -name 'libclang.so*' 2>/dev/null | head -1)
+            if [ -n "$CLANG_LIB" ]; then export LIBCLANG_PATH="$(dirname "$CLANG_LIB")"; fi
+            echo "LIBCLANG_PATH=$LIBCLANG_PATH"
+            rm -rf /opt/copt80 /tmp/copt-extract /tmp/copt.tar.gz
+            curl -fsSL "${{ env.COPT_LINUX_X86_64_URL }}" -o /tmp/copt.tar.gz
+            mkdir -p /tmp/copt-extract
+            tar -xzf /tmp/copt.tar.gz -C /tmp/copt-extract
+            COPT_FOUND=$(find /tmp/copt-extract -type d -path '*/include/coptcpp_inc' | head -1)
+            if [ -z "$COPT_FOUND" ]; then
+              echo "Could not locate extracted COPT headers" >&2
+              exit 1
+            fi
+            COPT_FOUND=$(dirname "$(dirname "$COPT_FOUND")")
+            mv "$COPT_FOUND" /opt/copt80
+            export COPT_HOME=/opt/copt80
+            export SURGE_PY_REQUIRE_COPT_NLP_SHIM=1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify wheel legal metadata and packaged shim
+        run: |
+          python3 scripts/check_wheel_legal_files.py \
+            --require-member surge/libsurge_copt_nlp.so \
+            src/surge-py/dist/*.whl
+
+      - name: Verify wheel has no hard optional-solver linkage
+        run: |
+          python3 scripts/check_optional_solver_linkage.py src/surge-py/dist/*.whl
+
+      - name: Smoke test
+        run: |
+          pip install numpy
+          pip install --no-index --find-links src/surge-py/dist/ surge_py
+          python - <<'EOF'
+          import surge
+          v = surge.version()
+          print(f"surge version: {v}")
+          assert isinstance(v, str) and len(v) > 0
+
+          net = surge.load("examples/cases/case9/case9.surge.json.zst")
+          print(f"Loaded: {net}")
+          assert net.n_buses > 0 and net.n_branches > 0
+
+          sol = surge.solve_dc_pf(net)
+          print(f"DC PF: slack={sol.slack_p_mw:.4f} MW, branches={len(sol.branch_p_mw)}")
+          assert abs(sol.slack_p_mw) < 1000.0
+          print("Smoke test PASSED")
+          EOF
+
+      - name: Upload public wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-public-linux-x86_64
+          path: src/surge-py/dist/*.whl
+          retention-days: 7
+
+  targeted-linux-x86_64-v4:
+    name: Targeted Linux x86_64 v4
+    if: (inputs.artifact_profile == 'all' || inputs.artifact_profile == 'targeted') && (inputs.platforms == 'all' || inputs.platforms == 'linux-x86_64')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build targeted wheels (manylinux)
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64
+          args: >-
+            --release
+            --out dist
+            --find-interpreter
+          manylinux: 2_28
+          working-directory: src/surge-py
+          before-script-linux: |
+            git config --global --add safe.directory '*'
+            dnf install -y epel-release || true
+            dnf install -y suitesparse-devel clang-devel glibc-devel curl tar || true
+            CLANG_LIB=$(find /usr/lib64 /usr/lib -maxdepth 4 -name 'libclang.so*' 2>/dev/null | head -1)
+            if [ -n "$CLANG_LIB" ]; then export LIBCLANG_PATH="$(dirname "$CLANG_LIB")"; fi
+            echo "LIBCLANG_PATH=$LIBCLANG_PATH"
+            rm -rf /opt/copt80 /tmp/copt-extract /tmp/copt.tar.gz
+            curl -fsSL "${{ env.COPT_LINUX_X86_64_URL }}" -o /tmp/copt.tar.gz
+            mkdir -p /tmp/copt-extract
+            tar -xzf /tmp/copt.tar.gz -C /tmp/copt-extract
+            COPT_FOUND=$(find /tmp/copt-extract -type d -path '*/include/coptcpp_inc' | head -1)
+            if [ -z "$COPT_FOUND" ]; then
+              echo "Could not locate extracted COPT headers" >&2
+              exit 1
+            fi
+            COPT_FOUND=$(dirname "$(dirname "$COPT_FOUND")")
+            mv "$COPT_FOUND" /opt/copt80
+            export COPT_HOME=/opt/copt80
+            export SURGE_PY_REQUIRE_COPT_NLP_SHIM=1
+        env:
+          RUSTFLAGS: "-C target-cpu=x86-64-v4"
+
+      - name: Verify wheel legal metadata and packaged shim
+        run: |
+          python3 scripts/check_wheel_legal_files.py \
+            --require-member surge/libsurge_copt_nlp.so \
+            src/surge-py/dist/*.whl
+
+      - name: Verify wheel has no hard optional-solver linkage
+        run: |
+          python3 scripts/check_optional_solver_linkage.py src/surge-py/dist/*.whl
+
+      - name: Upload targeted wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-targeted-linux-x86_64-v4
+          path: src/surge-py/dist/*.whl
+          retention-days: 7
+
+  public-linux-aarch64:
+    name: Public Linux aarch64
+    if: github.event_name == 'push' || ((inputs.artifact_profile == 'all' || inputs.artifact_profile == 'public') && (inputs.platforms == 'all' || inputs.platforms == 'linux-aarch64'))
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build generic wheels (manylinux aarch64)
+        uses: PyO3/maturin-action@v1
+        with:
+          target: aarch64
+          args: >-
+            --release
+            --out dist
+            --find-interpreter
+          manylinux: 2_28
+          working-directory: src/surge-py
+          before-script-linux: |
+            git config --global --add safe.directory '*'
+            dnf install -y epel-release || true
+            dnf install -y suitesparse-devel clang-devel glibc-devel curl tar || true
+            CLANG_LIB=$(find /usr/lib64 /usr/lib -maxdepth 4 -name 'libclang.so*' 2>/dev/null | head -1)
+            if [ -n "$CLANG_LIB" ]; then export LIBCLANG_PATH="$(dirname "$CLANG_LIB")"; fi
+            echo "LIBCLANG_PATH=$LIBCLANG_PATH"
+            rm -rf /opt/copt80 /tmp/copt-extract /tmp/copt.tar.gz
+            curl -fsSL "${{ env.COPT_LINUX_AARCH64_URL }}" -o /tmp/copt.tar.gz
+            mkdir -p /tmp/copt-extract
+            tar -xzf /tmp/copt.tar.gz -C /tmp/copt-extract
+            COPT_FOUND=$(find /tmp/copt-extract -type d -path '*/include/coptcpp_inc' | head -1)
+            if [ -z "$COPT_FOUND" ]; then
+              echo "Could not locate extracted COPT headers" >&2
+              exit 1
+            fi
+            COPT_FOUND=$(dirname "$(dirname "$COPT_FOUND")")
+            mv "$COPT_FOUND" /opt/copt80
+            export COPT_HOME=/opt/copt80
+            export SURGE_PY_REQUIRE_COPT_NLP_SHIM=1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify wheel legal metadata and packaged shim
+        run: |
+          python3 scripts/check_wheel_legal_files.py \
+            --require-member surge/libsurge_copt_nlp.so \
+            src/surge-py/dist/*.whl
+
+      - name: Verify wheel has no hard optional-solver linkage
+        run: |
+          python3 scripts/check_optional_solver_linkage.py src/surge-py/dist/*.whl
+
+      - name: Smoke test
+        run: |
+          pip install numpy
+          pip install --no-index --find-links src/surge-py/dist/ surge_py
+          python - <<'EOF'
+          import surge
+          v = surge.version()
+          print(f"surge version: {v}")
+          assert isinstance(v, str) and len(v) > 0
+
+          net = surge.load("examples/cases/case9/case9.surge.json.zst")
+          print(f"Loaded: {net}")
+          assert net.n_buses > 0 and net.n_branches > 0
+
+          sol = surge.solve_dc_pf(net)
+          print(f"DC PF: slack={sol.slack_p_mw:.4f} MW, branches={len(sol.branch_p_mw)}")
+          assert abs(sol.slack_p_mw) < 1000.0
+          print("Smoke test PASSED")
+          EOF
+
+      - name: Upload public wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-public-linux-aarch64
+          path: src/surge-py/dist/*.whl
+          retention-days: 7
+
+  public-macos-aarch64:
+    name: Public macOS aarch64 (Python ${{ matrix.python-version }})
+    if: github.event_name == 'push' || ((inputs.artifact_profile == 'all' || inputs.artifact_profile == 'public') && (inputs.platforms == 'all' || inputs.platforms == 'macos-aarch64'))
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: brew install suite-sparse
+
+      - name: Set up Python ${{ matrix.python-version }}
+        id: setup-python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install pinned COPT package
+        id: setup-copt
+        run: |
+          "${{ steps.setup-python.outputs.python-path }}" scripts/install_copt_ci.py \
+            --url "${COPT_MACOS_URL}" \
+            --dest-root "${RUNNER_TEMP}/copt-macos" >> "${GITHUB_OUTPUT}"
+
+      - name: Build generic wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: aarch64
+          args: >-
+            --release
+            --out dist
+            --interpreter ${{ steps.setup-python.outputs.python-path }}
+          working-directory: src/surge-py
+        env:
+          COPT_HOME: ${{ steps.setup-copt.outputs.copt_home }}
+          PKG_CONFIG_PATH: /opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/suite-sparse/lib/pkgconfig
+          SURGE_PY_REQUIRE_COPT_NLP_SHIM: "1"
+
+      - name: Verify wheel legal metadata and packaged shim
+        run: |
+          python3 scripts/check_wheel_legal_files.py \
+            --require-member surge/libsurge_copt_nlp.dylib \
+            src/surge-py/dist/*.whl
+
+      - name: Verify wheel has no hard optional-solver linkage
+        run: |
+          python3 scripts/check_optional_solver_linkage.py src/surge-py/dist/*.whl
+
+      - name: Smoke test
+        run: |
+          pip install numpy
+          pip install --no-index --find-links src/surge-py/dist/ surge_py
+          python - <<'EOF'
+          import surge
+          v = surge.version()
+          print(f"surge version: {v}")
+          assert isinstance(v, str) and len(v) > 0
+
+          net = surge.load("examples/cases/case9/case9.surge.json.zst")
+          print(f"Loaded: {net}")
+          assert net.n_buses > 0 and net.n_branches > 0
+
+          sol = surge.solve_dc_pf(net)
+          print(f"DC PF: slack={sol.slack_p_mw:.4f} MW, branches={len(sol.branch_p_mw)}")
+          assert abs(sol.slack_p_mw) < 1000.0
+          print("Smoke test PASSED")
+          EOF
+
+      - name: Upload public wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-public-macos-aarch64-py${{ matrix.python-version }}
+          path: src/surge-py/dist/*.whl
+          retention-days: 7
+
+  public-windows-x86_64:
+    name: Public Windows x86_64 (Python ${{ matrix.python-version }})
+    if: github.event_name == 'push' || ((inputs.artifact_profile == 'all' || inputs.artifact_profile == 'public') && (inputs.platforms == 'all' || inputs.platforms == 'windows-x86_64'))
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Export vcpkg binary-cache env vars
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Install vcpkg dependencies (KLU only — not full SuiteSparse)
+        run: vcpkg install suitesparse-klu:x64-windows-static
+        env:
+          VCPKG_DEFAULT_TRIPLET: x64-windows-static
+          VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        id: setup-python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install pinned COPT package
+        id: setup-copt
+        shell: pwsh
+        run: |
+          & "${{ steps.setup-python.outputs.python-path }}" scripts/install_copt_ci.py `
+            --url "${env:COPT_WINDOWS_URL}" `
+            --dest-root "${env:RUNNER_TEMP}\copt-win" >> $env:GITHUB_OUTPUT
+
+      - name: Build generic wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x64
+          args: >-
+            --release
+            --out dist
+            --interpreter ${{ steps.setup-python.outputs.python-path }}
+          working-directory: src/surge-py
+        env:
+          COPT_HOME: ${{ steps.setup-copt.outputs.copt_home }}
+          SURGE_PY_REQUIRE_COPT_NLP_SHIM: "1"
+          VCPKG_ROOT: C:\vcpkg
+          SUITESPARSE_INCLUDE_DIR: C:\vcpkg\installed\x64-windows-static\include
+          SUITESPARSE_LIB_DIR: C:\vcpkg\installed\x64-windows-static\lib
+
+      - name: Verify wheel legal metadata and packaged shim
+        shell: bash
+        run: |
+          python scripts/check_wheel_legal_files.py \
+            --require-member surge/surge_copt_nlp.dll \
+            src/surge-py/dist/*.whl
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          pip install numpy
+          pip install --no-index --find-links src/surge-py/dist/ surge_py
+          python - <<'EOF'
+          import surge
+          v = surge.version()
+          print(f"surge version: {v}")
+          assert isinstance(v, str) and len(v) > 0
+
+          net = surge.load("examples/cases/case9/case9.surge.json.zst")
+          print(f"Loaded: {net}")
+          assert net.n_buses > 0 and net.n_branches > 0
+
+          sol = surge.solve_dc_pf(net)
+          print(f"DC PF: slack={sol.slack_p_mw:.4f} MW, branches={len(sol.branch_p_mw)}")
+          assert abs(sol.slack_p_mw) < 1000.0
+          print("Smoke test PASSED")
+          EOF
+
+      - name: Upload public wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-public-windows-x86_64-py${{ matrix.python-version }}
+          path: src/surge-py/dist/*.whl
+          retention-days: 7
+
+  targeted-windows-x86_64-v4:
+    name: Targeted Windows x86_64 v4 (Python ${{ matrix.python-version }})
+    if: (inputs.artifact_profile == 'all' || inputs.artifact_profile == 'targeted') && (inputs.platforms == 'all' || inputs.platforms == 'windows-x86_64')
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Export vcpkg binary-cache env vars
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Install vcpkg dependencies (KLU only — not full SuiteSparse)
+        run: vcpkg install suitesparse-klu:x64-windows-static
+        env:
+          VCPKG_DEFAULT_TRIPLET: x64-windows-static
+          VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        id: setup-python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install pinned COPT package
+        id: setup-copt
+        shell: pwsh
+        run: |
+          & "${{ steps.setup-python.outputs.python-path }}" scripts/install_copt_ci.py `
+            --url "${env:COPT_WINDOWS_URL}" `
+            --dest-root "${env:RUNNER_TEMP}\copt-win-v4" >> $env:GITHUB_OUTPUT
+
+      - name: Build targeted wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x64
+          args: >-
+            --release
+            --out dist
+            --interpreter ${{ steps.setup-python.outputs.python-path }}
+          working-directory: src/surge-py
+        env:
+          COPT_HOME: ${{ steps.setup-copt.outputs.copt_home }}
+          SURGE_PY_REQUIRE_COPT_NLP_SHIM: "1"
+          VCPKG_ROOT: C:\vcpkg
+          SUITESPARSE_INCLUDE_DIR: C:\vcpkg\installed\x64-windows-static\include
+          SUITESPARSE_LIB_DIR: C:\vcpkg\installed\x64-windows-static\lib
+          RUSTFLAGS: "-C target-cpu=x86-64-v4"
+
+      - name: Verify wheel legal metadata and packaged shim
+        shell: bash
+        run: |
+          python scripts/check_wheel_legal_files.py \
+            --require-member surge/surge_copt_nlp.dll \
+            src/surge-py/dist/*.whl
+
+      - name: Upload targeted wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-targeted-windows-x86_64-v4-py${{ matrix.python-version }}
+          path: src/surge-py/dist/*.whl
+          retention-days: 7
+
+  collect-wheels:
+    name: Collect all wheels
+    needs:
+      - public-linux-x86_64
+      - targeted-linux-x86_64-v4
+      - public-linux-aarch64
+      - public-macos-aarch64
+      - public-windows-x86_64
+      - targeted-windows-x86_64-v4
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist/
+
+      - name: List built wheels
+        run: ls -lh dist/
+
+      - name: Verify wheel legal metadata
+        run: python3 scripts/check_wheel_legal_files.py dist/*.whl
+
+      - name: Upload combined wheel archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-all
+          path: dist/*.whl
+          retention-days: 7
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [collect-wheels]
+    if: >-
+      !failure() && !cancelled()
+      && needs.collect-wheels.result == 'success'
+      && github.event_name == 'push'
+      && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+    steps:
+      - name: Download public wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-public-*
+          merge-multiple: true
+          path: dist/
+
+      - name: List wheels to publish
+        run: ls -lh dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

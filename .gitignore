@@ -1,0 +1,72 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+**/dist/
+/build/
+.eggs/
+venv/
+.venv/
+*.egg
+
+# CUDA
+*.o
+*.so
+*.dylib
+*.cu.o
+
+# Benchmark suite lives in amptimal/surge-bench (not in this repo)
+/benchmarks/
+/pyproject.toml
+
+# Test data lives in amptimal/surge-bench (copy instances/ -> tests/data/ to run tests)
+/tests/data
+/docs/notebooks/execution_report.json
+
+# Build artifacts
+vendor/*/build/
+/vendor/highs-sys/HiGHS
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# AI assistant context files
+.claude/
+CLAUDE.md
+AGENTS.md
+agents.md
+.cursorrules
+.cursor/
+.github/copilot-instructions.md
+.windsurf/
+.aider*
+.continue/
+
+# OS
+.DS_Store
+Thumbs.db
+*.dSYM/
+
+# Environment
+.env
+.env.local
+
+# Solver logs
+*.log
+
+# Stray data files (OpenDSS exports, license temp files, etc.)
+*.dbl
+*.dat
+*.csv
+license.key
+
+# Test case data (downloaded, large)
+research/test-cases/data/

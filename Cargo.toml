@@ -1,0 +1,102 @@
+[workspace]
+resolver = "2"
+members = [
+    # Core solver infrastructure
+    "src/surge-network",
+    "src/surge-solution",
+    "src/surge-sparse",
+    "src/surge-io",
+    "src/surge-topology",
+    # Power flow
+    "src/surge-dc",
+    "src/surge-ac",
+    "src/surge-hvdc",
+    # Analysis
+    "src/surge-contingency",
+    "src/surge-opf",
+    "src/surge-transfer",
+    # Entry points
+    "src/surge-bindings",
+    "src/surge-py",
+]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+license = "PolyForm-Noncommercial-1.0.0"
+license-file = "LICENSE"
+authors = ["Amptimal LLC"]
+description = "Project Surge — AC/DC power flow solver for large-scale transmission networks"
+homepage = "https://amptimal.com/surge"
+repository = "https://github.com/amptimal/surge"
+
+[workspace.dependencies]
+# Sparse linear algebra
+faer = "0.22"
+dyn-stack = "0.13"
+
+# Data structures and parallelism
+ndarray = "0.16"
+rayon = "1.10"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging & tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Testing & benchmarking
+criterion = "0.5"
+
+# Numerical
+num-complex = { version = "0.4", features = ["serde"] }
+
+# CSV parsing
+csv = "1"
+
+# TOML parsing (for USRMDL DSL model definitions)
+toml = "0.8"
+
+# Dynamic library loading (for USRMDL plugins)
+libloading = "0.8"
+
+# Optimization solvers
+clarabel = "0.11"
+
+# Workspace member cross-refs
+surge-network = { path = "src/surge-network", version = "0.1.0" }
+surge-solution = { path = "src/surge-solution", version = "0.1.0" }
+surge-sparse = { path = "src/surge-sparse", version = "0.1.0" }
+surge-io = { path = "src/surge-io", version = "0.1.0" }
+surge-topology = { path = "src/surge-topology", version = "0.1.0" }
+surge-dc = { path = "src/surge-dc", version = "0.1.0" }
+surge-ac = { path = "src/surge-ac", version = "0.1.0" }
+surge-hvdc = { path = "src/surge-hvdc", version = "0.1.0" }
+surge-contingency = { path = "src/surge-contingency", version = "0.1.0" }
+surge-opf = { path = "src/surge-opf", version = "0.1.0" }
+surge-transfer = { path = "src/surge-transfer", version = "0.1.0" }
+surge-bindings = { path = "src/surge-bindings", version = "0.1.0" }
+surge-py = { path = "src/surge-py", version = "0.1.0" }
+
+[profile.bench]
+inherits = "release"
+debug = true

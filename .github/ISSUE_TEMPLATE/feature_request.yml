@@ -1,0 +1,21 @@
+name: Feature Request
+description: Suggest a new solver feature or capability
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What use case or limitation drives this request?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: How you'd like this to work
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority for your use case
+      options: ["Nice to have", "Important", "Blocking my work"]

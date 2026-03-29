@@ -1,0 +1,186 @@
+name: CI
+
+on:
+  workflow_dispatch:  # manual trigger only — CI disabled during active development
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  COPT_VERSION: "8.0.3"
+  COPT_LINUX_X86_64_URL: "https://pub.shanshu.ai/download/copt/8.0.3/linux64/CardinalOptimizer-8.0.3-lnx64.tar.gz"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Rust checks: test, clippy, fmt
+  # ---------------------------------------------------------------------------
+  rust:
+    name: Rust (test + clippy + fmt)
+    runs-on: ubuntu-latest
+    container: ghcr.io/amptimal/surge-builder:latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+      # HiGHS is pre-built in the surge-builder image (HIGHS_PREBUILT_DIR=/opt/highs).
+      # No source clone needed — highs-sys build.rs uses the installed static lib.
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --exclude surge-py
+        env:
+          RUST_LOG: warn
+
+  # ---------------------------------------------------------------------------
+  # Dependency audit
+  # ---------------------------------------------------------------------------
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Run audit
+        run: cargo audit
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: Run license policy
+        run: cargo deny check licenses
+
+      - name: Verify bundled case provenance
+        run: python3 scripts/check_case_provenance.py examples/cases
+
+  # ---------------------------------------------------------------------------
+  # Python smoke test: build wheel from source, install, verify import
+  # ---------------------------------------------------------------------------
+  python-smoke:
+    name: Python smoke test (surge wheel)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libsuitesparse-dev libipopt-dev
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install pinned COPT package
+        id: setup-copt
+        run: |
+          python scripts/install_copt_ci.py \
+            --url "${COPT_LINUX_X86_64_URL}" \
+            --dest-root "${RUNNER_TEMP}/copt-linux" >> "${GITHUB_OUTPUT}"
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/
+          key: ${{ runner.os }}-cargo-py${{ matrix.python-version }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Install maturin
+        run: pip install "maturin>=1.0,<2.0"
+
+      - name: Build wheel
+        run: |
+          cd src/surge-py
+          maturin build --release --out dist
+        env:
+          COPT_HOME: ${{ steps.setup-copt.outputs.copt_home }}
+          MATURIN_PEP517_ARGS: --release
+          SURGE_PY_REQUIRE_COPT_NLP_SHIM: "1"
+
+      - name: Verify wheel legal metadata and packaged shim
+        run: |
+          python3 scripts/check_wheel_legal_files.py \
+            --require-member surge/libsurge_copt_nlp.so \
+            src/surge-py/dist/*.whl
+
+      - name: Verify wheel has no hard optional-solver linkage
+        run: |
+          python scripts/check_optional_solver_linkage.py src/surge-py/dist/*.whl
+
+      - name: Install wheel
+        run: |
+          pip install numpy
+          pip install src/surge-py/dist/*.whl
+
+      - name: Smoke test — import and version()
+        run: |
+          python - <<'EOF'
+          import surge
+          v = surge.version()
+          print(f"surge version: {v}")
+          assert isinstance(v, str) and len(v) > 0, f"Expected non-empty version string, got: {v!r}"
+          print("Smoke test PASSED")
+          EOF
+
+      - name: Smoke test — load case9 and run DC power flow
+        run: |
+          python - <<'EOF'
+          import surge, os, sys
+
+          # Locate a test case shipped with this repository.
+          candidates = [
+              "examples/cases/case9/case9.surge.json.zst",
+          ]
+          case_path = next((p for p in candidates if os.path.exists(p)), None)
+          if case_path is None:
+              raise SystemExit("No repo-owned test case found for Python smoke test")
+
+          net = surge.load(case_path)
+          print(f"Loaded: {net}")
+          assert net.n_buses > 0
+          assert net.n_branches > 0
+
+          sol = surge.solve_dc_pf(net)
+          print(
+              f"DC PF: slack={sol.slack_p_mw:.4f} MW, branches={len(sol.branch_p_mw)}"
+          )
+          assert abs(sol.slack_p_mw) < 1000.0, (
+              f"Unexpectedly large slack: {sol.slack_p_mw}"
+          )
+          print("Network smoke test PASSED")
+          EOF
+
+      - name: Run pytest suite
+        run: |
+          pip install pytest pandas
+          pytest src/surge-py/tests/ -x -v --tb=short

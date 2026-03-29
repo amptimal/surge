@@ -1,0 +1,48 @@
+name: Bug Report
+description: Report incorrect solver results, crashes, or unexpected behavior
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: "Thanks for reporting a bug in Surge!"
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the bug
+      description: What happened vs. what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Minimum code/case file to reproduce
+      placeholder: |
+        ```rust
+        // or CLI command
+        surge-solve case14.m --method nr
+        ```
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - AC power flow (NR/FDPF)
+        - DC power flow / PTDF/LODF
+        - AC-OPF / DC-OPF / SCOPF
+        - SCED / SCUC
+        - Transient stability dynamics
+        - CGMES/CIM parser
+        - PSS/E parser
+        - MATPOWER parser
+        - N-1 contingency analysis
+        - Python bindings
+        - Other
+  - type: input
+    id: version
+    attributes:
+      label: Surge version
+    validations:
+      required: true

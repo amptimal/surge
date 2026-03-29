@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0
+# ============================================================================
+# surge-builder — Reusable base image with Rust toolchain + C solver libraries.
+#
+# Rebuild only when:
+#   - Adding/updating system dependencies (KLU, Ipopt, BLAS, etc.)
+#   - Updating the Rust toolchain version
+#   - Adding new build tools (cmake, bindgen/libclang, etc.)
+#
+# Build:  docker build -f docker/Dockerfile.base -t surge-builder:latest .
+# ============================================================================
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# System dependencies for building Surge:
+#   build-essential  — gcc, g++, make
+#   cmake            — HiGHS solver build (via highs-sys)
+#   libclang-dev     — bindgen FFI generation
+#   libsuitesparse-dev — KLU sparse direct solver
+#   coinor-libipopt-dev — Ipopt NLP solver (includes MUMPS)
+#   libsqlite3-dev   — SQLite for surge-api persistence
+#   libopenblas-dev   — BLAS/LAPACK for Ipopt
+#   libgfortran-13-dev — Fortran runtime for MUMPS/BLAS
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates git build-essential pkg-config cmake \
+    libclang-dev \
+    libsuitesparse-dev \
+    coinor-libipopt-dev \
+    libsqlite3-dev \
+    libopenblas-dev \
+    libgfortran-13-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build HiGHS static library and install to /opt/highs.
+# Pinned to v1.13.1 (commit 1d267d97c16928bb5f86fcb2cba2d20f94c8720c).
+# To upgrade: update the ARG below + HIGHS_SHA in build-wheels.yml + ci.yml.
+ARG HIGHS_SHA=1d267d97c16928bb5f86fcb2cba2d20f94c8720c
+RUN git clone --depth 1 --branch v1.13.1 \
+        https://github.com/ERGO-Code/HiGHS.git /opt/highs-src \
+    && cmake -S /opt/highs-src -B /opt/highs-build \
+        -DFAST_BUILD=ON \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/opt/highs \
+        -DZLIB=OFF \
+    && cmake --build /opt/highs-build -j$(nproc) \
+    && cmake --install /opt/highs-build \
+    && rm -rf /opt/highs-src /opt/highs-build
+
+# Point highs-sys to the pre-built installation (skips cmake source build in CI).
+ENV HIGHS_PREBUILT_DIR=/opt/highs
+
+# Trust all git directories so cmake/git version queries work at build time.
+RUN git config --global --add safe.directory '*'
+
+# Install Rust stable toolchain with clippy + rustfmt (needed for CI lint checks)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable --profile minimal \
+      --component clippy --component rustfmt
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Install cargo-chef for dependency caching
+RUN cargo install cargo-chef --locked
+
+WORKDIR /build

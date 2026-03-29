@@ -1,0 +1,22 @@
+[package]
+name = "surge-network"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Surge network — canonical power-system domain model"
+readme = "README.md"
+keywords = ["power-systems", "grid", "network-model"]
+categories = ["science", "simulation", "data-structures"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+num-complex.workspace = true
+chrono.workspace = true
+surge-sparse.workspace = true
