@@ -956,6 +956,12 @@ fn main() -> Result<()> {
                             .lmp_loss
                             .iter()
                             .any(|&v| v.abs() > 1e-8);
+                        let has_congestion_s = sol
+                            .base_opf
+                            .pricing
+                            .lmp_congestion
+                            .iter()
+                            .any(|&v| v.abs() > 1e-8);
                         println!("\nLocational Marginal Prices:");
                         if !sol.lmp_contingency_congestion.is_empty() {
                             if has_loss_s {
@@ -1003,6 +1009,67 @@ fn main() -> Result<()> {
                                             energy,
                                             base_cong,
                                             ctg_cong
+                                        );
+                                    }
+                                }
+                            }
+                        } else if has_congestion_s || has_loss_s {
+                            if has_congestion_s && has_loss_s {
+                                println!(
+                                    "{:>6}  {:>10}  {:>10}  {:>10}  {:>10}",
+                                    "Bus", "LMP($/MWh)", "Energy", "Congest", "Loss"
+                                );
+                            } else if has_congestion_s {
+                                println!(
+                                    "{:>6}  {:>10}  {:>10}  {:>10}",
+                                    "Bus", "LMP($/MWh)", "Energy", "Congest"
+                                );
+                            } else {
+                                println!(
+                                    "{:>6}  {:>10}  {:>10}  {:>10}",
+                                    "Bus", "LMP($/MWh)", "Energy", "Loss"
+                                );
+                            }
+                            let bus_pd_mw = network.bus_load_p_mw();
+                            for (i, bus) in network.buses.iter().enumerate() {
+                                if sol.base_opf.pricing.lmp[i].abs() > 1e-4 || bus_pd_mw[i] > 0.0 {
+                                    let loss_i = sol
+                                        .base_opf
+                                        .pricing
+                                        .lmp_loss
+                                        .get(i)
+                                        .copied()
+                                        .unwrap_or(0.0);
+                                    let congestion_i = sol
+                                        .base_opf
+                                        .pricing
+                                        .lmp_congestion
+                                        .get(i)
+                                        .copied()
+                                        .unwrap_or(0.0);
+                                    let energy =
+                                        sol.base_opf.pricing.lmp[i] - congestion_i - loss_i;
+                                    if has_congestion_s && has_loss_s {
+                                        println!(
+                                            "{:>6}  {:>10.4}  {:>10.4}  {:>10.4}  {:>10.4}",
+                                            bus.number,
+                                            sol.base_opf.pricing.lmp[i],
+                                            energy,
+                                            congestion_i,
+                                            loss_i
+                                        );
+                                    } else if has_congestion_s {
+                                        println!(
+                                            "{:>6}  {:>10.4}  {:>10.4}  {:>10.4}",
+                                            bus.number,
+                                            sol.base_opf.pricing.lmp[i],
+                                            energy,
+                                            congestion_i
+                                        );
+                                    } else {
+                                        println!(
+                                            "{:>6}  {:>10.4}  {:>10.4}  {:>10.4}",
+                                            bus.number, sol.base_opf.pricing.lmp[i], energy, loss_i
                                         );
                                     }
                                 }

@@ -25,6 +25,9 @@ pub(crate) struct PreventiveBaseModel {
     pub hvdc_injections: Vec<(usize, usize, f64, f64)>,
     /// Maps variable HVDC link index k → position in `hvdc_injections`.
     pub hvdc_var_to_inj_idx: Vec<usize>,
+    /// Per-variable-link loss parameters `(loss_a_pu, loss_b_frac)`.
+    /// Index k matches `hvdc_var_to_inj_idx[k]`.
+    pub hvdc_var_loss_params: Vec<(f64, f64)>,
     pub ptdf: PtdfRows,
     pub n_flow: usize,
     pub n_ang: usize,
@@ -248,6 +251,7 @@ pub(crate) fn build_preventive_base_model(
     // `hvdc_injections`, so the solve loop can update the right entry.
     let hvdc_links = surge_hvdc::interop::links_from_network(network);
     let mut hvdc_var_to_inj_idx: Vec<usize> = Vec::with_capacity(n_hvdc);
+    let mut hvdc_var_loss_params: Vec<(f64, f64)> = Vec::with_capacity(n_hvdc);
     let hvdc_injections: Vec<(usize, usize, f64, f64)> = if !all_hvdc_opf_links.is_empty() {
         let mut injs = Vec::new();
         for hvdc in all_hvdc_opf_links {
@@ -255,8 +259,10 @@ pub(crate) fn build_preventive_base_model(
             let ti = bus_map[&hvdc.to_bus];
             if hvdc.is_variable() {
                 hvdc_var_to_inj_idx.push(injs.len());
+                hvdc_var_loss_params.push((hvdc.loss_a_mw / base, hvdc.loss_b_frac));
                 let p_mid = (hvdc.p_dc_min_mw + hvdc.p_dc_max_mw) * 0.5 / base;
-                injs.push((fi, ti, -p_mid, p_mid));
+                let p_inv_mid = p_mid * (1.0 - hvdc.loss_b_frac) - hvdc.loss_a_mw / base;
+                injs.push((fi, ti, -p_mid, p_inv_mid));
             } else {
                 let p_dc_pu = hvdc.p_dc_min_mw / base;
                 let p_inv_pu = hvdc.p_inv_mw(hvdc.p_dc_min_mw) / base;
@@ -607,6 +613,7 @@ pub(crate) fn build_preventive_base_model(
         gen_bus_idx,
         hvdc_injections,
         hvdc_var_to_inj_idx,
+        hvdc_var_loss_params,
         ptdf,
         n_flow,
         n_ang,

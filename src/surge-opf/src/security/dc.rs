@@ -49,6 +49,22 @@ fn branch_loading_pct_from_flows(network: &Network, branch_p_from_mw: &[f64]) ->
         .collect()
 }
 
+fn update_variable_hvdc_injections_from_solution(
+    solution_x: &[f64],
+    hvdc_offset: usize,
+    hvdc_var_to_inj_idx: &[usize],
+    hvdc_var_loss_params: &[(f64, f64)],
+    hvdc_injections: &mut [(usize, usize, f64, f64)],
+) {
+    debug_assert_eq!(hvdc_var_to_inj_idx.len(), hvdc_var_loss_params.len());
+    for (k, &inj_idx) in hvdc_var_to_inj_idx.iter().enumerate() {
+        let p_dc_pu = solution_x[hvdc_offset + k];
+        let (loss_a_pu, loss_b_frac) = hvdc_var_loss_params[k];
+        hvdc_injections[inj_idx].2 = -p_dc_pu; // rectifier draws from the AC grid
+        hvdc_injections[inj_idx].3 = p_dc_pu * (1.0 - loss_b_frac) - loss_a_pu;
+    }
+}
+
 /// Solve SCOPF using sparse B-theta formulation with HiGHS.
 ///
 /// Variables: x = [θ (n_bus) | Pg (n_gen)]
@@ -112,6 +128,7 @@ pub(crate) fn solve_dc_preventive_with_context(
         gen_bus_idx,
         mut hvdc_injections,
         hvdc_var_to_inj_idx,
+        hvdc_var_loss_params,
         ptdf,
         n_flow,
         n_ang,
@@ -303,11 +320,13 @@ pub(crate) fn solve_dc_preventive_with_context(
 
         // Update HVDC injections from the LP solution for variable links.
         // Contingency evaluation uses these to compute post-trip flow shifts.
-        for (k, &inj_idx) in hvdc_var_to_inj_idx.iter().enumerate() {
-            let p_dc_pu = sol.x[hvdc_offset + k];
-            hvdc_injections[inj_idx].2 = -p_dc_pu; // rectifier draws
-            hvdc_injections[inj_idx].3 = p_dc_pu; // inverter injects
-        }
+        update_variable_hvdc_injections_from_solution(
+            &sol.x,
+            hvdc_offset,
+            &hvdc_var_to_inj_idx,
+            &hvdc_var_loss_params,
+            &mut hvdc_injections,
+        );
 
         // Compute base branch flows from θ: flow[l] = b_dc_l * (θ_from - θ_to - shift_rad_l)
         let mut base_flow = vec![0.0; n_br];
@@ -3751,6 +3770,25 @@ mod tests {
 
         let sol = result.unwrap();
         assert!(sol.base_opf.total_cost > 0.0, "cost should be positive");
+    }
+
+    #[test]
+    fn test_variable_hvdc_contingency_uses_loss_adjusted_injection() {
+        let mut hvdc_injections = vec![(1usize, 2usize, -0.25f64, 0.25f64)];
+        let hvdc_var_to_inj_idx = vec![0usize];
+        let hvdc_var_loss_params = vec![(0.03f64, 0.1f64)];
+        let solution_x = vec![0.0f64, 0.40f64];
+
+        update_variable_hvdc_injections_from_solution(
+            &solution_x,
+            1,
+            &hvdc_var_to_inj_idx,
+            &hvdc_var_loss_params,
+            &mut hvdc_injections,
+        );
+
+        assert!((hvdc_injections[0].2 + 0.40).abs() < 1e-12);
+        assert!((hvdc_injections[0].3 - 0.33).abs() < 1e-12);
     }
 
     // ---------------------------------------------------------------------------

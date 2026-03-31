@@ -59,7 +59,7 @@ Manually verify:
 - publish these crates to crates.io in dependency order:
   `surge-sparse`, `surge-network`, `surge-solution`, `surge-topology`,
   `surge-ac`, `surge-dc`, `surge-io`, `surge-hvdc`, `surge-opf`,
-  `surge-contingency`, and `surge-transfer`
+  `surge-contingency`, `surge-transfer`, and `surge-bindings`
 - after each dependency layer is live on crates.io, run
   `cargo package -p <crate> --allow-dirty --no-verify` for the next crate
   before publishing it

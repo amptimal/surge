@@ -268,6 +268,36 @@ fn test_dcpf_json_emits_json_result() {
 }
 
 #[test]
+fn test_scopf_text_output_shows_loss_column_without_ctg_congestion_split() {
+    let out = Command::new(common::surge_bin())
+        .args([
+            case9().to_str().unwrap(),
+            "--method",
+            "scopf",
+            "--scopf-mode",
+            "corrective",
+            "--use-loss-factors",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Locational Marginal Prices:"),
+        "missing LMP section: {stdout}"
+    );
+    assert!(
+        stdout.contains("Loss"),
+        "expected SCOPF text output to include a loss column when lmp_loss is present: {stdout}"
+    );
+}
+
+#[test]
 fn test_contingency_json_names_violated_contingency_count_truthfully() {
     let out = Command::new(common::surge_bin())
         .args([
