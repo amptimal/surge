@@ -110,11 +110,13 @@ pub(crate) fn solve_dc_preventive_with_context(
         active_base_flowgate_indices: active_fg_indices,
         active_contingency_flowgate_indices: _,
         gen_bus_idx,
-        hvdc_injections,
+        mut hvdc_injections,
+        hvdc_var_to_inj_idx,
         ptdf,
         n_flow,
         n_ang,
         n_ifg,
+        hvdc_offset,
         n_base_rows,
         n_var_base,
         col_cost,
@@ -298,6 +300,14 @@ pub(crate) fn solve_dc_preventive_with_context(
         // Extract θ and Pg
         let theta = &sol.x[theta_offset..theta_offset + n_bus];
         let pg_pu = &sol.x[pg_offset..pg_offset + n_gen];
+
+        // Update HVDC injections from the LP solution for variable links.
+        // Contingency evaluation uses these to compute post-trip flow shifts.
+        for (k, &inj_idx) in hvdc_var_to_inj_idx.iter().enumerate() {
+            let p_dc_pu = sol.x[hvdc_offset + k];
+            hvdc_injections[inj_idx].2 = -p_dc_pu; // rectifier draws
+            hvdc_injections[inj_idx].3 = p_dc_pu; // inverter injects
+        }
 
         // Compute base branch flows from θ: flow[l] = b_dc_l * (θ_from - θ_to - shift_rad_l)
         let mut base_flow = vec![0.0; n_br];

@@ -23,10 +23,13 @@ pub(crate) struct PreventiveBaseModel {
     pub active_contingency_flowgate_indices: Vec<usize>,
     pub gen_bus_idx: Vec<usize>,
     pub hvdc_injections: Vec<(usize, usize, f64, f64)>,
+    /// Maps variable HVDC link index k → position in `hvdc_injections`.
+    pub hvdc_var_to_inj_idx: Vec<usize>,
     pub ptdf: PtdfRows,
     pub n_flow: usize,
     pub n_ang: usize,
     pub n_ifg: usize,
+    pub hvdc_offset: usize,
     pub n_base_rows: usize,
     pub n_var_base: usize,
     pub col_cost: Vec<f64>,
@@ -234,16 +237,44 @@ pub(crate) fn build_preventive_base_model(
         .map(|&gi| bus_map[&network.generators[gi].bus])
         .collect();
 
+    // Build HVDC injection table for contingency evaluation.
+    // When DcOpfOptions::hvdc_links is set, use those (with proper loss model
+    // and variable dispatch support). Otherwise fall back to interop links.
+    // Each entry: (from_bus_idx, to_bus_idx, from_inj_pu, to_inj_pu).
+    // For variable links, initial injections use the midpoint of bounds;
+    // the solve loop updates these from the LP solution each iteration.
+    //
+    // `hvdc_var_to_inj_idx[k]` maps variable link k to its index in
+    // `hvdc_injections`, so the solve loop can update the right entry.
     let hvdc_links = surge_hvdc::interop::links_from_network(network);
-    let hvdc_injections = hvdc_links
-        .iter()
-        .filter_map(|link| {
-            let from_idx = *bus_map.get(&link.from_bus())?;
-            let to_idx = *bus_map.get(&link.to_bus())?;
-            let p_dc_pu = link.p_dc_mw() / base;
-            Some((from_idx, to_idx, -p_dc_pu, p_dc_pu))
-        })
-        .collect();
+    let mut hvdc_var_to_inj_idx: Vec<usize> = Vec::with_capacity(n_hvdc);
+    let hvdc_injections: Vec<(usize, usize, f64, f64)> = if !all_hvdc_opf_links.is_empty() {
+        let mut injs = Vec::new();
+        for hvdc in all_hvdc_opf_links {
+            let fi = bus_map[&hvdc.from_bus];
+            let ti = bus_map[&hvdc.to_bus];
+            if hvdc.is_variable() {
+                hvdc_var_to_inj_idx.push(injs.len());
+                let p_mid = (hvdc.p_dc_min_mw + hvdc.p_dc_max_mw) * 0.5 / base;
+                injs.push((fi, ti, -p_mid, p_mid));
+            } else {
+                let p_dc_pu = hvdc.p_dc_min_mw / base;
+                let p_inv_pu = hvdc.p_inv_mw(hvdc.p_dc_min_mw) / base;
+                injs.push((fi, ti, -p_dc_pu, p_inv_pu));
+            }
+        }
+        injs
+    } else {
+        hvdc_links
+            .iter()
+            .filter_map(|link| {
+                let from_idx = *bus_map.get(&link.from_bus())?;
+                let to_idx = *bus_map.get(&link.to_bus())?;
+                let p_dc_pu = link.p_dc_mw() / base;
+                Some((from_idx, to_idx, -p_dc_pu, p_dc_pu))
+            })
+            .collect()
+    };
 
     let mut base_triplets: Vec<Triplet<f64>> = Vec::with_capacity(6 * n_bus + n_gen + 4 * n_flow);
     for (ci, &branch_idx) in constrained_branches.iter().enumerate() {
@@ -575,10 +606,12 @@ pub(crate) fn build_preventive_base_model(
         active_contingency_flowgate_indices,
         gen_bus_idx,
         hvdc_injections,
+        hvdc_var_to_inj_idx,
         ptdf,
         n_flow,
         n_ang,
         n_ifg,
+        hvdc_offset,
         n_base_rows,
         n_var_base,
         col_cost,

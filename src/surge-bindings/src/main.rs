@@ -817,21 +817,45 @@ fn main() -> Result<()> {
                                     None,
                                 );
 
+                                let has_loss = sol.pricing.lmp_loss.iter().any(|&v| v.abs() > 1e-8);
                                 println!("\nLocational Marginal Prices:");
-                                println!(
-                                    "{:>6}  {:>10}  {:>12}  {:>10}",
-                                    "Bus", "LMP($/MWh)", "Energy", "Congest"
-                                );
+                                if has_loss {
+                                    println!(
+                                        "{:>6}  {:>10}  {:>12}  {:>10}  {:>10}",
+                                        "Bus", "LMP($/MWh)", "Energy", "Congest", "Loss"
+                                    );
+                                } else {
+                                    println!(
+                                        "{:>6}  {:>10}  {:>12}  {:>10}",
+                                        "Bus", "LMP($/MWh)", "Energy", "Congest"
+                                    );
+                                }
                                 let bus_pd_mw = network.bus_load_p_mw();
                                 for (i, bus) in network.buses.iter().enumerate() {
                                     if sol.pricing.lmp[i].abs() > 1e-4 || bus_pd_mw[i] > 0.0 {
-                                        println!(
-                                            "{:>6}  {:>10.4}  {:>12.4}  {:>10.4}",
-                                            bus.number,
-                                            sol.pricing.lmp[i],
-                                            sol.pricing.lmp[i] - sol.pricing.lmp_congestion[i],
-                                            sol.pricing.lmp_congestion[i]
-                                        );
+                                        let loss_i =
+                                            sol.pricing.lmp_loss.get(i).copied().unwrap_or(0.0);
+                                        let energy = sol.pricing.lmp[i]
+                                            - sol.pricing.lmp_congestion[i]
+                                            - loss_i;
+                                        if has_loss {
+                                            println!(
+                                                "{:>6}  {:>10.4}  {:>12.4}  {:>10.4}  {:>10.4}",
+                                                bus.number,
+                                                sol.pricing.lmp[i],
+                                                energy,
+                                                sol.pricing.lmp_congestion[i],
+                                                loss_i
+                                            );
+                                        } else {
+                                            println!(
+                                                "{:>6}  {:>10.4}  {:>12.4}  {:>10.4}",
+                                                bus.number,
+                                                sol.pricing.lmp[i],
+                                                energy,
+                                                sol.pricing.lmp_congestion[i]
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -926,28 +950,61 @@ fn main() -> Result<()> {
                             None,
                         );
 
+                        let has_loss_s = sol
+                            .base_opf
+                            .pricing
+                            .lmp_loss
+                            .iter()
+                            .any(|&v| v.abs() > 1e-8);
                         println!("\nLocational Marginal Prices:");
                         if !sol.lmp_contingency_congestion.is_empty() {
-                            println!(
-                                "{:>6}  {:>10}  {:>10}  {:>10}  {:>10}",
-                                "Bus", "LMP($/MWh)", "Energy", "BaseCong", "CtgCong"
-                            );
+                            if has_loss_s {
+                                println!(
+                                    "{:>6}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
+                                    "Bus", "LMP($/MWh)", "Energy", "BaseCong", "CtgCong", "Loss"
+                                );
+                            } else {
+                                println!(
+                                    "{:>6}  {:>10}  {:>10}  {:>10}  {:>10}",
+                                    "Bus", "LMP($/MWh)", "Energy", "BaseCong", "CtgCong"
+                                );
+                            }
                             let bus_pd_mw = network.bus_load_p_mw();
                             for (i, bus) in network.buses.iter().enumerate() {
                                 if sol.base_opf.pricing.lmp[i].abs() > 1e-4 || bus_pd_mw[i] > 0.0 {
+                                    let loss_i = sol
+                                        .base_opf
+                                        .pricing
+                                        .lmp_loss
+                                        .get(i)
+                                        .copied()
+                                        .unwrap_or(0.0);
                                     let energy = sol.base_opf.pricing.lmp[i]
-                                        - sol.base_opf.pricing.lmp_congestion[i];
+                                        - sol.base_opf.pricing.lmp_congestion[i]
+                                        - loss_i;
                                     let base_cong = sol.base_opf.pricing.lmp_congestion[i]
                                         - sol.lmp_contingency_congestion[i];
                                     let ctg_cong = sol.lmp_contingency_congestion[i];
-                                    println!(
-                                        "{:>6}  {:>10.4}  {:>10.4}  {:>10.4}  {:>10.4}",
-                                        bus.number,
-                                        sol.base_opf.pricing.lmp[i],
-                                        energy,
-                                        base_cong,
-                                        ctg_cong
-                                    );
+                                    if has_loss_s {
+                                        println!(
+                                            "{:>6}  {:>10.4}  {:>10.4}  {:>10.4}  {:>10.4}  {:>10.4}",
+                                            bus.number,
+                                            sol.base_opf.pricing.lmp[i],
+                                            energy,
+                                            base_cong,
+                                            ctg_cong,
+                                            loss_i
+                                        );
+                                    } else {
+                                        println!(
+                                            "{:>6}  {:>10.4}  {:>10.4}  {:>10.4}  {:>10.4}",
+                                            bus.number,
+                                            sol.base_opf.pricing.lmp[i],
+                                            energy,
+                                            base_cong,
+                                            ctg_cong
+                                        );
+                                    }
                                 }
                             }
                         } else {
@@ -955,8 +1012,16 @@ fn main() -> Result<()> {
                             let bus_pd_mw = network.bus_load_p_mw();
                             for (i, bus) in network.buses.iter().enumerate() {
                                 if sol.base_opf.pricing.lmp[i].abs() > 1e-4 || bus_pd_mw[i] > 0.0 {
+                                    let loss_i = sol
+                                        .base_opf
+                                        .pricing
+                                        .lmp_loss
+                                        .get(i)
+                                        .copied()
+                                        .unwrap_or(0.0);
                                     let energy = sol.base_opf.pricing.lmp[i]
-                                        - sol.base_opf.pricing.lmp_congestion[i];
+                                        - sol.base_opf.pricing.lmp_congestion[i]
+                                        - loss_i;
                                     println!(
                                         "{:>6}  {:>10.4}  {:>10.4}",
                                         bus.number, sol.base_opf.pricing.lmp[i], energy

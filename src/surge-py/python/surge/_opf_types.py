@@ -651,6 +651,9 @@ class ScopfOptions:
             "use_loss_factors": dc.loss_model is DcLossModel.ITERATIVE if dc else False,
             "max_loss_iter": dc.loss_iterations if dc else 3,
             "loss_tol": dc.loss_tolerance if dc else 1e-3,
+            "enforce_thermal_limits": dc.enforce_thermal_limits if dc else True,
+            "par_setpoints": dc.par_setpoints if dc and dc.par_setpoints else None,
+            "hvdc_links": dc.hvdc_links if dc and dc.hvdc_links else None,
         }
         return _compact_kwargs(kwargs, network)
 
