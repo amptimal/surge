@@ -830,9 +830,14 @@ pub(crate) fn solve_dc_preventive_with_context(
                 .map(|i| sol.row_dual[n_flow + n_ang + n_ifg + i] / base)
                 .collect();
 
-            // Per-island energy decomposition
-            let (lmp_energy, _, _) =
-                crate::dc::island_lmp::decompose_lmp_lossless(&lmp, &island_refs);
+            // Per-island energy decomposition (with loss component when active)
+            let (lmp_energy, _, _) = if use_loss_factors && loss_iter_count > 0 {
+                use crate::dc::loss_factors::compute_dc_loss_sensitivities;
+                let dloss_dp = compute_dc_loss_sensitivities(network, theta, bus_map, &ptdf);
+                crate::dc::island_lmp::decompose_lmp_with_losses(&lmp, &dloss_dp, &island_refs)
+            } else {
+                crate::dc::island_lmp::decompose_lmp_lossless(&lmp, &island_refs)
+            };
 
             // Base congestion from branch flow duals (rows 0..n_flow)
             let mut lmp_base_congestion = vec![0.0; n_bus];
@@ -1079,7 +1084,12 @@ pub(crate) fn solve_dc_preventive_with_context(
                 })
                 .collect();
             let total_generation_mw_scopf: f64 = gen_p_mw.iter().sum();
-            let total_losses_mw_scopf = 0.0; // DC SCOPF is lossless
+            let total_losses_mw_scopf = if use_loss_factors && loss_iter_count > 0 {
+                use crate::dc::loss_factors::compute_total_dc_losses;
+                compute_total_dc_losses(network, theta, bus_map) * base
+            } else {
+                0.0
+            };
 
             // Extract generator bound duals from LP column duals.
             // HiGHS col_dual: negative at lower bound, positive at upper bound.
