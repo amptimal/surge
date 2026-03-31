@@ -346,8 +346,9 @@ pub(crate) struct Cli {
     pub dc_opf_warm_start: DcOpfWarmStart,
 
     /// DC-OPF cost formulation: qp (exact quadratic) or lp (PWL tangent-line approximation).
-    #[arg(long, value_enum, default_value_t = CliDcCostMode::Qp)]
-    pub dc_cost_mode: CliDcCostMode,
+    /// DC-OPF defaults to qp; SCOPF defaults to lp.
+    #[arg(long, value_enum)]
+    pub dc_cost_mode: Option<CliDcCostMode>,
 
     /// Number of PWL breakpoints per generator when --dc-cost-mode lp is used (default: 20)
     #[arg(long, default_value = "20")]

@@ -831,7 +831,7 @@ pub(crate) fn solve_dc_preventive_with_context(
                 .collect();
 
             // Per-island energy decomposition (with loss component when active)
-            let (lmp_energy, _, _) = if use_loss_factors && loss_iter_count > 0 {
+            let (lmp_energy, _, lmp_loss) = if use_loss_factors && loss_iter_count > 0 {
                 use crate::dc::loss_factors::compute_dc_loss_sensitivities;
                 let dloss_dp = compute_dc_loss_sensitivities(network, theta, bus_map, &ptdf);
                 crate::dc::island_lmp::decompose_lmp_with_losses(&lmp, &dloss_dp, &island_refs)
@@ -1121,7 +1121,7 @@ pub(crate) fn solve_dc_preventive_with_context(
                         lmp,
                         lmp_energy,
                         lmp_congestion,
-                        lmp_loss: vec![0.0; n_bus],
+                        lmp_loss,
                         lmp_reactive: vec![],
                     },
                     branches: OpfBranchResults {
@@ -1165,9 +1165,7 @@ pub(crate) fn solve_dc_preventive_with_context(
                 mode: ScopfMode::Preventive,
                 iterations: scopf_iter + 1,
                 converged: true,
-                total_contingencies_evaluated: ctg_data.len()
-                    + gen_ctg_data.len()
-                    + n2_ctg_data.len(),
+                total_contingencies_evaluated: contingencies.len(),
                 total_contingency_constraints: n_ctg_cuts,
                 binding_contingencies: binding,
                 lmp_contingency_congestion: lmp_ctg_congestion,
@@ -2347,7 +2345,7 @@ pub(crate) fn solve_dc_corrective_with_context(
             let lmp: Vec<f64> = (0..n_bus)
                 .map(|i| sol.row_dual[n_flow + n_ang_c + i] / base)
                 .collect();
-            let (lmp_energy, lmp_congestion, _) =
+            let (lmp_energy, lmp_congestion, lmp_loss) =
                 crate::dc::island_lmp::decompose_lmp_lossless(&lmp, &island_refs);
 
             // Branch shadow prices
@@ -2466,7 +2464,7 @@ pub(crate) fn solve_dc_corrective_with_context(
                         lmp,
                         lmp_energy,
                         lmp_congestion,
-                        lmp_loss: vec![0.0; n_bus],
+                        lmp_loss,
                         lmp_reactive: vec![],
                     },
                     branches: OpfBranchResults {

@@ -756,8 +756,12 @@ fn main() -> Result<()> {
             let opf_options = surge_opf::DcOpfOptions {
                 tolerance: cli.tolerance,
                 max_iterations: cli.max_iter,
-                use_pwl_costs: cli.dc_cost_mode == CliDcCostMode::Lp,
+                use_pwl_costs: cli.dc_cost_mode == Some(CliDcCostMode::Lp),
                 pwl_cost_breakpoints: cli.dc_pwl_breakpoints,
+                gen_limit_penalty: cli.gen_limit_penalty,
+                use_loss_factors: cli.use_loss_factors,
+                max_loss_iter: cli.loss_iterations,
+                loss_tol: cli.loss_tolerance,
                 ..Default::default()
             };
             let dc_runtime = match lp_solver.clone() {
@@ -859,9 +863,10 @@ fn main() -> Result<()> {
                 dc_opf: surge_opf::DcOpfOptions {
                     tolerance: cli.tolerance,
                     max_iterations: cli.max_iter,
-                    // SCOPF always uses PWL (LP) costs — the HiGHS QP solver
-                    // has numerical issues on large cases.
-                    use_pwl_costs: true,
+                    // SCOPF defaults to PWL (LP) costs — the HiGHS QP solver
+                    // has numerical issues on large cases.  Use --dc-cost-mode qp
+                    // to override with exact quadratic costs.
+                    use_pwl_costs: cli.dc_cost_mode != Some(CliDcCostMode::Qp),
                     pwl_cost_breakpoints: cli.dc_pwl_breakpoints,
                     gen_limit_penalty: cli.gen_limit_penalty,
                     use_loss_factors: cli.use_loss_factors,
