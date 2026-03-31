@@ -117,9 +117,15 @@ pub struct ScopfOptions {
     pub contingency_rating: ThermalRating,
     /// Enforce flowgate and interface constraints.
     ///
-    /// SCOPF currently rejects these corridor constraints entirely instead of
-    /// silently approximating them as single-branch cuts.
+    /// Supported in preventive DC-SCOPF and preventive AC-SCOPF. DC corrective
+    /// SCOPF still rejects corridor constraints instead of silently ignoring
+    /// them.
     pub enforce_flowgates: bool,
+    /// Enforce branch angle-difference limits as soft constraints.
+    /// Default: `true`.  Set to `false` to skip angle constraints entirely,
+    /// which is appropriate when the network data carries placeholder ±π
+    /// limits that add rows without tightening the feasible region.
+    pub enforce_angle_limits: bool,
 
     // ── Pre-screening ─────────────────────────────────────────────────────
     /// N-1 contingency pre-screener configuration.
@@ -215,9 +221,13 @@ impl Default for ScopfOptions {
             min_rate_a: 1.0,
             contingency_rating: ThermalRating::RateA,
             enforce_flowgates: true,
+            enforce_angle_limits: true,
             screener: Some(ScopfScreeningPolicy::default()),
             penalty_config: PenaltyConfig::default(),
-            dc_opf: DcOpfOptions::default(),
+            dc_opf: DcOpfOptions {
+                use_pwl_costs: true,
+                ..DcOpfOptions::default()
+            },
             ac: ScopfAcSettings::default(),
             corrective: ScopfCorrectiveSettings::default(),
         }

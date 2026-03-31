@@ -6,6 +6,32 @@ this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows Semantic Versioning intent.
 
+## [0.1.1] — 2026-03-31
+
+### Fixed
+
+- Corrected several DC-SCOPF issues affecting angle-limit handling, HVDC and
+  MTDC power balance, piecewise-linear cost passthrough, corrective Hessian
+  sizing, loss-factor outputs, and HVDC contingency accounting.
+
+### Added
+
+- Added co-optimized variable HVDC dispatch, PAR scheduled-interchange
+  treatment, soft generator limits, iterative loss-factor support, and the
+  related CLI and Python SCOPF options.
+
+### Changed
+
+- DC-SCOPF now defaults to LP costs in Rust and Python for more robust HiGHS
+  behavior on large cases.
+- `surge-bindings` is now published on crates.io, and installation guidance now
+  leads with `cargo install surge-bindings` and `pip install surge-py`.
+
+### Documentation
+
+- Refreshed the quickstart, support matrix, SCOPF tutorial, CLI reference,
+  notebook, and crate docs to match the new defaults and release packaging.
+
 ## [0.1.0] — 2026-03-29
 
 Initial public release of the Surge power systems analysis engine.

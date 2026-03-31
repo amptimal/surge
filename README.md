@@ -50,9 +50,37 @@ requires a separate license from Amptimal. See [LICENSE](LICENSE),
 
 ## Quick Start
 
+### Python
+
+Install the prebuilt package from PyPI:
+
+```bash
+pip install surge-py
+```
+
+```python
+import surge
+
+net = surge.load("examples/cases/ieee118/case118.surge.json.zst")
+ac = surge.solve_ac_pf(net)
+print(ac.converged, ac.iterations, ac.max_mismatch)
+```
+
+To build from source instead, see [Building from source](#building-from-source)
+below.
+
 ### CLI
 
-Build the workspace binaries from the repository root:
+Building the CLI requires a [Rust toolchain](https://rustup.rs/) (stable 1.87+)
+and native dependencies listed in [Build Notes](#build-notes). If you don't have
+Rust installed:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+```
+
+Then build and run:
 
 ```bash
 cargo build --release --workspace --exclude surge-py
@@ -67,9 +95,11 @@ Run a few common studies:
 ./target/release/surge-solve examples/cases/ieee118/case118.surge.json.zst --method dc-opf --output json
 ```
 
-### Python
+### Building from source
 
-Build `surge-py` with maturin rather than as a plain Cargo workspace member:
+Building the Python package from source requires a
+[Rust toolchain](https://rustup.rs/) (stable 1.87+) and native dependencies
+listed in [Build Notes](#build-notes).
 
 ```bash
 python3 -m venv .venv
@@ -85,27 +115,6 @@ If `COPT_HOME` points to a COPT 8.x install when the package is built, the
 Python package bundles the Surge COPT NLP shim into the wheel and configures it
 automatically at import time. Python users still need a working COPT runtime
 installation and license to run `nlp_solver="copt"`.
-
-Minimal example:
-
-```python
-import surge
-
-net = surge.load("examples/cases/ieee118/case118.surge.json.zst")
-
-ac = surge.solve_ac_pf(net)
-dc = surge.solve_dc_pf(net)
-dc_centered = surge.solve_dc_pf(
-    net,
-    surge.DcPfOptions(angle_reference="distributed_load"),
-)
-n1 = surge.analyze_n1_branch(net)
-
-print(ac.converged, ac.iterations, ac.max_mismatch)
-print(dc.solve_time_secs)
-print(dc_centered.solve_time_secs)
-print(n1.n_contingencies, n1.n_with_violations)
-```
 
 ### Rust
 
@@ -148,10 +157,15 @@ Common native requirements:
 
 - Rust stable 1.87+
 - SuiteSparse / KLU development libraries for AC workflows
-- HiGHS runtime library for `surge-opf` (install via package manager or set `HIGHS_LIB_DIR`)
-- Ipopt for open-source AC-OPF
+- HiGHS C library for `surge-opf` (install via package manager or set `HIGHS_LIB_DIR`)
+- Ipopt C library for open-source AC-OPF (install via package manager or set `IPOPT_LIB_DIR`)
 - COPT 8.x if you want the commercial AC-OPF backend; `surge-py` wheels built
   with `COPT_HOME` bundle the Surge NLP shim automatically
+
+> **Note:** `pip install highspy` and `pip install cyipopt` do **not** provide
+> the C shared libraries Surge needs. Install HiGHS and Ipopt via your system
+> package manager (`brew install highs ipopt` /
+> `apt install libhighs-dev coinor-libipopt-dev`).
 
 ## Documentation
 

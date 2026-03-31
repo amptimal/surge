@@ -524,12 +524,17 @@ pub fn solve_ac_opf(
                     max_iterations=20, max_cuts_per_iteration=100,
                     corrective_ramp_window_min=10.0, voltage_threshold=0.01,
                     contingency_rating="rate-a", enforce_flowgates=true,
-                    enforce_voltage_security=true,
+                    enforce_angle_limits=true, enforce_voltage_security=true,
                     lp_solver=None, nlp_solver=None, max_contingencies=0,
                     min_rate_a=1.0, nr_max_iterations=30,
                     nr_convergence_tolerance=1e-6, enable_screener=true,
                     screener_threshold_fraction=0.9,
-                    screener_max_initial_contingencies=500, warm_start=None))]
+                    screener_max_initial_contingencies=500, warm_start=None,
+                    use_pwl_costs=true, pwl_cost_breakpoints=20,
+                    gen_limit_penalty=None, use_loss_factors=false,
+                    max_loss_iter=3, loss_tol=1e-3,
+                    enforce_thermal_limits=true,
+                    par_setpoints=None, hvdc_links=None))]
 pub fn solve_scopf(
     py: Python<'_>,
     network: &Network,
@@ -542,6 +547,7 @@ pub fn solve_scopf(
     voltage_threshold: f64,
     contingency_rating: &str,
     enforce_flowgates: bool,
+    enforce_angle_limits: bool,
     enforce_voltage_security: bool,
     lp_solver: Option<&str>,
     nlp_solver: Option<&str>,
@@ -553,6 +559,15 @@ pub fn solve_scopf(
     screener_threshold_fraction: f64,
     screener_max_initial_contingencies: usize,
     warm_start: Option<&ScopfResult>,
+    use_pwl_costs: bool,
+    pwl_cost_breakpoints: usize,
+    gen_limit_penalty: Option<f64>,
+    use_loss_factors: bool,
+    max_loss_iter: usize,
+    loss_tol: f64,
+    enforce_thermal_limits: bool,
+    par_setpoints: Option<Vec<std::collections::HashMap<String, pyo3::Py<pyo3::PyAny>>>>,
+    hvdc_links: Option<Vec<std::collections::HashMap<String, pyo3::Py<pyo3::PyAny>>>>,
 ) -> PyResult<ScopfResult> {
     catch_panic("solve_scopf", || {
         let form = match formulation {
@@ -596,6 +611,50 @@ pub fn solve_scopf(
                 )));
             }
         };
+        let parsed_par_setpoints: Vec<surge_solution::ParSetpoint> = par_setpoints
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|d| {
+                let get_u32 =
+                    |k: &str| -> Option<u32> { d.get(k).and_then(|v| v.extract::<u32>(py).ok()) };
+                let get_str = |k: &str| -> String {
+                    d.get(k)
+                        .and_then(|v| v.extract::<String>(py).ok())
+                        .unwrap_or_else(|| "1".to_string())
+                };
+                let get_f64 =
+                    |k: &str| -> Option<f64> { d.get(k).and_then(|v| v.extract::<f64>(py).ok()) };
+                Some(surge_solution::ParSetpoint {
+                    from_bus: get_u32("from_bus")?,
+                    to_bus: get_u32("to_bus")?,
+                    circuit: get_str("circuit"),
+                    target_mw: get_f64("target_mw")?,
+                })
+            })
+            .collect();
+        let parsed_hvdc_links: Option<Vec<surge_opf::HvdcOpfLink>> = hvdc_links.map(|links| {
+            links
+                .into_iter()
+                .filter_map(|d| {
+                    let get_u32 = |k: &str| -> Option<u32> {
+                        d.get(k).and_then(|v| v.extract::<u32>(py).ok())
+                    };
+                    let get_f64 = |k: &str| -> Option<f64> {
+                        d.get(k).and_then(|v| v.extract::<f64>(py).ok())
+                    };
+                    let get_f64_or = |k: &str, def: f64| -> f64 { get_f64(k).unwrap_or(def) };
+                    Some(surge_opf::HvdcOpfLink {
+                        from_bus: get_u32("from_bus")?,
+                        to_bus: get_u32("to_bus")?,
+                        p_dc_min_mw: get_f64("p_dc_min_mw")?,
+                        p_dc_max_mw: get_f64("p_dc_max_mw")?,
+                        loss_a_mw: get_f64_or("loss_a_mw", 0.0),
+                        loss_b_frac: get_f64_or("loss_b_frac", 0.0),
+                        name: String::new(),
+                    })
+                })
+                .collect()
+        });
         let opts = surge_opf::ScopfOptions {
             formulation: form,
             mode: md,
@@ -606,11 +665,23 @@ pub fn solve_scopf(
             min_rate_a,
             contingency_rating: ctg_rating,
             enforce_flowgates,
+            enforce_angle_limits,
             screener: enable_screener.then_some(surge_opf::ScopfScreeningPolicy {
                 threshold_fraction: screener_threshold_fraction,
                 max_initial_contingencies: screener_max_initial_contingencies,
             }),
-            dc_opf: surge_opf::DcOpfOptions::default(),
+            dc_opf: surge_opf::DcOpfOptions {
+                enforce_thermal_limits,
+                use_pwl_costs,
+                pwl_cost_breakpoints,
+                gen_limit_penalty,
+                use_loss_factors,
+                max_loss_iter,
+                loss_tol,
+                par_setpoints: parsed_par_setpoints,
+                hvdc_links: parsed_hvdc_links,
+                ..Default::default()
+            },
             ac: surge_opf::ScopfAcSettings {
                 opf: surge_opf::AcOpfOptions {
                     tolerance,

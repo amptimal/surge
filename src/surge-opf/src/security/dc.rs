@@ -20,7 +20,7 @@ use surge_solution::{
 use tracing::{debug, info, warn};
 
 use super::dc_contingencies::prepare_preventive_contingencies;
-use super::dc_model::build_preventive_base_model;
+use super::dc_model::{build_preventive_base_model, collect_par_branch_set};
 use super::dc_support::{
     ContingencyData, CorrectiveCtgBlock, CutInfo, CutType, ViolationInfo, get_ptdf,
 };
@@ -44,6 +44,101 @@ fn branch_loading_pct_from_flows(network: &Network, branch_p_from_mw: &[f64]) ->
                 f64::NAN
             } else {
                 pf_mw.abs() / branch.rating_a_mva * 100.0
+            }
+        })
+        .collect()
+}
+
+fn update_variable_hvdc_injections_from_solution(
+    solution_x: &[f64],
+    hvdc_offset: usize,
+    hvdc_var_to_inj_idx: &[usize],
+    hvdc_var_loss_params: &[(f64, f64)],
+    hvdc_injections: &mut [(usize, usize, f64, f64)],
+) {
+    debug_assert_eq!(hvdc_var_to_inj_idx.len(), hvdc_var_loss_params.len());
+    for (k, &inj_idx) in hvdc_var_to_inj_idx.iter().enumerate() {
+        let p_dc_pu = solution_x[hvdc_offset + k];
+        let (loss_a_pu, loss_b_frac) = hvdc_var_loss_params[k];
+        hvdc_injections[inj_idx].2 = -p_dc_pu; // rectifier draws from the AC grid
+        hvdc_injections[inj_idx].3 = p_dc_pu * (1.0 - loss_b_frac) - loss_a_pu;
+    }
+}
+
+fn extract_angle_shadow_prices(
+    n_branches: usize,
+    angle_constrained_branches: &[usize],
+    row_duals: &[f64],
+    row_offset: usize,
+    base: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    let mut shadow_price_angmin = vec![0.0_f64; n_branches];
+    let mut shadow_price_angmax = vec![0.0_f64; n_branches];
+
+    for (angle_row_idx, &branch_idx) in angle_constrained_branches.iter().enumerate() {
+        let lam = row_duals[row_offset + angle_row_idx] / base;
+        if lam > 0.0 {
+            shadow_price_angmin[branch_idx] = lam;
+        } else {
+            shadow_price_angmax[branch_idx] = -lam;
+        }
+    }
+
+    (shadow_price_angmin, shadow_price_angmax)
+}
+
+fn extract_par_results(
+    network: &Network,
+    bus_map: &HashMap<u32, usize>,
+    theta: &[f64],
+    base: f64,
+    par_setpoints: &[surge_solution::ParSetpoint],
+) -> Vec<surge_solution::ParResult> {
+    par_setpoints
+        .iter()
+        .map(|ps| {
+            if let Some(br_idx) = network.branches.iter().position(|br| {
+                br.in_service
+                    && br.from_bus == ps.from_bus
+                    && br.to_bus == ps.to_bus
+                    && br.circuit == ps.circuit
+            }) {
+                let br = &network.branches[br_idx];
+                let from_i = bus_map[&ps.from_bus];
+                let to_i = bus_map[&ps.to_bus];
+                let b_dc = br.b_dc();
+                let implied_shift_rad = if b_dc.abs() > 1e-20 {
+                    theta[from_i] - theta[to_i] - ps.target_mw / (base * b_dc)
+                } else {
+                    0.0
+                };
+                let implied_shift_deg = implied_shift_rad.to_degrees();
+                let within_limits = br
+                    .opf_control
+                    .as_ref()
+                    .map(|control| {
+                        implied_shift_rad >= control.phase_min_rad
+                            && implied_shift_rad <= control.phase_max_rad
+                    })
+                    .unwrap_or(false);
+
+                surge_solution::ParResult {
+                    from_bus: ps.from_bus,
+                    to_bus: ps.to_bus,
+                    circuit: ps.circuit.clone(),
+                    target_mw: ps.target_mw,
+                    implied_shift_deg,
+                    within_limits,
+                }
+            } else {
+                surge_solution::ParResult {
+                    from_bus: ps.from_bus,
+                    to_bus: ps.to_bus,
+                    circuit: ps.circuit.clone(),
+                    target_mw: ps.target_mw,
+                    implied_shift_deg: 0.0,
+                    within_limits: false,
+                }
             }
         })
         .collect()
@@ -102,19 +197,24 @@ pub(crate) fn solve_dc_preventive_with_context(
     let theta_offset = 0;
     let pg_offset = n_bus;
     let thermal_penalty_per_pu = options.penalty_config.thermal.marginal_cost_at(0.0) * base;
+    let par_branch_set = collect_par_branch_set(network, options, &ctx);
     let base_model = build_preventive_base_model(network, options, &ctx)?;
     let ctg_fg_indices = base_model.active_contingency_flowgate_indices.clone();
     let super::dc_model::PreventiveBaseModel {
         constrained_branches,
+        angle_constrained_branches,
         active_interface_indices: active_iface_indices,
         active_base_flowgate_indices: active_fg_indices,
         active_contingency_flowgate_indices: _,
         gen_bus_idx,
-        hvdc_injections,
+        mut hvdc_injections,
+        hvdc_var_to_inj_idx,
+        hvdc_var_loss_params,
         ptdf,
         n_flow,
         n_ang,
         n_ifg,
+        hvdc_offset,
         n_base_rows,
         n_var_base,
         col_cost,
@@ -122,9 +222,12 @@ pub(crate) fn solve_dc_preventive_with_context(
         hessian,
         col_lower,
         col_upper,
-        base_triplets,
+        mut base_triplets,
         mut base_row_lower,
         mut base_row_upper,
+        gen_balance_triplet_indices,
+        balance_row_offset,
+        pbusinj: model_pbusinj,
     } = base_model;
 
     if !hvdc_injections.is_empty() {
@@ -142,6 +245,7 @@ pub(crate) fn solve_dc_preventive_with_context(
             bus_map,
             gen_indices,
             gen_bus_idx: &gen_bus_idx,
+            par_branch_set: &par_branch_set,
             ptdf: &ptdf,
             n_bus,
             n_branches: n_br,
@@ -181,6 +285,11 @@ pub(crate) fn solve_dc_preventive_with_context(
     } = initial_cuts;
 
     let mut scopf_iter = 0u32;
+    let use_loss_factors = options.dc_opf.use_loss_factors;
+    let max_loss_iter = options.dc_opf.max_loss_iter;
+    let loss_tol = options.dc_opf.loss_tol;
+    let mut prev_dloss = vec![0.0f64; n_bus];
+    let mut loss_iter_count = 0usize;
 
     // Resolve LP solver once before the loop (shared across iterations).
     let lp_solver = context
@@ -290,6 +399,16 @@ pub(crate) fn solve_dc_preventive_with_context(
         // Extract θ and Pg
         let theta = &sol.x[theta_offset..theta_offset + n_bus];
         let pg_pu = &sol.x[pg_offset..pg_offset + n_gen];
+
+        // Update HVDC injections from the LP solution for variable links.
+        // Contingency evaluation uses these to compute post-trip flow shifts.
+        update_variable_hvdc_injections_from_solution(
+            &sol.x,
+            hvdc_offset,
+            &hvdc_var_to_inj_idx,
+            &hvdc_var_loss_params,
+            &mut hvdc_injections,
+        );
 
         // Compute base branch flows from θ: flow[l] = b_dc_l * (θ_from - θ_to - shift_rad_l)
         let mut base_flow = vec![0.0; n_br];
@@ -719,7 +838,94 @@ pub(crate) fn solve_dc_preventive_with_context(
         }
 
         if violations.is_empty() {
-            // Converged — extract solution
+            // Cutting-plane converged. Check if loss iteration is needed.
+            if use_loss_factors && loss_iter_count < max_loss_iter {
+                use crate::dc::loss_factors::{
+                    compute_dc_loss_sensitivities, compute_total_dc_losses,
+                };
+                let theta = &sol.x[theta_offset..theta_offset + n_bus];
+                let dloss_dp = compute_dc_loss_sensitivities(network, theta, bus_map, &ptdf);
+
+                if loss_iter_count > 0 {
+                    let max_change = dloss_dp
+                        .iter()
+                        .zip(prev_dloss.iter())
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0f64, f64::max);
+                    if max_change < loss_tol {
+                        // Loss factors converged — proceed to result.
+                    } else {
+                        prev_dloss.copy_from_slice(&dloss_dp);
+
+                        // Update gen coefficients in base triplets.
+                        for (j, &ti) in gen_balance_triplet_indices.iter().enumerate() {
+                            let bus_idx = gen_bus_idx[j];
+                            let pf_inv = (1.0 - dloss_dp[bus_idx]).clamp(0.5, 1.5);
+                            base_triplets[ti].val = -pf_inv;
+                        }
+
+                        // Update power balance RHS with loss allocation.
+                        let total_loss_pu = compute_total_dc_losses(network, theta, bus_map);
+                        let total_load_pu: f64 = bus_pd_mw
+                            .iter()
+                            .map(|&pd| pd / base)
+                            .sum::<f64>()
+                            .abs()
+                            .max(1e-10);
+                        for i in 0..n_bus {
+                            let load_share = (bus_pd_mw[i] / base).abs() / total_load_pu;
+                            let loss_at_bus = total_loss_pu * load_share;
+                            let pd_pu = bus_pd_mw[i] / base;
+                            let gs_pu = network.buses[i].shunt_conductance_mw / base;
+                            let rhs = -pd_pu - gs_pu - model_pbusinj[i] - loss_at_bus;
+                            base_row_lower[balance_row_offset + i] = rhs;
+                            base_row_upper[balance_row_offset + i] = rhs;
+                        }
+
+                        loss_iter_count += 1;
+                        info!(
+                            loss_iter = loss_iter_count,
+                            max_change, "loss factor iteration — re-solving SCOPF"
+                        );
+                        continue; // re-enter cutting-plane loop
+                    }
+                } else {
+                    prev_dloss.copy_from_slice(&dloss_dp);
+
+                    // First loss iteration: update coefficients.
+                    for (j, &ti) in gen_balance_triplet_indices.iter().enumerate() {
+                        let bus_idx = gen_bus_idx[j];
+                        let pf_inv = (1.0 - dloss_dp[bus_idx]).clamp(0.5, 1.5);
+                        base_triplets[ti].val = -pf_inv;
+                    }
+
+                    let total_loss_pu = compute_total_dc_losses(network, theta, bus_map);
+                    let total_load_pu: f64 = bus_pd_mw
+                        .iter()
+                        .map(|&pd| pd / base)
+                        .sum::<f64>()
+                        .abs()
+                        .max(1e-10);
+                    for i in 0..n_bus {
+                        let load_share = (bus_pd_mw[i] / base).abs() / total_load_pu;
+                        let loss_at_bus = total_loss_pu * load_share;
+                        let pd_pu = bus_pd_mw[i] / base;
+                        let gs_pu = network.buses[i].shunt_conductance_mw / base;
+                        let rhs = -pd_pu - gs_pu - model_pbusinj[i] - loss_at_bus;
+                        base_row_lower[balance_row_offset + i] = rhs;
+                        base_row_upper[balance_row_offset + i] = rhs;
+                    }
+
+                    loss_iter_count += 1;
+                    info!(
+                        loss_iter = loss_iter_count,
+                        "loss factor iteration — re-solving SCOPF"
+                    );
+                    continue; // re-enter cutting-plane loop
+                }
+            }
+
+            // Fully converged — extract solution
             let n_ctg_cuts = cut_metadata.len();
 
             info!(
@@ -735,9 +941,14 @@ pub(crate) fn solve_dc_preventive_with_context(
                 .map(|i| sol.row_dual[n_flow + n_ang + n_ifg + i] / base)
                 .collect();
 
-            // Per-island energy decomposition
-            let (lmp_energy, _, _) =
-                crate::dc::island_lmp::decompose_lmp_lossless(&lmp, &island_refs);
+            // Per-island energy decomposition (with loss component when active)
+            let (lmp_energy, _, lmp_loss) = if use_loss_factors && loss_iter_count > 0 {
+                use crate::dc::loss_factors::compute_dc_loss_sensitivities;
+                let dloss_dp = compute_dc_loss_sensitivities(network, theta, bus_map, &ptdf);
+                crate::dc::island_lmp::decompose_lmp_with_losses(&lmp, &dloss_dp, &island_refs)
+            } else {
+                crate::dc::island_lmp::decompose_lmp_lossless(&lmp, &island_refs)
+            };
 
             // Base congestion from branch flow duals (rows 0..n_flow)
             let mut lmp_base_congestion = vec![0.0; n_bus];
@@ -800,11 +1011,12 @@ pub(crate) fn solve_dc_preventive_with_context(
                 }
             }
 
-            // Total congestion = LMP - per-island energy
+            // Total congestion = LMP - energy - loss
             let lmp_congestion: Vec<f64> = lmp
                 .iter()
                 .zip(lmp_energy.iter())
-                .map(|(&l, &e)| l - e)
+                .zip(lmp_loss.iter())
+                .map(|((&l, &e), &lo)| l - e - lo)
                 .collect();
 
             // Branch shadow prices (base-case)
@@ -812,6 +1024,13 @@ pub(crate) fn solve_dc_preventive_with_context(
             for (ci, &l) in constrained_branches.iter().enumerate() {
                 branch_shadow_prices[l] = sol.row_dual[ci] / base;
             }
+            let (shadow_price_angmin, shadow_price_angmax) = extract_angle_shadow_prices(
+                n_br,
+                &angle_constrained_branches,
+                &sol.row_dual,
+                n_flow,
+                base,
+            );
 
             // Build PF solution from optimal dispatch
             let gen_p_mw: Vec<f64> = pg_pu.iter().map(|&p| p * base).collect();
@@ -984,7 +1203,12 @@ pub(crate) fn solve_dc_preventive_with_context(
                 })
                 .collect();
             let total_generation_mw_scopf: f64 = gen_p_mw.iter().sum();
-            let total_losses_mw_scopf = 0.0; // DC SCOPF is lossless
+            let total_losses_mw_scopf = if use_loss_factors && loss_iter_count > 0 {
+                use crate::dc::loss_factors::compute_total_dc_losses;
+                compute_total_dc_losses(network, theta, bus_map) * base
+            } else {
+                0.0
+            };
 
             // Extract generator bound duals from LP column duals.
             // HiGHS col_dual: negative at lower bound, positive at upper bound.
@@ -995,6 +1219,8 @@ pub(crate) fn solve_dc_preventive_with_context(
             let mu_pg_max_scopf: Vec<f64> = (0..n_gen)
                 .map(|j| sol.col_dual[pg_offset + j].max(0.0) / base)
                 .collect();
+            let par_results =
+                extract_par_results(network, bus_map, theta, base, &options.dc_opf.par_setpoints);
 
             return Ok(ScopfResult {
                 base_opf: OpfSolution {
@@ -1016,14 +1242,14 @@ pub(crate) fn solve_dc_preventive_with_context(
                         lmp,
                         lmp_energy,
                         lmp_congestion,
-                        lmp_loss: vec![0.0; n_bus],
+                        lmp_loss,
                         lmp_reactive: vec![],
                     },
                     branches: OpfBranchResults {
                         branch_loading_pct,
                         branch_shadow_prices,
-                        shadow_price_angmin: vec![],
-                        shadow_price_angmax: vec![],
+                        shadow_price_angmin,
+                        shadow_price_angmax,
                         flowgate_shadow_prices: {
                             let mut v = vec![0.0; network.flowgates.len()];
                             for (ri, &fi) in active_fg_indices.iter().enumerate() {
@@ -1048,7 +1274,7 @@ pub(crate) fn solve_dc_preventive_with_context(
                     total_load_mw,
                     total_generation_mw: total_generation_mw_scopf,
                     total_losses_mw: total_losses_mw_scopf,
-                    par_results: vec![],
+                    par_results,
                     virtual_bid_results: vec![],
                     benders_cut_duals: vec![],
                     solve_time_secs: solve_time,
@@ -1060,9 +1286,7 @@ pub(crate) fn solve_dc_preventive_with_context(
                 mode: ScopfMode::Preventive,
                 iterations: scopf_iter + 1,
                 converged: true,
-                total_contingencies_evaluated: ctg_data.len()
-                    + gen_ctg_data.len()
-                    + n2_ctg_data.len(),
+                total_contingencies_evaluated: contingencies.len(),
                 total_contingency_constraints: n_ctg_cuts,
                 binding_contingencies: binding,
                 lmp_contingency_congestion: lmp_ctg_congestion,
@@ -1498,9 +1722,15 @@ pub(crate) fn solve_dc_corrective_with_context(
         .map(|&gi| bus_map[&network.generators[gi].bus])
         .collect();
 
+    // --- PAR branch exclusion ---
+    let par_branch_set = collect_par_branch_set(network, options, &ctx);
+
     // --- Constrained branches ---
     let constrained_branches: Vec<usize> = if options.dc_opf.enforce_thermal_limits {
         ctx.constrained_branch_indices(options.min_rate_a)
+            .into_iter()
+            .filter(|idx| !par_branch_set.contains(idx))
+            .collect()
     } else {
         Vec::new()
     };
@@ -1515,32 +1745,54 @@ pub(crate) fn solve_dc_corrective_with_context(
     // --- Identify angle-constrained branches ---
     // Only enforce when angmin > -π or angmax < +π (tighter than unconstrained default).
     // angmin/angmax are stored in radians by the IO parsers.
-    const ANG_UNCONSTRAINED_LO_C: f64 = -std::f64::consts::PI;
-    const ANG_UNCONSTRAINED_HI_C: f64 = std::f64::consts::PI;
-    let mut angle_constrained_branches_c: Vec<usize> = Vec::new();
-    for l in 0..n_br {
-        let br = &network.branches[l];
-        if !br.in_service {
-            continue;
-        }
-        let lo = br.angle_diff_min_rad.unwrap_or(f64::NEG_INFINITY);
-        let hi = br.angle_diff_max_rad.unwrap_or(f64::INFINITY);
-        if lo > ANG_UNCONSTRAINED_LO_C || hi < ANG_UNCONSTRAINED_HI_C {
-            angle_constrained_branches_c.push(l);
-        }
-    }
+    // Gated by options.enforce_angle_limits.
+    let angle_constrained_branches_c: Vec<usize> = if options.enforce_angle_limits {
+        const ANG_UNCONSTRAINED_LO_C: f64 = -std::f64::consts::PI;
+        const ANG_UNCONSTRAINED_HI_C: f64 = std::f64::consts::PI;
+        (0..n_br)
+            .filter(|&l| {
+                let br = &network.branches[l];
+                if !br.in_service {
+                    return false;
+                }
+                let lo = br.angle_diff_min_rad.unwrap_or(f64::NEG_INFINITY);
+                let hi = br.angle_diff_max_rad.unwrap_or(f64::INFINITY);
+                lo > ANG_UNCONSTRAINED_LO_C || hi < ANG_UNCONSTRAINED_HI_C
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let n_ang_c = angle_constrained_branches_c.len();
 
+    // Variable HVDC links from DcOpfOptions.
+    let all_hvdc_opf_links = options.dc_opf.hvdc_links.as_deref().unwrap_or(&[]);
+    let hvdc_var_c: Vec<&crate::dc::opf::HvdcOpfLink> = all_hvdc_opf_links
+        .iter()
+        .filter(|h| h.is_variable())
+        .collect();
+    let n_hvdc_c = hvdc_var_c.len();
+
+    let has_gen_slacks_c = options.dc_opf.gen_limit_penalty.is_some();
+    let n_gen_slacks_c = if has_gen_slacks_c { n_gen } else { 0 };
+
     // --- Pre-contingency variable layout ---
-    // x_base = [θ⁰ | Pg⁰ | s_upper_base | s_lower_base]
+    // x_base = [θ⁰ | Pg⁰ | P_hvdc⁰ | s_upper_base | s_lower_base
+    //           | sa_upper | sa_lower | sg_upper | sg_lower]
     let theta0_off = 0usize;
     let pg0_off = n_bus;
-    let s_upper_base_off = n_bus + n_gen;
-    let s_lower_base_off = n_bus + n_gen + n_flow;
-    let base_n_var = n_bus + n_gen + 2 * n_flow;
+    let hvdc0_off = n_bus + n_gen;
+    let s_upper_base_off = hvdc0_off + n_hvdc_c;
+    let s_lower_base_off = s_upper_base_off + n_flow;
+    let sa_upper_base_off = s_lower_base_off + n_flow;
+    let sa_lower_base_off = sa_upper_base_off + n_ang_c;
+    let sg_upper_base_off = sa_lower_base_off + n_ang_c;
+    let sg_lower_base_off = sg_upper_base_off + n_gen_slacks_c;
+    let base_n_var = sg_lower_base_off + n_gen_slacks_c;
 
     // Penalty cost per per-unit thermal violation (matches dc_opf_lp.rs)
     let thermal_penalty_per_pu = options.penalty_config.thermal.marginal_cost_at(0.0) * base;
+    let angle_penalty_per_rad = options.penalty_config.angle.marginal_cost_at(0.0);
 
     // --- PTDF for LODF calculation ---
     let all_branches_ptdf: Vec<usize> = (0..n_br).collect();
@@ -1559,7 +1811,7 @@ pub(crate) fn solve_dc_corrective_with_context(
     let monitored_branches: Vec<usize> = (0..n_br)
         .filter(|&l| {
             let br = &network.branches[l];
-            br.in_service && br.rating_a_mva >= options.min_rate_a
+            br.in_service && !par_branch_set.contains(&l) && br.rating_a_mva >= options.min_rate_a
         })
         .collect();
 
@@ -1575,7 +1827,10 @@ pub(crate) fn solve_dc_corrective_with_context(
                 continue;
             }
             let outaged_br = ctg.branch_indices[0];
-            if outaged_br >= n_br || !network.branches[outaged_br].in_service {
+            if outaged_br >= n_br
+                || par_branch_set.contains(&outaged_br)
+                || !network.branches[outaged_br].in_service
+            {
                 continue;
             }
             let br = &network.branches[outaged_br];
@@ -1643,6 +1898,19 @@ pub(crate) fn solve_dc_corrective_with_context(
         obj_coeffs_base[s_upper_base_off + ci] = thermal_penalty_per_pu;
         obj_coeffs_base[s_lower_base_off + ci] = thermal_penalty_per_pu;
     }
+    // Angle slack penalty costs.
+    for ai in 0..n_ang_c {
+        obj_coeffs_base[sa_upper_base_off + ai] = angle_penalty_per_rad;
+        obj_coeffs_base[sa_lower_base_off + ai] = angle_penalty_per_rad;
+    }
+    // Gen-limit slack penalty costs.
+    if let Some(penalty) = options.dc_opf.gen_limit_penalty {
+        let penalty_pu = penalty * base;
+        for j in 0..n_gen {
+            obj_coeffs_base[sg_upper_base_off + j] = penalty_pu;
+            obj_coeffs_base[sg_lower_base_off + j] = penalty_pu;
+        }
+    }
 
     let has_quadratic = q_diag.iter().any(|&v| v.abs() > 1e-20);
 
@@ -1658,8 +1926,18 @@ pub(crate) fn solve_dc_corrective_with_context(
         &island_refs,
     );
     for (j, &gi) in gen_indices.iter().enumerate() {
-        col_lower_base[pg0_off + j] = network.generators[gi].pmin / base;
-        col_upper_base[pg0_off + j] = network.generators[gi].pmax / base;
+        if has_gen_slacks_c {
+            col_lower_base[pg0_off + j] = f64::NEG_INFINITY;
+            col_upper_base[pg0_off + j] = f64::INFINITY;
+        } else {
+            col_lower_base[pg0_off + j] = network.generators[gi].pmin / base;
+            col_upper_base[pg0_off + j] = network.generators[gi].pmax / base;
+        }
+    }
+    // HVDC variable bounds.
+    for (k, hvdc) in hvdc_var_c.iter().enumerate() {
+        col_lower_base[hvdc0_off + k] = hvdc.p_dc_min_mw / base;
+        col_upper_base[hvdc0_off + k] = hvdc.p_dc_max_mw / base;
     }
     // Base thermal slack bounds: [0, +∞)
     for ci in 0..n_flow {
@@ -1668,15 +1946,30 @@ pub(crate) fn solve_dc_corrective_with_context(
         col_lower_base[s_lower_base_off + ci] = 0.0;
         col_upper_base[s_lower_base_off + ci] = f64::INFINITY;
     }
+    // Angle slack bounds: [0, +∞)
+    for ai in 0..n_ang_c {
+        col_lower_base[sa_upper_base_off + ai] = 0.0;
+        col_upper_base[sa_upper_base_off + ai] = f64::INFINITY;
+        col_lower_base[sa_lower_base_off + ai] = 0.0;
+        col_upper_base[sa_lower_base_off + ai] = f64::INFINITY;
+    }
+    // Gen-limit slack bounds.
+    for j in 0..n_gen_slacks_c {
+        col_lower_base[sg_upper_base_off + j] = 0.0;
+        col_upper_base[sg_upper_base_off + j] = f64::INFINITY;
+        col_lower_base[sg_lower_base_off + j] = 0.0;
+        col_upper_base[sg_lower_base_off + j] = f64::INFINITY;
+    }
 
     // --- Base constraint triplets (pre-contingency, fixed) ---
     // Row layout (base):
     //   0..n_flow                      : branch thermal limits Bf*θ⁰ ∈ [-fmax, fmax]
     //   n_flow..n_flow+n_ang_c         : angle diff limits θ_from - θ_to ∈ [angmin, angmax]
     //   n_flow+n_ang_c..+n_bus         : power balance B*θ⁰ - A_gen*Pg⁰ = -Pd
+    //   ..+2*n_gen_slacks              : gen-limit soft constraints (if enabled)
     //
     // These rows reference only base-variable columns (0..base_n_var).
-    let base_n_row = n_flow + n_ang_c + n_bus;
+    let base_n_row = n_flow + n_ang_c + n_bus + 2 * n_gen_slacks_c;
 
     let mut base_triplets: Vec<Triplet<f64>> = Vec::new();
 
@@ -1712,7 +2005,7 @@ pub(crate) fn solve_dc_corrective_with_context(
         });
     }
 
-    // Angle difference rows (n_flow..n_flow+n_ang_c): θ_from - θ_to ∈ [angmin, angmax]
+    // Angle difference rows (n_flow..n_flow+n_ang_c): soft via penalty slacks
     for (ai, &l) in angle_constrained_branches_c.iter().enumerate() {
         let br = &network.branches[l];
         let from = bus_map[&br.from_bus];
@@ -1728,11 +2021,21 @@ pub(crate) fn solve_dc_corrective_with_context(
             col: theta0_off + to,
             val: -1.0,
         });
+        base_triplets.push(Triplet {
+            row: ang_row,
+            col: sa_upper_base_off + ai,
+            val: -1.0,
+        });
+        base_triplets.push(Triplet {
+            row: ang_row,
+            col: sa_lower_base_off + ai,
+            val: 1.0,
+        });
     }
 
     // Power balance rows (B_bus * θ⁰): rows n_flow+n_ang_c..n_flow+n_ang_c+n_bus
-    for branch in &network.branches {
-        if !branch.in_service || branch.x.abs() < 1e-20 {
+    for (br_idx, branch) in network.branches.iter().enumerate() {
+        if !branch.in_service || branch.x.abs() < 1e-20 || par_branch_set.contains(&br_idx) {
             continue;
         }
         let from = bus_map[&branch.from_bus];
@@ -1762,12 +2065,57 @@ pub(crate) fn solve_dc_corrective_with_context(
         });
     }
     // -A_gen block
+    let mut gen_balance_triplet_indices_c = Vec::with_capacity(gen_bus_idx.len());
     for (j, &bus_idx) in gen_bus_idx.iter().enumerate() {
+        gen_balance_triplet_indices_c.push(base_triplets.len());
         base_triplets.push(Triplet {
             row: n_flow + n_ang_c + bus_idx,
             col: pg0_off + j,
             val: -1.0,
         });
+    }
+    let balance_row_offset_c = n_flow + n_ang_c;
+    // HVDC variable link power balance coefficients.
+    let hvdc_from_idx_c: Vec<usize> = hvdc_var_c.iter().map(|h| bus_map[&h.from_bus]).collect();
+    let hvdc_to_idx_c: Vec<usize> = hvdc_var_c.iter().map(|h| bus_map[&h.to_bus]).collect();
+    for (k, hvdc) in hvdc_var_c.iter().enumerate() {
+        base_triplets.push(Triplet {
+            row: n_flow + n_ang_c + hvdc_from_idx_c[k],
+            col: hvdc0_off + k,
+            val: 1.0,
+        });
+        base_triplets.push(Triplet {
+            row: n_flow + n_ang_c + hvdc_to_idx_c[k],
+            col: hvdc0_off + k,
+            val: -(1.0 - hvdc.loss_b_frac),
+        });
+    }
+    // Gen-limit soft constraint rows.
+    if has_gen_slacks_c {
+        let gen_pmax_row_c = n_flow + n_ang_c + n_bus;
+        let gen_pmin_row_c = gen_pmax_row_c + n_gen;
+        for j in 0..n_gen {
+            base_triplets.push(Triplet {
+                row: gen_pmax_row_c + j,
+                col: pg0_off + j,
+                val: 1.0,
+            });
+            base_triplets.push(Triplet {
+                row: gen_pmax_row_c + j,
+                col: sg_upper_base_off + j,
+                val: -1.0,
+            });
+            base_triplets.push(Triplet {
+                row: gen_pmin_row_c + j,
+                col: pg0_off + j,
+                val: -1.0,
+            });
+            base_triplets.push(Triplet {
+                row: gen_pmin_row_c + j,
+                col: sg_lower_base_off + j,
+                val: -1.0,
+            });
+        }
     }
 
     // --- Base row bounds ---
@@ -1800,12 +2148,91 @@ pub(crate) fn solve_dc_corrective_with_context(
         pbusinj_corrective[from_idx] += pf;
         pbusinj_corrective[to_idx] -= pf;
     }
+
+    // HVDC link injections.
+    if !all_hvdc_opf_links.is_empty() {
+        for hvdc in all_hvdc_opf_links.iter().filter(|h| !h.is_variable()) {
+            let p_dc = hvdc.p_dc_min_mw;
+            let p_inv = hvdc.p_inv_mw(p_dc);
+            let fi = bus_map[&hvdc.from_bus];
+            pbusinj_corrective[fi] += p_dc / base;
+            let ti = bus_map[&hvdc.to_bus];
+            pbusinj_corrective[ti] -= p_inv / base;
+        }
+        for (k, hvdc) in hvdc_var_c.iter().enumerate() {
+            let ti = hvdc_to_idx_c[k];
+            pbusinj_corrective[ti] += hvdc.loss_a_mw / base;
+        }
+    } else {
+        let hvdc_links_corrective = surge_hvdc::interop::links_from_network(network);
+        for link in &hvdc_links_corrective {
+            if let Some(&fi) = bus_map.get(&link.from_bus()) {
+                pbusinj_corrective[fi] += link.p_dc_mw() / base;
+            }
+            if let Some(&ti) = bus_map.get(&link.to_bus()) {
+                pbusinj_corrective[ti] -= link.p_dc_mw() / base;
+            }
+        }
+    }
+
+    // Multi-terminal DC (MTDC) grid injections.
+    {
+        let dc_grid_results =
+            surge_hvdc::interop::dc_grid_injections(network).map_err(|error| {
+                DcOpfError::SolverError(format!("explicit DC-grid solve failed: {error}"))
+            })?;
+        for inj in &dc_grid_results.injections {
+            if let Some(&i) = bus_map.get(&inj.ac_bus) {
+                pbusinj_corrective[i] -= inj.p_mw / base;
+            }
+        }
+    }
+
+    // PAR scheduled-interchange injections.
+    for ps in &options.dc_opf.par_setpoints {
+        if let Some(&br_idx) = ctx
+            .branch_idx_map
+            .get(&(ps.from_bus, ps.to_bus, ps.circuit.clone()))
+        {
+            let br = &network.branches[br_idx];
+            if !br.in_service || br.x.abs() < 1e-20 {
+                continue;
+            }
+            // Undo PST phase-shift contribution
+            if br.phase_shift_rad.abs() >= 1e-12 {
+                let pf = br.b_dc() * br.phase_shift_rad;
+                let fi = bus_map[&br.from_bus];
+                let ti = bus_map[&br.to_bus];
+                pbusinj_corrective[fi] -= pf;
+                pbusinj_corrective[ti] += pf;
+            }
+            // Add scheduled-interchange injection
+            let fi = bus_map[&ps.from_bus];
+            let ti = bus_map[&ps.to_bus];
+            pbusinj_corrective[fi] += ps.target_mw / base;
+            pbusinj_corrective[ti] -= ps.target_mw / base;
+        }
+    }
+
     for i in 0..n_bus {
         let pd_pu = bus_pd_mw[i] / base;
         let gs_pu = network.buses[i].shunt_conductance_mw / base;
         let rhs = -pd_pu - gs_pu - pbusinj_corrective[i];
         base_row_lower.push(rhs);
         base_row_upper.push(rhs);
+    }
+    // Gen-limit soft constraint row bounds.
+    if has_gen_slacks_c {
+        for &gi in gen_indices {
+            let g = &network.generators[gi];
+            base_row_lower.push(f64::NEG_INFINITY);
+            base_row_upper.push(g.pmax / base);
+        }
+        for &gi in gen_indices {
+            let g = &network.generators[gi];
+            base_row_lower.push(f64::NEG_INFINITY);
+            base_row_upper.push(-g.pmin / base);
+        }
     }
 
     // --- Iterative corrective constraint generation ---
@@ -1837,6 +2264,11 @@ pub(crate) fn solve_dc_corrective_with_context(
         .map_err(DcOpfError::SolverError)?;
 
     let mut scopf_iter = 0u32;
+    let use_loss_factors_c = options.dc_opf.use_loss_factors;
+    let max_loss_iter_c = options.dc_opf.max_loss_iter;
+    let loss_tol_c = options.dc_opf.loss_tol;
+    let mut prev_dloss_c = vec![0.0f64; n_bus];
+    let mut loss_iter_count_c = 0usize;
 
     loop {
         // --- Build current LP dimensions ---
@@ -1877,8 +2309,8 @@ pub(crate) fn solve_dc_corrective_with_context(
                     q_value_vec.push(qd);
                 }
             }
-            // Base thermal slack columns (2*n_flow) + extra corrective columns: no Hessian
-            for _ in 0..(2 * n_flow + n_extra_col) {
+            // HVDC + thermal slacks + angle slacks + gen-limit slacks + extra corrective columns: no Hessian
+            for _ in 0..(n_hvdc_c + 2 * n_flow + 2 * n_ang_c + 2 * n_gen_slacks_c + n_extra_col) {
                 q_start_vec.push(q_index_vec.len() as i32);
             }
             q_start_vec.push(q_index_vec.len() as i32);
@@ -2027,22 +2459,88 @@ pub(crate) fn solve_dc_corrective_with_context(
                 n_ctg_constraints
             );
 
+            // Cutting-plane converged. Check if loss iteration is needed.
+            if use_loss_factors_c && loss_iter_count_c < max_loss_iter_c {
+                use crate::dc::loss_factors::{
+                    compute_dc_loss_sensitivities, compute_total_dc_losses,
+                };
+                let dloss_dp = compute_dc_loss_sensitivities(network, theta0, bus_map, &ptdf);
+
+                let need_resolve = if loss_iter_count_c > 0 {
+                    let max_change = dloss_dp
+                        .iter()
+                        .zip(prev_dloss_c.iter())
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0f64, f64::max);
+                    max_change >= loss_tol_c
+                } else {
+                    true
+                };
+
+                if need_resolve {
+                    prev_dloss_c.copy_from_slice(&dloss_dp);
+
+                    for (j, &ti) in gen_balance_triplet_indices_c.iter().enumerate() {
+                        let bus_idx = gen_bus_idx[j];
+                        let pf_inv = (1.0 - dloss_dp[bus_idx]).clamp(0.5, 1.5);
+                        base_triplets[ti].val = -pf_inv;
+                    }
+
+                    let total_loss_pu = compute_total_dc_losses(network, theta0, bus_map);
+                    let total_load_pu: f64 = bus_pd_mw
+                        .iter()
+                        .map(|&pd| pd / base)
+                        .sum::<f64>()
+                        .abs()
+                        .max(1e-10);
+                    for i in 0..n_bus {
+                        let load_share = (bus_pd_mw[i] / base).abs() / total_load_pu;
+                        let loss_at_bus = total_loss_pu * load_share;
+                        let pd_pu = bus_pd_mw[i] / base;
+                        let gs_pu = network.buses[i].shunt_conductance_mw / base;
+                        let rhs = -pd_pu - gs_pu - pbusinj_corrective[i] - loss_at_bus;
+                        base_row_lower[balance_row_offset_c + i] = rhs;
+                        base_row_upper[balance_row_offset_c + i] = rhs;
+                    }
+
+                    loss_iter_count_c += 1;
+                    info!(
+                        loss_iter = loss_iter_count_c,
+                        "corrective loss factor iteration — re-solving"
+                    );
+                    continue;
+                }
+            }
+
             // --- Extract results ---
             let gen_p_mw: Vec<f64> = pg0_pu.iter().map(|&p| p * base).collect();
             let total_cost = sol.objective + c0_total;
 
-            // LMPs from power balance duals (rows n_flow+n_ang_c..n_flow+n_ang_c+n_bus)
+            // LMPs from power balance duals
             let lmp: Vec<f64> = (0..n_bus)
                 .map(|i| sol.row_dual[n_flow + n_ang_c + i] / base)
                 .collect();
-            let (lmp_energy, lmp_congestion, _) =
-                crate::dc::island_lmp::decompose_lmp_lossless(&lmp, &island_refs);
+            let (lmp_energy, lmp_congestion, lmp_loss) =
+                if use_loss_factors_c && loss_iter_count_c > 0 {
+                    use crate::dc::loss_factors::compute_dc_loss_sensitivities;
+                    let dloss_dp = compute_dc_loss_sensitivities(network, theta0, bus_map, &ptdf);
+                    crate::dc::island_lmp::decompose_lmp_with_losses(&lmp, &dloss_dp, &island_refs)
+                } else {
+                    crate::dc::island_lmp::decompose_lmp_lossless(&lmp, &island_refs)
+                };
 
             // Branch shadow prices
             let mut branch_shadow_prices = vec![0.0f64; n_br];
             for (ci, &l) in constrained_branches.iter().enumerate() {
                 branch_shadow_prices[l] = sol.row_dual[ci] / base;
             }
+            let (shadow_price_angmin, shadow_price_angmax) = extract_angle_shadow_prices(
+                n_br,
+                &angle_constrained_branches_c,
+                &sol.row_dual,
+                n_flow,
+                base,
+            );
 
             let va: Vec<f64> = theta0.to_vec();
             let mut p_inject = vec![0.0f64; n_bus];
@@ -2122,7 +2620,12 @@ pub(crate) fn solve_dc_corrective_with_context(
                 })
                 .collect();
             let total_generation_mw_cscopf: f64 = gen_p_mw.iter().sum();
-            let total_losses_mw_cscopf = 0.0; // DC corrective SCOPF is lossless
+            let total_losses_mw_cscopf = if use_loss_factors_c && loss_iter_count_c > 0 {
+                use crate::dc::loss_factors::compute_total_dc_losses;
+                compute_total_dc_losses(network, theta0, bus_map) * base
+            } else {
+                0.0
+            };
 
             // Extract generator bound duals from LP column duals.
             // Pre-contingency Pg⁰ variables are at columns pg0_off + j.
@@ -2133,6 +2636,13 @@ pub(crate) fn solve_dc_corrective_with_context(
             let mu_pg_max_cscopf: Vec<f64> = (0..n_gen)
                 .map(|j| sol.col_dual[pg0_off + j].max(0.0) / base)
                 .collect();
+            let par_results = extract_par_results(
+                network,
+                bus_map,
+                theta0,
+                base,
+                &options.dc_opf.par_setpoints,
+            );
 
             return Ok(ScopfResult {
                 base_opf: OpfSolution {
@@ -2154,14 +2664,14 @@ pub(crate) fn solve_dc_corrective_with_context(
                         lmp,
                         lmp_energy,
                         lmp_congestion,
-                        lmp_loss: vec![0.0; n_bus],
+                        lmp_loss,
                         lmp_reactive: vec![],
                     },
                     branches: OpfBranchResults {
                         branch_loading_pct,
                         branch_shadow_prices,
-                        shadow_price_angmin: vec![],
-                        shadow_price_angmax: vec![],
+                        shadow_price_angmin,
+                        shadow_price_angmax,
                         flowgate_shadow_prices: vec![],
                         interface_shadow_prices: vec![],
                         shadow_price_vm_min: vec![],
@@ -2172,7 +2682,7 @@ pub(crate) fn solve_dc_corrective_with_context(
                     total_load_mw,
                     total_generation_mw: total_generation_mw_cscopf,
                     total_losses_mw: total_losses_mw_cscopf,
-                    par_results: vec![],
+                    par_results,
                     virtual_bid_results: vec![],
                     benders_cut_duals: vec![],
                     solve_time_secs: solve_time,
@@ -2546,7 +3056,9 @@ mod tests {
 
     use super::*;
     use crate::dc::opf::DcOpfOptions;
+    use crate::security::{dc_contingencies, dc_model};
     use surge_network::network::Contingency;
+    use surge_solution::OpfSolution;
 
     /// Convenience wrapper: calls `solve_dc_preventive_with_context` with a default context.
     fn solve_dc_preventive(
@@ -2556,14 +3068,103 @@ mod tests {
         solve_dc_preventive_with_context(network, options, &ScopfRunContext::default())
     }
 
+    fn exact_cost_scopf_options() -> ScopfOptions {
+        ScopfOptions {
+            dc_opf: DcOpfOptions {
+                use_pwl_costs: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn make_par_scopf_test_network() -> Network {
+        use surge_network::market::CostCurve;
+        use surge_network::network::{Branch, BranchOpfControl, Bus, BusType, Generator};
+
+        let mut net = Network::new("par_scopf_test");
+        net.base_mva = 100.0;
+        net.buses.push(Bus::new(1, BusType::Slack, 100.0));
+        net.buses.push(Bus::new(2, BusType::PQ, 100.0));
+        net.buses.push(Bus::new(3, BusType::PQ, 100.0));
+
+        net.loads
+            .push(surge_network::network::Load::new(2, 80.0, 0.0));
+        net.loads
+            .push(surge_network::network::Load::new(3, 60.0, 0.0));
+
+        let mut par_branch = Branch::new_line(1, 2, 0.0, 0.2, 0.0);
+        par_branch.circuit = "1".to_string();
+        par_branch.rating_a_mva = 200.0;
+        par_branch.opf_control = Some(BranchOpfControl {
+            phase_min_rad: (-30.0_f64).to_radians(),
+            phase_max_rad: 30.0_f64.to_radians(),
+            ..BranchOpfControl::default()
+        });
+        net.branches.push(par_branch);
+
+        let mut br13 = Branch::new_line(1, 3, 0.0, 0.1, 0.0);
+        br13.circuit = "1".to_string();
+        br13.rating_a_mva = 200.0;
+        br13.angle_diff_min_rad = Some((-0.5_f64).to_radians());
+        br13.angle_diff_max_rad = Some(0.5_f64.to_radians());
+        net.branches.push(br13);
+
+        let mut br23 = Branch::new_line(2, 3, 0.0, 0.1, 0.0);
+        br23.circuit = "1".to_string();
+        br23.rating_a_mva = 200.0;
+        net.branches.push(br23);
+
+        let mut gen1 = Generator::new(1, 0.0, 1.0);
+        gen1.pmin = 0.0;
+        gen1.pmax = 200.0;
+        gen1.cost = Some(CostCurve::Polynomial {
+            startup: 0.0,
+            shutdown: 0.0,
+            coeffs: vec![20.0, 0.0],
+        });
+        net.generators.push(gen1);
+
+        let mut gen2 = Generator::new(3, 0.0, 1.0);
+        gen2.pmin = 0.0;
+        gen2.pmax = 100.0;
+        gen2.cost = Some(CostCurve::Polynomial {
+            startup: 0.0,
+            shutdown: 0.0,
+            coeffs: vec![25.0, 0.0],
+        });
+        net.generators.push(gen2);
+
+        net
+    }
+
+    fn assert_lmp_decomposition(opf: &OpfSolution) {
+        for i in 0..opf.pricing.lmp.len() {
+            let recomposed =
+                opf.pricing.lmp_energy[i] + opf.pricing.lmp_congestion[i] + opf.pricing.lmp_loss[i];
+            assert!(
+                (opf.pricing.lmp[i] - recomposed).abs() < 1e-8,
+                "bus {} LMP decomposition mismatch: {:.8} != {:.8} + {:.8} + {:.8}",
+                i,
+                opf.pricing.lmp[i],
+                opf.pricing.lmp_energy[i],
+                opf.pricing.lmp_congestion[i],
+                opf.pricing.lmp_loss[i]
+            );
+        }
+    }
+
     #[test]
     fn test_scopf_cost_geq_dcopf_case9() {
         let net = surge_io::load(case_path("case9")).unwrap();
 
-        let dcopf_opts = DcOpfOptions::default();
+        let dcopf_opts = DcOpfOptions {
+            use_pwl_costs: false,
+            ..Default::default()
+        };
         let dcopf_sol = crate::dc::opf::solve_dc_opf(&net, &dcopf_opts).unwrap().opf;
 
-        let scopf_opts = ScopfOptions::default();
+        let scopf_opts = exact_cost_scopf_options();
         let scopf_sol = solve_dc_preventive(&net, &scopf_opts).unwrap();
 
         assert!(
@@ -3051,7 +3652,7 @@ mod tests {
     fn test_corrective_scopf_cost_leq_preventive_case9() {
         let net = surge_io::load(case_path("case9")).unwrap();
 
-        let opts = ScopfOptions::default();
+        let opts = exact_cost_scopf_options();
         let preventive =
             solve_dc_preventive_with_context(&net, &opts, &ScopfRunContext::default()).unwrap();
         let corrective =
@@ -3092,12 +3693,18 @@ mod tests {
     fn test_corrective_scopf_cost_geq_dcopf_case9() {
         let net = surge_io::load(case_path("case9")).unwrap();
 
-        let dcopf_sol = crate::dc::opf::solve_dc_opf(&net, &DcOpfOptions::default())
-            .unwrap()
-            .opf;
+        let dcopf_sol = crate::dc::opf::solve_dc_opf(
+            &net,
+            &DcOpfOptions {
+                use_pwl_costs: false,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .opf;
         let corr_sol = solve_dc_corrective_with_context(
             &net,
-            &ScopfOptions::default(),
+            &exact_cost_scopf_options(),
             &ScopfRunContext::default(),
         )
         .unwrap();
@@ -3209,7 +3816,7 @@ mod tests {
     fn test_corrective_scopf_leq_preventive_case118() {
         let net = surge_io::load(case_path("case118")).unwrap();
 
-        let opts = ScopfOptions::default();
+        let opts = exact_cost_scopf_options();
         let preventive =
             solve_dc_preventive_with_context(&net, &opts, &ScopfRunContext::default()).unwrap();
         let corrective =
@@ -3322,6 +3929,25 @@ mod tests {
 
         let sol = result.unwrap();
         assert!(sol.base_opf.total_cost > 0.0, "cost should be positive");
+    }
+
+    #[test]
+    fn test_variable_hvdc_contingency_uses_loss_adjusted_injection() {
+        let mut hvdc_injections = vec![(1usize, 2usize, -0.25f64, 0.25f64)];
+        let hvdc_var_to_inj_idx = vec![0usize];
+        let hvdc_var_loss_params = vec![(0.03f64, 0.1f64)];
+        let solution_x = vec![0.0f64, 0.40f64];
+
+        update_variable_hvdc_injections_from_solution(
+            &solution_x,
+            1,
+            &hvdc_var_to_inj_idx,
+            &hvdc_var_loss_params,
+            &mut hvdc_injections,
+        );
+
+        assert!((hvdc_injections[0].2 + 0.40).abs() < 1e-12);
+        assert!((hvdc_injections[0].3 - 0.33).abs() < 1e-12);
     }
 
     // ---------------------------------------------------------------------------
@@ -3647,10 +4273,164 @@ mod tests {
         assert!(result.total_contingencies_evaluated > 0);
     }
 
-    /// SCOPF rejects flowgate constraints until aggregate corridor security cuts
-    /// are modeled as first-class constraints.
     #[test]
-    fn test_scopf_flowgate_constraints_are_rejected() {
+    fn test_prepare_preventive_contingencies_excludes_par_branches() {
+        let net = make_par_scopf_test_network();
+        let opts = ScopfOptions {
+            contingencies: Some(vec![
+                Contingency {
+                    id: "par_n1".into(),
+                    label: "Trip PAR branch".into(),
+                    branch_indices: vec![0],
+                    ..Default::default()
+                },
+                Contingency {
+                    id: "line_n1".into(),
+                    label: "Trip non-PAR branch".into(),
+                    branch_indices: vec![1],
+                    ..Default::default()
+                },
+                Contingency {
+                    id: "par_n2".into(),
+                    label: "Trip PAR and non-PAR branches".into(),
+                    branch_indices: vec![0, 2],
+                    ..Default::default()
+                },
+            ]),
+            dc_opf: DcOpfOptions {
+                par_setpoints: vec![surge_solution::ParSetpoint {
+                    from_bus: 1,
+                    to_bus: 2,
+                    circuit: "1".to_string(),
+                    target_mw: 30.0,
+                }],
+                ..Default::default()
+            },
+            screener: None,
+            ..Default::default()
+        };
+        let ctx = OpfNetworkContext::for_dc(&net).expect("PAR test context should build");
+        let base_model = dc_model::build_preventive_base_model(&net, &opts, &ctx)
+            .expect("preventive base model should build");
+        let par_branch_set = dc_model::collect_par_branch_set(&net, &opts, &ctx);
+        let prepared = dc_contingencies::prepare_preventive_contingencies(
+            &net,
+            &opts,
+            &ScopfRunContext::default(),
+            dc_contingencies::PreventiveContingencyInputs {
+                bus_map: &ctx.bus_map,
+                gen_indices: &ctx.gen_indices,
+                gen_bus_idx: &base_model.gen_bus_idx,
+                par_branch_set: &par_branch_set,
+                ptdf: &base_model.ptdf,
+                n_bus: ctx.n_bus,
+                n_branches: ctx.n_branches,
+                n_base_rows: base_model.n_base_rows,
+                n_var_base: base_model.n_var_base,
+                theta_offset: 0,
+                thermal_penalty_per_pu: opts.penalty_config.thermal.marginal_cost_at(0.0)
+                    * ctx.base_mva,
+                base: ctx.base_mva,
+            },
+        );
+
+        assert!(
+            par_branch_set.contains(&0),
+            "branch 0 should be recognized as PAR"
+        );
+        assert!(
+            !prepared.monitored_branches.contains(&0),
+            "PAR branches must not be monitored in preventive screening"
+        );
+        assert!(
+            prepared.ctg_data.iter().all(|cd| cd.outaged_br != 0),
+            "PAR outages must not be turned into single-branch contingency data"
+        );
+        assert!(
+            prepared
+                .n2_ctg_data
+                .iter()
+                .all(|n2| n2.k1 != 0 && n2.k2 != 0),
+            "PAR outages must not be turned into N-2 contingency data"
+        );
+        assert!(
+            prepared.ctg_data.iter().any(|cd| cd.outaged_br == 1),
+            "non-PAR outages should still be prepared"
+        );
+    }
+
+    #[test]
+    fn test_scopf_preventive_exposes_par_results_and_angle_duals() {
+        let net = make_par_scopf_test_network();
+        let opts = ScopfOptions {
+            contingencies: Some(vec![]),
+            dc_opf: DcOpfOptions {
+                enforce_thermal_limits: false,
+                par_setpoints: vec![surge_solution::ParSetpoint {
+                    from_bus: 1,
+                    to_bus: 2,
+                    circuit: "1".to_string(),
+                    target_mw: 30.0,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let result = solve_dc_preventive(&net, &opts).expect("preventive PAR SCOPF should solve");
+        assert_eq!(result.base_opf.par_results.len(), 1);
+        assert_eq!(
+            result.base_opf.branches.shadow_price_angmin.len(),
+            net.branches.len()
+        );
+        assert_eq!(
+            result.base_opf.branches.shadow_price_angmax.len(),
+            net.branches.len()
+        );
+        assert!(
+            result.base_opf.par_results[0].implied_shift_deg.is_finite(),
+            "preventive PAR result should include a finite implied shift"
+        );
+    }
+
+    #[test]
+    fn test_scopf_corrective_exposes_par_results_and_angle_duals() {
+        let net = make_par_scopf_test_network();
+        let opts = ScopfOptions {
+            mode: ScopfMode::Corrective,
+            contingencies: Some(vec![]),
+            dc_opf: DcOpfOptions {
+                enforce_thermal_limits: false,
+                par_setpoints: vec![surge_solution::ParSetpoint {
+                    from_bus: 1,
+                    to_bus: 2,
+                    circuit: "1".to_string(),
+                    target_mw: 30.0,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let result = solve_dc_corrective_with_context(&net, &opts, &ScopfRunContext::default())
+            .expect("corrective PAR SCOPF should solve");
+        assert_eq!(result.base_opf.par_results.len(), 1);
+        assert_eq!(
+            result.base_opf.branches.shadow_price_angmin.len(),
+            net.branches.len()
+        );
+        assert_eq!(
+            result.base_opf.branches.shadow_price_angmax.len(),
+            net.branches.len()
+        );
+        assert!(
+            result.base_opf.par_results[0].implied_shift_deg.is_finite(),
+            "corrective PAR result should include a finite implied shift"
+        );
+    }
+
+    #[test]
+    fn test_scopf_preventive_flowgate_constraints_are_supported() {
         let mut net = surge_io::load(case_path("case9")).unwrap();
 
         // Add a tight base-case flowgate on the first branch
@@ -3673,22 +4453,25 @@ mod tests {
         });
 
         let opts = ScopfOptions {
+            contingencies: Some(vec![]),
             enforce_flowgates: true,
             screener: None,
             ..Default::default()
         };
-        let err =
-            crate::security::solve_scopf(&net, &opts).expect_err("SCOPF should reject flowgates");
+        let result = crate::security::solve_scopf(&net, &opts)
+            .expect("preventive SCOPF should enforce flowgates");
         assert!(
-            matches!(err, ScopfError::UnsupportedSecurityConstraint { .. }),
-            "unexpected error: {err}"
+            result.base_opf.branches.flowgate_shadow_prices.len() == net.flowgates.len(),
+            "flowgate shadow prices should align with network.flowgates"
+        );
+        assert!(
+            result.base_opf.branches.flowgate_shadow_prices[0].abs() > 1e-4,
+            "binding flowgate should expose a non-zero shadow price"
         );
     }
 
-    /// SCOPF rejects interface constraints until aggregate corridor security cuts
-    /// are modeled as first-class constraints.
     #[test]
-    fn test_scopf_interface_constraints_are_rejected() {
+    fn test_scopf_preventive_interface_constraints_are_supported() {
         let mut net = surge_io::load(case_path("case9")).unwrap();
 
         // Add a tight interface on branch 0
@@ -3709,12 +4492,85 @@ mod tests {
         });
 
         let opts = ScopfOptions {
+            contingencies: Some(vec![]),
             enforce_flowgates: true,
             screener: None,
             ..Default::default()
         };
-        let err =
-            crate::security::solve_scopf(&net, &opts).expect_err("SCOPF should reject interfaces");
+        let result = crate::security::solve_scopf(&net, &opts)
+            .expect("preventive SCOPF should enforce interfaces");
+        assert!(
+            result.base_opf.branches.interface_shadow_prices.len() == net.interfaces.len(),
+            "interface shadow prices should align with network.interfaces"
+        );
+        assert!(
+            result.base_opf.branches.interface_shadow_prices[0].abs() > 1e-4,
+            "binding interface should expose a non-zero shadow price"
+        );
+    }
+
+    #[test]
+    fn test_scopf_corrective_flowgate_constraints_are_rejected() {
+        let mut net = surge_io::load(case_path("case9")).unwrap();
+        let br = &net.branches[0];
+        net.flowgates.push(surge_network::network::Flowgate {
+            name: "FG1".into(),
+            monitored: vec![surge_network::network::WeightedBranchRef::new(
+                br.from_bus,
+                br.to_bus,
+                br.circuit.clone(),
+                1.0,
+            )],
+            contingency_branch: None,
+            limit_mw: 50.0,
+            in_service: true,
+            limit_reverse_mw: 0.0,
+            limit_mw_schedule: vec![],
+            limit_reverse_mw_schedule: vec![],
+            hvdc_coefficients: vec![],
+        });
+
+        let opts = ScopfOptions {
+            mode: ScopfMode::Corrective,
+            enforce_flowgates: true,
+            screener: None,
+            ..Default::default()
+        };
+        let err = crate::security::solve_scopf(&net, &opts)
+            .expect_err("corrective SCOPF should still reject flowgates");
+        assert!(
+            matches!(err, ScopfError::UnsupportedSecurityConstraint { .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_scopf_corrective_interface_constraints_are_rejected() {
+        let mut net = surge_io::load(case_path("case9")).unwrap();
+        let br = &net.branches[0];
+        net.interfaces.push(surge_network::network::Interface {
+            name: "IF1".into(),
+            members: vec![surge_network::network::WeightedBranchRef::new(
+                br.from_bus,
+                br.to_bus,
+                br.circuit.clone(),
+                1.0,
+            )],
+            limit_forward_mw: 50.0,
+            limit_reverse_mw: 50.0,
+            in_service: true,
+            limit_forward_mw_schedule: vec![],
+            limit_reverse_mw_schedule: vec![],
+        });
+
+        let opts = ScopfOptions {
+            mode: ScopfMode::Corrective,
+            enforce_flowgates: true,
+            screener: None,
+            ..Default::default()
+        };
+        let err = crate::security::solve_scopf(&net, &opts)
+            .expect_err("corrective SCOPF should still reject interfaces");
         assert!(
             matches!(err, ScopfError::UnsupportedSecurityConstraint { .. }),
             "unexpected error: {err}"
@@ -3866,5 +4722,176 @@ mod tests {
         // The mixed contingency has 1 branch, so it goes into ctg_data
         // with the gen shift tracked in mixed_gen_shifts
         assert!(result.total_contingencies_evaluated > 0);
+    }
+
+    #[test]
+    fn test_scopf_gen_limit_slacks_case9() {
+        let net = surge_io::load(case_path("case9")).unwrap();
+        let opts = ScopfOptions {
+            dc_opf: DcOpfOptions {
+                gen_limit_penalty: Some(1000.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = solve_dc_preventive(&net, &opts).unwrap();
+        assert!(result.converged);
+        assert!(result.base_opf.total_cost > 0.0);
+    }
+
+    #[test]
+    fn test_scopf_loss_factors_case9() {
+        let net = surge_io::load(case_path("case9")).unwrap();
+        let opts_no_loss = ScopfOptions::default();
+        let opts_loss = ScopfOptions {
+            dc_opf: DcOpfOptions {
+                use_loss_factors: true,
+                max_loss_iter: 3,
+                loss_tol: 1e-3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result_no = solve_dc_preventive(&net, &opts_no_loss).unwrap();
+        let result_yes = solve_dc_preventive(&net, &opts_loss).unwrap();
+        assert!(result_yes.converged);
+        // With loss compensation, cost should be >= lossless (generators
+        // must produce more to cover losses).
+        assert!(
+            result_yes.base_opf.total_cost >= result_no.base_opf.total_cost - 0.01,
+            "loss-compensated cost ({:.2}) should be >= lossless ({:.2})",
+            result_yes.base_opf.total_cost,
+            result_no.base_opf.total_cost,
+        );
+        assert!(
+            result_yes.base_opf.total_generation_mw
+                >= result_no.base_opf.total_generation_mw - 0.01,
+            "loss-compensated generation ({:.3}) should be >= lossless ({:.3})",
+            result_yes.base_opf.total_generation_mw,
+            result_no.base_opf.total_generation_mw,
+        );
+        assert!(
+            result_yes.base_opf.total_losses_mw > 0.0,
+            "loss-compensated preventive SCOPF should report positive losses"
+        );
+        assert!(
+            result_yes
+                .base_opf
+                .pricing
+                .lmp_loss
+                .iter()
+                .any(|loss| loss.abs() > 1e-8),
+            "loss-compensated preventive SCOPF should expose a non-zero loss LMP component"
+        );
+        assert_lmp_decomposition(&result_yes.base_opf);
+    }
+
+    #[test]
+    fn test_scopf_corrective_loss_factors_case9() {
+        let net = surge_io::load(case_path("case9")).unwrap();
+        let opts_no_loss = ScopfOptions {
+            mode: ScopfMode::Corrective,
+            ..Default::default()
+        };
+        let opts_loss = ScopfOptions {
+            mode: ScopfMode::Corrective,
+            dc_opf: DcOpfOptions {
+                use_loss_factors: true,
+                max_loss_iter: 3,
+                loss_tol: 1e-3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result_no =
+            solve_dc_corrective_with_context(&net, &opts_no_loss, &ScopfRunContext::default())
+                .unwrap();
+        let result_yes =
+            solve_dc_corrective_with_context(&net, &opts_loss, &ScopfRunContext::default())
+                .unwrap();
+
+        assert!(result_yes.converged);
+        assert!(
+            result_yes.base_opf.total_cost >= result_no.base_opf.total_cost - 0.01,
+            "loss-compensated corrective cost ({:.2}) should be >= lossless ({:.2})",
+            result_yes.base_opf.total_cost,
+            result_no.base_opf.total_cost,
+        );
+        assert!(
+            result_yes.base_opf.total_generation_mw
+                >= result_no.base_opf.total_generation_mw - 0.01,
+            "loss-compensated corrective generation ({:.3}) should be >= lossless ({:.3})",
+            result_yes.base_opf.total_generation_mw,
+            result_no.base_opf.total_generation_mw,
+        );
+        assert!(
+            result_yes.base_opf.total_losses_mw > 0.0,
+            "loss-compensated corrective SCOPF should report positive losses"
+        );
+        assert!(
+            result_yes
+                .base_opf
+                .pricing
+                .lmp_loss
+                .iter()
+                .any(|loss| loss.abs() > 1e-8),
+            "loss-compensated corrective SCOPF should expose a non-zero loss LMP component"
+        );
+        assert_lmp_decomposition(&result_yes.base_opf);
+    }
+
+    #[test]
+    fn test_scopf_no_angle_limits_case9() {
+        let net = surge_io::load(case_path("case9")).unwrap();
+        let opts_on = ScopfOptions {
+            enforce_angle_limits: true,
+            ..Default::default()
+        };
+        let opts_off = ScopfOptions {
+            enforce_angle_limits: false,
+            ..Default::default()
+        };
+        let result_on = solve_dc_preventive(&net, &opts_on).unwrap();
+        let result_off = solve_dc_preventive(&net, &opts_off).unwrap();
+        assert!(result_on.converged);
+        assert!(result_off.converged);
+        // With angle limits off, cost should be <= cost with limits on
+        // (less constrained problem).
+        assert!(
+            result_off.base_opf.total_cost <= result_on.base_opf.total_cost + 0.01,
+            "no-angle cost ({:.2}) should be <= with-angle cost ({:.2})",
+            result_off.base_opf.total_cost,
+            result_on.base_opf.total_cost,
+        );
+    }
+
+    #[test]
+    fn test_scopf_corrective_case9() {
+        let net = surge_io::load(case_path("case9")).unwrap();
+        let opts = ScopfOptions {
+            mode: ScopfMode::Corrective,
+            ..Default::default()
+        };
+        let result =
+            solve_dc_corrective_with_context(&net, &opts, &ScopfRunContext::default()).unwrap();
+        assert!(result.converged);
+        assert!(result.base_opf.total_cost > 0.0);
+    }
+
+    #[test]
+    fn test_scopf_corrective_gen_slacks_case9() {
+        let net = surge_io::load(case_path("case9")).unwrap();
+        let opts = ScopfOptions {
+            mode: ScopfMode::Corrective,
+            dc_opf: DcOpfOptions {
+                gen_limit_penalty: Some(1000.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result =
+            solve_dc_corrective_with_context(&net, &opts, &ScopfRunContext::default()).unwrap();
+        assert!(result.converged);
+        assert!(result.base_opf.total_cost > 0.0);
     }
 }

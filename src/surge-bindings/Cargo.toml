@@ -10,7 +10,7 @@ rust-version.workspace = true
 description = "Surge CLI integration crate for the Surge power flow solver"
 keywords = ["power-systems", "cli", "power-flow", "solver"]
 categories = ["science", "simulation", "command-line-utilities"]
-publish = false
+publish = true
 
 [[bin]]
 name = "surge-solve"

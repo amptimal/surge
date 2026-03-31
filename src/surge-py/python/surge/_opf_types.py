@@ -588,6 +588,15 @@ class ScopfOptions:
             evaluates all N-1 branch contingencies.
         minimum_branch_rating_a_mva: Branches with rate_a below this
             value are treated as unconstrained. Default 1.0.
+        cost_model: DC-SCOPF cost formulation. PIECEWISE_LINEAR
+            (default) uses the LP epigraph and avoids HiGHS QP
+            numerical issues on large cases. QUADRATIC uses the exact
+            quadratic objective on small cases where the QP backend is
+            stable.
+        dc_opf: Optional DC-OPF sub-options for DC-SCOPF such as PWL
+            breakpoint count, loss-factor iteration, and soft
+            generator-limit penalties. SCOPF cost selection uses the
+            top-level ``cost_model`` field above. Default None.
     """
 
     formulation: ScopfFormulation = ScopfFormulation.DC
@@ -599,6 +608,9 @@ class ScopfOptions:
     enforce_voltage_security: bool = True
     max_contingencies: int = 0
     minimum_branch_rating_a_mva: float = 1.0
+    enforce_angle_limits: bool = True
+    cost_model: DcCostModel = DcCostModel.PIECEWISE_LINEAR
+    dc_opf: "DcOpfOptions | None" = None
 
     def __post_init__(self) -> None:
         _require_positive(
@@ -614,20 +626,36 @@ class ScopfOptions:
         )
 
     def to_native_kwargs(self, network: object | None = None) -> dict[str, object]:
-        return _compact_kwargs(
-            {
-                "formulation": self.formulation.value,
-                "mode": self.mode.value,
-                "corrective_ramp_window_min": self.corrective_ramp_window_minutes,
-                "voltage_threshold": self.voltage_threshold_pu,
-                "contingency_rating": self.contingency_rating.value,
-                "enforce_flowgates": self.enforce_flowgates,
-                "enforce_voltage_security": self.enforce_voltage_security,
-                "max_contingencies": self.max_contingencies,
-                "min_rate_a": self.minimum_branch_rating_a_mva,
-            },
-            network,
-        )
+        dc = self.dc_opf
+        kwargs: dict[str, object] = {
+            "formulation": self.formulation.value,
+            "mode": self.mode.value,
+            "corrective_ramp_window_min": self.corrective_ramp_window_minutes,
+            "voltage_threshold": self.voltage_threshold_pu,
+            "contingency_rating": self.contingency_rating.value,
+            "enforce_flowgates": self.enforce_flowgates,
+            "enforce_voltage_security": self.enforce_voltage_security,
+            "max_contingencies": self.max_contingencies,
+            "min_rate_a": self.minimum_branch_rating_a_mva,
+            "enforce_angle_limits": self.enforce_angle_limits,
+            # SCOPF uses the top-level cost_model; dc_opf carries the
+            # remaining DC sub-options such as breakpoints, losses,
+            # and soft-limit penalties.
+            "use_pwl_costs": self.cost_model is not DcCostModel.QUADRATIC,
+            "pwl_cost_breakpoints": dc.piecewise_linear_breakpoints if dc else 20,
+            "gen_limit_penalty": (
+                dc.generator_limit_penalty_per_mw
+                if dc and dc.generator_limit_mode is GeneratorLimitMode.SOFT
+                else None
+            ),
+            "use_loss_factors": dc.loss_model is DcLossModel.ITERATIVE if dc else False,
+            "max_loss_iter": dc.loss_iterations if dc else 3,
+            "loss_tol": dc.loss_tolerance if dc else 1e-3,
+            "enforce_thermal_limits": dc.enforce_thermal_limits if dc else True,
+            "par_setpoints": dc.par_setpoints if dc and dc.par_setpoints else None,
+            "hvdc_links": dc.hvdc_links if dc and dc.hvdc_links else None,
+        }
+        return _compact_kwargs(kwargs, network)
 
 
 @dataclass(frozen=True, kw_only=True)

@@ -27,7 +27,7 @@ codegen-units = 1
 strip = "symbols"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.87"
 license = "PolyForm-Noncommercial-1.0.0"
@@ -83,19 +83,19 @@ libloading = "0.8"
 clarabel = "0.11"
 
 # Workspace member cross-refs
-surge-network = { path = "src/surge-network", version = "0.1.0" }
-surge-solution = { path = "src/surge-solution", version = "0.1.0" }
-surge-sparse = { path = "src/surge-sparse", version = "0.1.0" }
-surge-io = { path = "src/surge-io", version = "0.1.0" }
-surge-topology = { path = "src/surge-topology", version = "0.1.0" }
-surge-dc = { path = "src/surge-dc", version = "0.1.0" }
-surge-ac = { path = "src/surge-ac", version = "0.1.0" }
-surge-hvdc = { path = "src/surge-hvdc", version = "0.1.0" }
-surge-contingency = { path = "src/surge-contingency", version = "0.1.0" }
-surge-opf = { path = "src/surge-opf", version = "0.1.0" }
-surge-transfer = { path = "src/surge-transfer", version = "0.1.0" }
-surge-bindings = { path = "src/surge-bindings", version = "0.1.0" }
-surge-py = { path = "src/surge-py", version = "0.1.0" }
+surge-network = { path = "src/surge-network", version = "0.1.1" }
+surge-solution = { path = "src/surge-solution", version = "0.1.1" }
+surge-sparse = { path = "src/surge-sparse", version = "0.1.1" }
+surge-io = { path = "src/surge-io", version = "0.1.1" }
+surge-topology = { path = "src/surge-topology", version = "0.1.1" }
+surge-dc = { path = "src/surge-dc", version = "0.1.1" }
+surge-ac = { path = "src/surge-ac", version = "0.1.1" }
+surge-hvdc = { path = "src/surge-hvdc", version = "0.1.1" }
+surge-contingency = { path = "src/surge-contingency", version = "0.1.1" }
+surge-opf = { path = "src/surge-opf", version = "0.1.1" }
+surge-transfer = { path = "src/surge-transfer", version = "0.1.1" }
+surge-bindings = { path = "src/surge-bindings", version = "0.1.1" }
+surge-py = { path = "src/surge-py", version = "0.1.1" }
 
 [profile.bench]
 inherits = "release"

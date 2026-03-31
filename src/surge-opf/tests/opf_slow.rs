@@ -847,7 +847,10 @@ fn test_acopf_lmp_decomposition_identity() {
 fn test_scopf_cost_geq_dcopf_case118() {
     let net = surge_io::load(case_path("case118")).unwrap();
 
-    let dcopf_opts = DcOpfOptions::default();
+    let dcopf_opts = DcOpfOptions {
+        use_pwl_costs: true,
+        ..Default::default()
+    };
     let dcopf_sol = solve_dc_opf(&net, &dcopf_opts).unwrap().opf;
 
     let scopf_opts = ScopfOptions::default();

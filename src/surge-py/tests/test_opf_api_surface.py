@@ -78,3 +78,26 @@ def test_batch_violations_reads_branch_loading_property():
 def test_scopf_wrapper_uses_screening_stats_name():
     assert hasattr(surge.opf.ScopfResult, "screening_stats")
     assert not hasattr(surge.opf.ScopfResult, "screening")
+
+
+def test_scopf_options_keep_pwl_default_with_dc_suboptions():
+    kwargs = surge.ScopfOptions(
+        dc_opf=surge.DcOpfOptions(loss_model=surge.DcLossModel.ITERATIVE),
+    ).to_native_kwargs()
+
+    assert kwargs["use_pwl_costs"] is True
+    assert kwargs["use_loss_factors"] is True
+
+
+def test_scopf_options_use_top_level_cost_model_override():
+    kwargs = surge.ScopfOptions(
+        cost_model=surge.DcCostModel.QUADRATIC,
+        dc_opf=surge.DcOpfOptions(
+            loss_model=surge.DcLossModel.ITERATIVE,
+            piecewise_linear_breakpoints=33,
+        ),
+    ).to_native_kwargs()
+
+    assert kwargs["use_pwl_costs"] is False
+    assert kwargs["pwl_cost_breakpoints"] == 33
+    assert kwargs["use_loss_factors"] is True

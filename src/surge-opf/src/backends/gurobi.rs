@@ -417,16 +417,16 @@ mod impl_ {
 
     fn gurobi_lib_paths() -> Vec<std::path::PathBuf> {
         let mut paths = Vec::new();
+        let lib_name = if cfg!(target_os = "linux") {
+            "libgurobi130.so"
+        } else if cfg!(target_os = "macos") {
+            "libgurobi130.dylib"
+        } else {
+            "gurobi130.dll"
+        };
         // GUROBI_HOME (set by Gurobi installer or user)
         if let Ok(home) = std::env::var("GUROBI_HOME") {
-            let name = if cfg!(target_os = "linux") {
-                "libgurobi130.so"
-            } else if cfg!(target_os = "macos") {
-                "libgurobi130.dylib"
-            } else {
-                "gurobi130.dll"
-            };
-            paths.push(std::path::Path::new(&home).join("lib").join(name));
+            paths.push(std::path::Path::new(&home).join("lib").join(lib_name));
         }
         // Common Linux install paths (Gurobi 13.0.x)
         #[cfg(target_os = "linux")]
@@ -434,15 +434,39 @@ mod impl_ {
             paths.push("/opt/gurobi1301/linux64/lib/libgurobi130.so".into());
             paths.push("/opt/gurobi1300/linux64/lib/libgurobi130.so".into());
         }
+        // `pip install gurobipy` bundles the real shared library inside
+        // site-packages/gurobipy/.libs/.  Probe common site-packages roots.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let mut base_dirs: Vec<std::path::PathBuf> = Vec::new();
+            if let Ok(venv) = std::env::var("VIRTUAL_ENV") {
+                base_dirs.push(std::path::PathBuf::from(venv).join("lib"));
+            }
+            if let Ok(conda) = std::env::var("CONDA_PREFIX") {
+                base_dirs.push(std::path::PathBuf::from(conda).join("lib"));
+            }
+            if let Ok(home) = std::env::var("HOME") {
+                base_dirs.push(std::path::PathBuf::from(home).join(".local/lib"));
+            }
+            for base in &base_dirs {
+                if let Ok(entries) = std::fs::read_dir(base) {
+                    for entry in entries.flatten() {
+                        if let Some(name) = entry.file_name().to_str() {
+                            if name.starts_with("python3") {
+                                paths.push(
+                                    entry
+                                        .path()
+                                        .join("site-packages/gurobipy/.libs")
+                                        .join(lib_name),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // Let OS linker search (LD_LIBRARY_PATH / DYLD_LIBRARY_PATH)
-        let bare = if cfg!(target_os = "linux") {
-            "libgurobi130.so"
-        } else if cfg!(target_os = "macos") {
-            "libgurobi130.dylib"
-        } else {
-            "gurobi130.dll"
-        };
-        paths.push(bare.into());
+        paths.push(lib_name.into());
         paths
     }
 

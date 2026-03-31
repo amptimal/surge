@@ -76,7 +76,7 @@ Options:
       --dc-opf-warm-start <DC_OPF_WARM_START>
           Seed AC-OPF initial angles from a DC-OPF solution [default: auto] [possible values: auto, yes, no]
       --dc-cost-mode <DC_COST_MODE>
-          DC-OPF cost formulation: qp (exact quadratic) or lp (PWL tangent-line approximation) [default: qp] [possible values: qp, lp]
+          DC-OPF cost formulation: qp (exact quadratic) or lp (PWL tangent-line approximation). DC-OPF defaults to qp; SCOPF defaults to lp [possible values: qp, lp]
       --dc-pwl-breakpoints <DC_PWL_BREAKPOINTS>
           Number of PWL breakpoints per generator when --dc-cost-mode lp is used (default: 20) [default: 20]
       --scopf-formulation <SCOPF_FORMULATION>
@@ -95,6 +95,16 @@ Options:
           SCOPF: disable flowgate and interface constraints
       --no-voltage-security
           SCOPF: disable post-contingency voltage limits in AC-SCOPF
+      --no-angle-limits
+          SCOPF: disable branch angle-difference constraints
+      --gen-limit-penalty <GEN_LIMIT_PENALTY>
+          Penalty cost ($/MW) for soft generator Pmin/Pmax limits in DC-OPF and SCOPF. When set, hard generator bounds are relaxed and violations are penalized
+      --use-loss-factors
+          Enable iterative loss factor compensation in DC-OPF and SCOPF
+      --loss-iterations <LOSS_ITERATIONS>
+          Maximum loss factor iterations (default: 3) [default: 3]
+      --loss-tolerance <LOSS_TOLERANCE>
+          Loss factor convergence tolerance (default: 1e-3) [default: 0.001]
       --export <EXPORT>
           Export a full solved-state artifact to this file path (JSON or JSON.zst)
       --export-format <EXPORT_FORMAT>

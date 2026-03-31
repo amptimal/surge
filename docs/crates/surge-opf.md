@@ -261,11 +261,30 @@ between the two in `to_native_kwargs()`.
 | `mode` | enum | `Preventive` | `Preventive` or `Corrective` |
 | `corrective_ramp_window_minutes` | float | `10.0` | Corrective action time window |
 | `contingency_rating` | enum | `RateA` | Post-contingency thermal rating tier |
-| `enforce_flowgates` | bool | `true` | Include flowgate constraints |
+| `enforce_flowgates` | bool | `true` | Include interface and flowgate constraints in preventive SCOPF; DC corrective mode still rejects corridor constraints |
+| `enforce_angle_limits` | bool | `true` | Enforce branch angle-difference limits as soft constraints |
 | `enforce_voltage_security` | bool | `true` | Post-contingency voltage limits (AC only) |
 | `voltage_threshold_pu` | float | `0.01` | Voltage violation threshold (AC only) |
 | `max_contingencies` | int | `0` | Cap on contingencies evaluated (0 = all) |
 | `minimum_branch_rating_a_mva` | float | `1.0` | Minimum rating for thermal constraints |
+| `cost_model` | enum | `PiecewiseLinear` | `PiecewiseLinear` (LP, default) or `Quadratic` (QP) |
+| `dc_opf` | `DcOpfOptions` | default | DC-OPF sub-options (PWL breakpoints, loss factors, gen-limit penalties, etc.) |
+
+> **Note:** DC-SCOPF defaults to piecewise-linear (LP) costs. This avoids
+> HiGHS QP numerical issues on large cases. Use `--dc-cost-mode qp` (CLI) or
+> `cost_model=DcCostModel.QUADRATIC` (Python) to override
+> with exact quadratic costs on small cases where HiGHS QP is stable.
+
+The `dc_opf` sub-options expose the following DC-OPF features to SCOPF:
+
+- **PAR setpoints** — `par_setpoints` excludes PAR branches from B_bus and
+  injects scheduled interchange into the power balance
+- **Variable HVDC dispatch** — `hvdc_links` with `is_variable()` links adds
+  P_dc decision variables co-optimized with generation
+- **Generator limit slacks** — `generator_limit_mode=Soft` with
+  `generator_limit_penalty_per_mw` relaxes hard Pmin/Pmax with penalty cost
+- **Loss factor iteration** — `loss_model=Iterative` wraps the cutting-plane
+  loop in an outer loss iteration for both preventive and corrective DC-SCOPF
 
 ## ScopfRuntime Reference
 
