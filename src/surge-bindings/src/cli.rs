@@ -385,6 +385,27 @@ pub(crate) struct Cli {
     #[arg(long = "no-voltage-security", action = ArgAction::SetTrue)]
     pub no_voltage_security: bool,
 
+    /// SCOPF: disable branch angle-difference constraints.
+    #[arg(long = "no-angle-limits", action = ArgAction::SetTrue)]
+    pub no_angle_limits: bool,
+
+    /// Penalty cost ($/MW) for soft generator Pmin/Pmax limits in DC-OPF and SCOPF.
+    /// When set, hard generator bounds are relaxed and violations are penalized.
+    #[arg(long = "gen-limit-penalty")]
+    pub gen_limit_penalty: Option<f64>,
+
+    /// Enable iterative loss factor compensation in DC-OPF and SCOPF.
+    #[arg(long = "use-loss-factors", action = ArgAction::SetTrue)]
+    pub use_loss_factors: bool,
+
+    /// Maximum loss factor iterations (default: 3).
+    #[arg(long = "loss-iterations", default_value_t = 3)]
+    pub loss_iterations: usize,
+
+    /// Loss factor convergence tolerance (default: 1e-3).
+    #[arg(long = "loss-tolerance", default_value_t = 1e-3)]
+    pub loss_tolerance: f64,
+
     /// Export a full solved-state artifact to this file path (JSON or JSON.zst)
     #[arg(long)]
     pub export: Option<PathBuf>,

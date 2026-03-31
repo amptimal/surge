@@ -178,8 +178,11 @@ fn get_highs() -> Result<&'static Arc<HighsLib>, String> {
                 }
             }
             Err(
-                "HiGHS not found — install HiGHS (brew install highs / apt install libhighs-dev) \
-                 or set HIGHS_LIB_DIR to the directory containing libhighs.{so,dylib}."
+                "HiGHS not found — Surge requires the HiGHS C library (libhighs.so / \
+                 libhighs.dylib), not the Python package. Install via your system package \
+                 manager (brew install highs / apt install libhighs-dev) or build from \
+                 source. `pip install highspy` does NOT provide the shared library. \
+                 Set HIGHS_LIB_DIR to override the search path."
                     .to_string(),
             )
         })

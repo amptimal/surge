@@ -34,8 +34,14 @@ COPT_HOME=/opt/copt80 SURGE_PY_REQUIRE_COPT_NLP_SHIM=1 maturin develop --release
 
 - Rust stable toolchain
 - `libsuitesparse-dev` (KLU sparse solver)
-- `libipopt-dev` (optional, open-source AC-OPF backend)
+- `libhighs-dev` (HiGHS LP solver for OPF — install via system package manager)
+- `coinor-libipopt-dev` (optional, open-source AC-OPF backend — install via system package manager)
 - COPT 8.x install + license (optional, commercial AC-OPF backend)
+
+> **Note:** `pip install highspy` and `pip install cyipopt` do **not** provide
+> the C shared libraries Surge needs. Both HiGHS and Ipopt must be installed
+> via your system package manager (`brew install highs ipopt` /
+> `apt install libhighs-dev coinor-libipopt-dev`).
 
 ## Quick Start
 

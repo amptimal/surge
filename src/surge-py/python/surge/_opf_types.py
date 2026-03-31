@@ -588,6 +588,10 @@ class ScopfOptions:
             evaluates all N-1 branch contingencies.
         minimum_branch_rating_a_mva: Branches with rate_a below this
             value are treated as unconstrained. Default 1.0.
+        dc_opf: Optional DC-OPF sub-options for DC-SCOPF. Use
+            ``DcOpfOptions(cost_model=DcCostModel.PIECEWISE_LINEAR)`` for
+            large cases to avoid HiGHS QP numerical issues. Default None
+            (uses DcOpfOptions defaults).
     """
 
     formulation: ScopfFormulation = ScopfFormulation.DC
@@ -599,6 +603,8 @@ class ScopfOptions:
     enforce_voltage_security: bool = True
     max_contingencies: int = 0
     minimum_branch_rating_a_mva: float = 1.0
+    enforce_angle_limits: bool = True
+    dc_opf: "DcOpfOptions | None" = None
 
     def __post_init__(self) -> None:
         _require_positive(
@@ -614,20 +620,22 @@ class ScopfOptions:
         )
 
     def to_native_kwargs(self, network: object | None = None) -> dict[str, object]:
-        return _compact_kwargs(
-            {
-                "formulation": self.formulation.value,
-                "mode": self.mode.value,
-                "corrective_ramp_window_min": self.corrective_ramp_window_minutes,
-                "voltage_threshold": self.voltage_threshold_pu,
-                "contingency_rating": self.contingency_rating.value,
-                "enforce_flowgates": self.enforce_flowgates,
-                "enforce_voltage_security": self.enforce_voltage_security,
-                "max_contingencies": self.max_contingencies,
-                "min_rate_a": self.minimum_branch_rating_a_mva,
-            },
-            network,
-        )
+        dc = self.dc_opf
+        kwargs: dict[str, object] = {
+            "formulation": self.formulation.value,
+            "mode": self.mode.value,
+            "corrective_ramp_window_min": self.corrective_ramp_window_minutes,
+            "voltage_threshold": self.voltage_threshold_pu,
+            "contingency_rating": self.contingency_rating.value,
+            "enforce_flowgates": self.enforce_flowgates,
+            "enforce_voltage_security": self.enforce_voltage_security,
+            "max_contingencies": self.max_contingencies,
+            "min_rate_a": self.minimum_branch_rating_a_mva,
+            "enforce_angle_limits": self.enforce_angle_limits,
+            "use_pwl_costs": dc.cost_model is DcCostModel.PIECEWISE_LINEAR if dc else True,
+            "pwl_cost_breakpoints": dc.piecewise_linear_breakpoints if dc else 20,
+        }
+        return _compact_kwargs(kwargs, network)
 
 
 @dataclass(frozen=True, kw_only=True)

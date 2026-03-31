@@ -41,6 +41,10 @@ Install with your system package manager:
 If HiGHS is installed to a custom location, set `HIGHS_LIB_DIR` to the
 directory containing `libhighs.{so,dylib}`.
 
+> **Note:** `pip install highspy` does **not** provide `libhighs`. The pip
+> package statically links HiGHS into a Python extension module and does not
+> install a standalone shared library. You must use your system package manager.
+
 ### Required For AC Workflows
 
 - SuiteSparse / KLU development libraries
@@ -48,6 +52,11 @@ directory containing `libhighs.{so,dylib}`.
 ### Required For AC-OPF
 
 - Ipopt runtime library (`libipopt.so` on Linux, `libipopt.dylib` on macOS)
+
+> **Note:** `pip install cyipopt` does **not** bundle `libipopt`. It is a
+> source-only package that wraps an existing system install. Install Ipopt via
+> your system package manager (`brew install ipopt` /
+> `apt install coinor-libipopt-dev`).
 
 ### Optional Runtime Solvers
 

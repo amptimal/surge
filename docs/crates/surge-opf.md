@@ -262,10 +262,17 @@ between the two in `to_native_kwargs()`.
 | `corrective_ramp_window_minutes` | float | `10.0` | Corrective action time window |
 | `contingency_rating` | enum | `RateA` | Post-contingency thermal rating tier |
 | `enforce_flowgates` | bool | `true` | Include flowgate constraints |
+| `enforce_angle_limits` | bool | `true` | Enforce branch angle-difference limits as soft constraints |
 | `enforce_voltage_security` | bool | `true` | Post-contingency voltage limits (AC only) |
 | `voltage_threshold_pu` | float | `0.01` | Voltage violation threshold (AC only) |
 | `max_contingencies` | int | `0` | Cap on contingencies evaluated (0 = all) |
 | `minimum_branch_rating_a_mva` | float | `1.0` | Minimum rating for thermal constraints |
+| `dc_opf` | `DcOpfOptions` | default | DC-OPF sub-options (cost model, tolerances, etc.) |
+
+> **Note:** DC-SCOPF defaults to piecewise-linear (LP) costs. This avoids
+> HiGHS QP numerical issues on large cases. Use `--dc-cost-mode qp` (CLI) or
+> `dc_opf=DcOpfOptions(cost_model=DcCostModel.QUADRATIC)` (Python) to override
+> with exact quadratic costs on small cases where HiGHS QP is stable.
 
 ## ScopfRuntime Reference
 

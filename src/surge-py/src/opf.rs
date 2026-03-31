@@ -524,12 +524,13 @@ pub fn solve_ac_opf(
                     max_iterations=20, max_cuts_per_iteration=100,
                     corrective_ramp_window_min=10.0, voltage_threshold=0.01,
                     contingency_rating="rate-a", enforce_flowgates=true,
-                    enforce_voltage_security=true,
+                    enforce_angle_limits=true, enforce_voltage_security=true,
                     lp_solver=None, nlp_solver=None, max_contingencies=0,
                     min_rate_a=1.0, nr_max_iterations=30,
                     nr_convergence_tolerance=1e-6, enable_screener=true,
                     screener_threshold_fraction=0.9,
-                    screener_max_initial_contingencies=500, warm_start=None))]
+                    screener_max_initial_contingencies=500, warm_start=None,
+                    use_pwl_costs=true, pwl_cost_breakpoints=20))]
 pub fn solve_scopf(
     py: Python<'_>,
     network: &Network,
@@ -542,6 +543,7 @@ pub fn solve_scopf(
     voltage_threshold: f64,
     contingency_rating: &str,
     enforce_flowgates: bool,
+    enforce_angle_limits: bool,
     enforce_voltage_security: bool,
     lp_solver: Option<&str>,
     nlp_solver: Option<&str>,
@@ -553,6 +555,8 @@ pub fn solve_scopf(
     screener_threshold_fraction: f64,
     screener_max_initial_contingencies: usize,
     warm_start: Option<&ScopfResult>,
+    use_pwl_costs: bool,
+    pwl_cost_breakpoints: usize,
 ) -> PyResult<ScopfResult> {
     catch_panic("solve_scopf", || {
         let form = match formulation {
@@ -606,11 +610,16 @@ pub fn solve_scopf(
             min_rate_a,
             contingency_rating: ctg_rating,
             enforce_flowgates,
+            enforce_angle_limits,
             screener: enable_screener.then_some(surge_opf::ScopfScreeningPolicy {
                 threshold_fraction: screener_threshold_fraction,
                 max_initial_contingencies: screener_max_initial_contingencies,
             }),
-            dc_opf: surge_opf::DcOpfOptions::default(),
+            dc_opf: surge_opf::DcOpfOptions {
+                use_pwl_costs,
+                pwl_cost_breakpoints,
+                ..Default::default()
+            },
             ac: surge_opf::ScopfAcSettings {
                 opf: surge_opf::AcOpfOptions {
                     tolerance,

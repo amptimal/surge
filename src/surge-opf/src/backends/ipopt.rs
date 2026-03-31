@@ -149,8 +149,11 @@ pub fn get_ipopt() -> Result<&'static Arc<IpoptLib>, String> {
                 }
             }
             Err(
-                "Ipopt not found — install coinor-libipopt-dev or set IPOPT_LIB_DIR. \
-             Only Ipopt 3.x (libipopt.so) is supported."
+                "Ipopt not found — Surge requires the Ipopt C library (libipopt.so / \
+                 libipopt.dylib), not the Python package. Install via your system package \
+                 manager (brew install ipopt / apt install coinor-libipopt-dev) or build \
+                 from source. `pip install cyipopt` does NOT bundle the shared library. \
+                 Only Ipopt 3.x is supported. Set IPOPT_LIB_DIR to override the search path."
                     .to_string(),
             )
         })

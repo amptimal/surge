@@ -12,27 +12,25 @@ source "$HOME/.cargo/env"
 ## 2. Install Native Dependencies
 
 Surge needs pkg-config and SuiteSparse / KLU for AC workflows. HiGHS is the
-default LP solver for OPF and needs to be installed as a system package.
+default LP solver for OPF and Ipopt is the open-source NLP solver for AC-OPF.
+Both must be installed as **system packages** — Surge loads `libhighs` and
+`libipopt` at runtime via their C shared libraries.
+
+> **Note:** `pip install highspy` and `pip install cyipopt` do **not** provide
+> the shared libraries Surge needs. `highspy` statically links HiGHS into a
+> Python extension, and `cyipopt` is a source-only package that wraps an
+> existing system install. You must install via your system package manager or
+> build from source.
 
 ```bash
 # Ubuntu / Debian
-sudo apt install pkg-config libsuitesparse-dev libclang-dev libhighs-dev
+sudo apt install pkg-config libsuitesparse-dev libclang-dev libhighs-dev coinor-libipopt-dev
 
 # Fedora
 sudo dnf install pkgconf suitesparse-devel clang-devel
 
 # macOS (Homebrew)
-brew install pkg-config suite-sparse highs
-```
-
-For AC-OPF, install at least one NLP backend. Ipopt is the open-source path:
-
-```bash
-# Ubuntu / Debian
-sudo apt install coinor-libipopt-dev
-
-# macOS (Homebrew)
-brew install ipopt
+brew install pkg-config suite-sparse highs ipopt
 ```
 
 COPT 8.x is also supported as a commercial NLP backend. If `COPT_HOME` is set

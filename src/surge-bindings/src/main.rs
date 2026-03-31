@@ -855,9 +855,18 @@ fn main() -> Result<()> {
                 max_cuts_per_iteration: cli.scopf_max_cuts,
                 contingency_rating: cli.contingency_rating.into_runtime(),
                 enforce_flowgates: !cli.no_flowgates,
+                enforce_angle_limits: !cli.no_angle_limits,
                 dc_opf: surge_opf::DcOpfOptions {
                     tolerance: cli.tolerance,
                     max_iterations: cli.max_iter,
+                    // SCOPF always uses PWL (LP) costs — the HiGHS QP solver
+                    // has numerical issues on large cases.
+                    use_pwl_costs: true,
+                    pwl_cost_breakpoints: cli.dc_pwl_breakpoints,
+                    gen_limit_penalty: cli.gen_limit_penalty,
+                    use_loss_factors: cli.use_loss_factors,
+                    max_loss_iter: cli.loss_iterations,
+                    loss_tol: cli.loss_tolerance,
                     ..Default::default()
                 },
                 ac: surge_opf::ScopfAcSettings {

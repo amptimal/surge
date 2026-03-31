@@ -122,9 +122,12 @@ pub(crate) fn solve_dc_preventive_with_context(
         hessian,
         col_lower,
         col_upper,
-        base_triplets,
+        mut base_triplets,
         mut base_row_lower,
         mut base_row_upper,
+        gen_balance_triplet_indices,
+        balance_row_offset,
+        pbusinj: model_pbusinj,
     } = base_model;
 
     if !hvdc_injections.is_empty() {
@@ -181,6 +184,11 @@ pub(crate) fn solve_dc_preventive_with_context(
     } = initial_cuts;
 
     let mut scopf_iter = 0u32;
+    let use_loss_factors = options.dc_opf.use_loss_factors;
+    let max_loss_iter = options.dc_opf.max_loss_iter;
+    let loss_tol = options.dc_opf.loss_tol;
+    let mut prev_dloss = vec![0.0f64; n_bus];
+    let mut loss_iter_count = 0usize;
 
     // Resolve LP solver once before the loop (shared across iterations).
     let lp_solver = context
@@ -719,7 +727,99 @@ pub(crate) fn solve_dc_preventive_with_context(
         }
 
         if violations.is_empty() {
-            // Converged — extract solution
+            // Cutting-plane converged. Check if loss iteration is needed.
+            if use_loss_factors && loss_iter_count < max_loss_iter {
+                use crate::dc::loss_factors::{
+                    compute_dc_loss_sensitivities, compute_total_dc_losses,
+                };
+                let theta = &sol.x[theta_offset..theta_offset + n_bus];
+                let dloss_dp =
+                    compute_dc_loss_sensitivities(network, theta, bus_map, &ptdf);
+
+                if loss_iter_count > 0 {
+                    let max_change = dloss_dp
+                        .iter()
+                        .zip(prev_dloss.iter())
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0f64, f64::max);
+                    if max_change < loss_tol {
+                        // Loss factors converged — proceed to result.
+                    } else {
+                        prev_dloss.copy_from_slice(&dloss_dp);
+
+                        // Update gen coefficients in base triplets.
+                        for (j, &ti) in gen_balance_triplet_indices.iter().enumerate() {
+                            let bus_idx = gen_bus_idx[j];
+                            let pf_inv = (1.0 - dloss_dp[bus_idx]).clamp(0.5, 1.5);
+                            base_triplets[ti].val = -pf_inv;
+                        }
+
+                        // Update power balance RHS with loss allocation.
+                        let total_loss_pu = compute_total_dc_losses(network, theta, bus_map);
+                        let total_load_pu: f64 = bus_pd_mw
+                            .iter()
+                            .map(|&pd| pd / base)
+                            .sum::<f64>()
+                            .abs()
+                            .max(1e-10);
+                        for i in 0..n_bus {
+                            let load_share =
+                                (bus_pd_mw[i] / base).abs() / total_load_pu;
+                            let loss_at_bus = total_loss_pu * load_share;
+                            let pd_pu = bus_pd_mw[i] / base;
+                            let gs_pu =
+                                network.buses[i].shunt_conductance_mw / base;
+                            let rhs =
+                                -pd_pu - gs_pu - model_pbusinj[i] - loss_at_bus;
+                            base_row_lower[balance_row_offset + i] = rhs;
+                            base_row_upper[balance_row_offset + i] = rhs;
+                        }
+
+                        loss_iter_count += 1;
+                        info!(
+                            loss_iter = loss_iter_count,
+                            max_change,
+                            "loss factor iteration — re-solving SCOPF"
+                        );
+                        continue; // re-enter cutting-plane loop
+                    }
+                } else {
+                    prev_dloss.copy_from_slice(&dloss_dp);
+
+                    // First loss iteration: update coefficients.
+                    for (j, &ti) in gen_balance_triplet_indices.iter().enumerate() {
+                        let bus_idx = gen_bus_idx[j];
+                        let pf_inv = (1.0 - dloss_dp[bus_idx]).clamp(0.5, 1.5);
+                        base_triplets[ti].val = -pf_inv;
+                    }
+
+                    let total_loss_pu = compute_total_dc_losses(network, theta, bus_map);
+                    let total_load_pu: f64 = bus_pd_mw
+                        .iter()
+                        .map(|&pd| pd / base)
+                        .sum::<f64>()
+                        .abs()
+                        .max(1e-10);
+                    for i in 0..n_bus {
+                        let load_share = (bus_pd_mw[i] / base).abs() / total_load_pu;
+                        let loss_at_bus = total_loss_pu * load_share;
+                        let pd_pu = bus_pd_mw[i] / base;
+                        let gs_pu = network.buses[i].shunt_conductance_mw / base;
+                        let rhs = -pd_pu - gs_pu - model_pbusinj[i] - loss_at_bus;
+                        base_row_lower[balance_row_offset + i] = rhs;
+                        base_row_upper[balance_row_offset + i] = rhs;
+                    }
+
+                    loss_iter_count += 1;
+                    info!(
+                        loss_iter = loss_iter_count,
+                        "loss factor iteration — re-solving SCOPF"
+                    );
+                    continue; // re-enter cutting-plane loop
+                }
+            }
+
+            // Fully converged — extract solution
             let n_ctg_cuts = cut_metadata.len();
 
             info!(
@@ -1498,9 +1598,25 @@ pub(crate) fn solve_dc_corrective_with_context(
         .map(|&gi| bus_map[&network.generators[gi].bus])
         .collect();
 
+    // --- PAR branch exclusion ---
+    let par_branch_set: HashSet<usize> = options
+        .dc_opf
+        .par_setpoints
+        .iter()
+        .filter_map(|ps| {
+            ctx.branch_idx_map
+                .get(&(ps.from_bus, ps.to_bus, ps.circuit.clone()))
+                .copied()
+                .filter(|&idx| network.branches[idx].in_service)
+        })
+        .collect();
+
     // --- Constrained branches ---
     let constrained_branches: Vec<usize> = if options.dc_opf.enforce_thermal_limits {
         ctx.constrained_branch_indices(options.min_rate_a)
+            .into_iter()
+            .filter(|idx| !par_branch_set.contains(idx))
+            .collect()
     } else {
         Vec::new()
     };
@@ -1515,20 +1631,24 @@ pub(crate) fn solve_dc_corrective_with_context(
     // --- Identify angle-constrained branches ---
     // Only enforce when angmin > -π or angmax < +π (tighter than unconstrained default).
     // angmin/angmax are stored in radians by the IO parsers.
-    const ANG_UNCONSTRAINED_LO_C: f64 = -std::f64::consts::PI;
-    const ANG_UNCONSTRAINED_HI_C: f64 = std::f64::consts::PI;
-    let mut angle_constrained_branches_c: Vec<usize> = Vec::new();
-    for l in 0..n_br {
-        let br = &network.branches[l];
-        if !br.in_service {
-            continue;
-        }
-        let lo = br.angle_diff_min_rad.unwrap_or(f64::NEG_INFINITY);
-        let hi = br.angle_diff_max_rad.unwrap_or(f64::INFINITY);
-        if lo > ANG_UNCONSTRAINED_LO_C || hi < ANG_UNCONSTRAINED_HI_C {
-            angle_constrained_branches_c.push(l);
-        }
-    }
+    // Gated by options.enforce_angle_limits.
+    let angle_constrained_branches_c: Vec<usize> = if options.enforce_angle_limits {
+        const ANG_UNCONSTRAINED_LO_C: f64 = -std::f64::consts::PI;
+        const ANG_UNCONSTRAINED_HI_C: f64 = std::f64::consts::PI;
+        (0..n_br)
+            .filter(|&l| {
+                let br = &network.branches[l];
+                if !br.in_service {
+                    return false;
+                }
+                let lo = br.angle_diff_min_rad.unwrap_or(f64::NEG_INFINITY);
+                let hi = br.angle_diff_max_rad.unwrap_or(f64::INFINITY);
+                lo > ANG_UNCONSTRAINED_LO_C || hi < ANG_UNCONSTRAINED_HI_C
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let n_ang_c = angle_constrained_branches_c.len();
 
     // --- Pre-contingency variable layout ---
@@ -1731,8 +1851,8 @@ pub(crate) fn solve_dc_corrective_with_context(
     }
 
     // Power balance rows (B_bus * θ⁰): rows n_flow+n_ang_c..n_flow+n_ang_c+n_bus
-    for branch in &network.branches {
-        if !branch.in_service || branch.x.abs() < 1e-20 {
+    for (br_idx, branch) in network.branches.iter().enumerate() {
+        if !branch.in_service || branch.x.abs() < 1e-20 || par_branch_set.contains(&br_idx) {
             continue;
         }
         let from = bus_map[&branch.from_bus];
@@ -1800,6 +1920,57 @@ pub(crate) fn solve_dc_corrective_with_context(
         pbusinj_corrective[from_idx] += pf;
         pbusinj_corrective[to_idx] -= pf;
     }
+
+    // Fixed HVDC link injections (lossless approximation).
+    let hvdc_links_corrective = surge_hvdc::interop::links_from_network(network);
+    for link in &hvdc_links_corrective {
+        if let Some(&fi) = bus_map.get(&link.from_bus()) {
+            pbusinj_corrective[fi] += link.p_dc_mw() / base;
+        }
+        if let Some(&ti) = bus_map.get(&link.to_bus()) {
+            pbusinj_corrective[ti] -= link.p_dc_mw() / base;
+        }
+    }
+
+    // Multi-terminal DC (MTDC) grid injections.
+    {
+        let dc_grid_results =
+            surge_hvdc::interop::dc_grid_injections(network).map_err(|error| {
+                DcOpfError::SolverError(format!("explicit DC-grid solve failed: {error}"))
+            })?;
+        for inj in &dc_grid_results.injections {
+            if let Some(&i) = bus_map.get(&inj.ac_bus) {
+                pbusinj_corrective[i] -= inj.p_mw / base;
+            }
+        }
+    }
+
+    // PAR scheduled-interchange injections.
+    for ps in &options.dc_opf.par_setpoints {
+        if let Some(&br_idx) = ctx
+            .branch_idx_map
+            .get(&(ps.from_bus, ps.to_bus, ps.circuit.clone()))
+        {
+            let br = &network.branches[br_idx];
+            if !br.in_service || br.x.abs() < 1e-20 {
+                continue;
+            }
+            // Undo PST phase-shift contribution
+            if br.phase_shift_rad.abs() >= 1e-12 {
+                let pf = br.b_dc() * br.phase_shift_rad;
+                let fi = bus_map[&br.from_bus];
+                let ti = bus_map[&br.to_bus];
+                pbusinj_corrective[fi] -= pf;
+                pbusinj_corrective[ti] += pf;
+            }
+            // Add scheduled-interchange injection
+            let fi = bus_map[&ps.from_bus];
+            let ti = bus_map[&ps.to_bus];
+            pbusinj_corrective[fi] += ps.target_mw / base;
+            pbusinj_corrective[ti] -= ps.target_mw / base;
+        }
+    }
+
     for i in 0..n_bus {
         let pd_pu = bus_pd_mw[i] / base;
         let gs_pu = network.buses[i].shunt_conductance_mw / base;
