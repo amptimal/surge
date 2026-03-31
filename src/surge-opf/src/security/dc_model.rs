@@ -27,8 +27,6 @@ pub(crate) struct PreventiveBaseModel {
     pub n_flow: usize,
     pub n_ang: usize,
     pub n_ifg: usize,
-    pub n_hvdc: usize,
-    pub hvdc_offset: usize,
     pub n_base_rows: usize,
     pub n_var_base: usize,
     pub col_cost: Vec<f64>,
@@ -373,14 +371,8 @@ pub(crate) fn build_preventive_base_model(
     // HVDC variable link power balance coefficients.
     // Rectifier (from_bus): +1.0 (draws power from AC).
     // Inverter (to_bus): -(1 - loss_b_frac) (injects net of linear losses).
-    let hvdc_from_idx: Vec<usize> = hvdc_var
-        .iter()
-        .map(|h| bus_map[&h.from_bus])
-        .collect();
-    let hvdc_to_idx: Vec<usize> = hvdc_var
-        .iter()
-        .map(|h| bus_map[&h.to_bus])
-        .collect();
+    let hvdc_from_idx: Vec<usize> = hvdc_var.iter().map(|h| bus_map[&h.from_bus]).collect();
+    let hvdc_to_idx: Vec<usize> = hvdc_var.iter().map(|h| bus_map[&h.to_bus]).collect();
     for (k, hvdc) in hvdc_var.iter().enumerate() {
         let fi = hvdc_from_idx[k];
         let ti = hvdc_to_idx[k];
@@ -587,8 +579,6 @@ pub(crate) fn build_preventive_base_model(
         n_flow,
         n_ang,
         n_ifg,
-        n_hvdc,
-        hvdc_offset,
         n_base_rows,
         n_var_base,
         col_cost,

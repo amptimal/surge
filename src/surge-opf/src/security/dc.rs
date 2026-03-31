@@ -115,8 +115,6 @@ pub(crate) fn solve_dc_preventive_with_context(
         n_flow,
         n_ang,
         n_ifg,
-        n_hvdc,
-        hvdc_offset,
         n_base_rows,
         n_var_base,
         col_cost,
@@ -735,8 +733,7 @@ pub(crate) fn solve_dc_preventive_with_context(
                     compute_dc_loss_sensitivities, compute_total_dc_losses,
                 };
                 let theta = &sol.x[theta_offset..theta_offset + n_bus];
-                let dloss_dp =
-                    compute_dc_loss_sensitivities(network, theta, bus_map, &ptdf);
+                let dloss_dp = compute_dc_loss_sensitivities(network, theta, bus_map, &ptdf);
 
                 if loss_iter_count > 0 {
                     let max_change = dloss_dp
@@ -765,14 +762,11 @@ pub(crate) fn solve_dc_preventive_with_context(
                             .abs()
                             .max(1e-10);
                         for i in 0..n_bus {
-                            let load_share =
-                                (bus_pd_mw[i] / base).abs() / total_load_pu;
+                            let load_share = (bus_pd_mw[i] / base).abs() / total_load_pu;
                             let loss_at_bus = total_loss_pu * load_share;
                             let pd_pu = bus_pd_mw[i] / base;
-                            let gs_pu =
-                                network.buses[i].shunt_conductance_mw / base;
-                            let rhs =
-                                -pd_pu - gs_pu - model_pbusinj[i] - loss_at_bus;
+                            let gs_pu = network.buses[i].shunt_conductance_mw / base;
+                            let rhs = -pd_pu - gs_pu - model_pbusinj[i] - loss_at_bus;
                             base_row_lower[balance_row_offset + i] = rhs;
                             base_row_upper[balance_row_offset + i] = rhs;
                         }
@@ -780,8 +774,7 @@ pub(crate) fn solve_dc_preventive_with_context(
                         loss_iter_count += 1;
                         info!(
                             loss_iter = loss_iter_count,
-                            max_change,
-                            "loss factor iteration — re-solving SCOPF"
+                            max_change, "loss factor iteration — re-solving SCOPF"
                         );
                         continue; // re-enter cutting-plane loop
                     }

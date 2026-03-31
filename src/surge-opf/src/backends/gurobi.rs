@@ -446,8 +446,7 @@ mod impl_ {
                 base_dirs.push(std::path::PathBuf::from(conda).join("lib"));
             }
             if let Ok(home) = std::env::var("HOME") {
-                base_dirs
-                    .push(std::path::PathBuf::from(home).join(".local/lib"));
+                base_dirs.push(std::path::PathBuf::from(home).join(".local/lib"));
             }
             for base in &base_dirs {
                 if let Ok(entries) = std::fs::read_dir(base) {
