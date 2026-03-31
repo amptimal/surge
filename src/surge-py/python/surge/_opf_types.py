@@ -634,6 +634,14 @@ class ScopfOptions:
             "enforce_angle_limits": self.enforce_angle_limits,
             "use_pwl_costs": dc.cost_model is DcCostModel.PIECEWISE_LINEAR if dc else True,
             "pwl_cost_breakpoints": dc.piecewise_linear_breakpoints if dc else 20,
+            "gen_limit_penalty": (
+                dc.generator_limit_penalty_per_mw
+                if dc and dc.generator_limit_mode is GeneratorLimitMode.SOFT
+                else None
+            ),
+            "use_loss_factors": dc.loss_model is DcLossModel.ITERATIVE if dc else False,
+            "max_loss_iter": dc.loss_iterations if dc else 3,
+            "loss_tol": dc.loss_tolerance if dc else 1e-3,
         }
         return _compact_kwargs(kwargs, network)
 

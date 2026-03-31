@@ -274,6 +274,17 @@ between the two in `to_native_kwargs()`.
 > `dc_opf=DcOpfOptions(cost_model=DcCostModel.QUADRATIC)` (Python) to override
 > with exact quadratic costs on small cases where HiGHS QP is stable.
 
+The `dc_opf` sub-options expose the following DC-OPF features to SCOPF:
+
+- **PAR setpoints** — `par_setpoints` excludes PAR branches from B_bus and
+  injects scheduled interchange into the power balance
+- **Variable HVDC dispatch** — `hvdc_links` with `is_variable()` links adds
+  P_dc decision variables co-optimized with generation
+- **Generator limit slacks** — `generator_limit_mode=Soft` with
+  `generator_limit_penalty_per_mw` relaxes hard Pmin/Pmax with penalty cost
+- **Loss factor iteration** — `loss_model=Iterative` wraps the cutting-plane
+  loop in an outer loss iteration (preventive mode only)
+
 ## ScopfRuntime Reference
 
 | Field | Type | Default | Description |

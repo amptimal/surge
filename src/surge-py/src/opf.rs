@@ -530,7 +530,9 @@ pub fn solve_ac_opf(
                     nr_convergence_tolerance=1e-6, enable_screener=true,
                     screener_threshold_fraction=0.9,
                     screener_max_initial_contingencies=500, warm_start=None,
-                    use_pwl_costs=true, pwl_cost_breakpoints=20))]
+                    use_pwl_costs=true, pwl_cost_breakpoints=20,
+                    gen_limit_penalty=None, use_loss_factors=false,
+                    max_loss_iter=3, loss_tol=1e-3))]
 pub fn solve_scopf(
     py: Python<'_>,
     network: &Network,
@@ -557,6 +559,10 @@ pub fn solve_scopf(
     warm_start: Option<&ScopfResult>,
     use_pwl_costs: bool,
     pwl_cost_breakpoints: usize,
+    gen_limit_penalty: Option<f64>,
+    use_loss_factors: bool,
+    max_loss_iter: usize,
+    loss_tol: f64,
 ) -> PyResult<ScopfResult> {
     catch_panic("solve_scopf", || {
         let form = match formulation {
@@ -618,6 +624,10 @@ pub fn solve_scopf(
             dc_opf: surge_opf::DcOpfOptions {
                 use_pwl_costs,
                 pwl_cost_breakpoints,
+                gen_limit_penalty,
+                use_loss_factors,
+                max_loss_iter,
+                loss_tol,
                 ..Default::default()
             },
             ac: surge_opf::ScopfAcSettings {

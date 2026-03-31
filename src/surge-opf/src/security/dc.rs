@@ -115,6 +115,8 @@ pub(crate) fn solve_dc_preventive_with_context(
         n_flow,
         n_ang,
         n_ifg,
+        n_hvdc,
+        hvdc_offset,
         n_base_rows,
         n_var_base,
         col_cost,
@@ -915,6 +917,14 @@ pub(crate) fn solve_dc_preventive_with_context(
 
             // Build PF solution from optimal dispatch
             let gen_p_mw: Vec<f64> = pg_pu.iter().map(|&p| p * base).collect();
+            let _hvdc_dispatch_mw: Vec<f64> = if n_hvdc > 0 {
+                sol.x[hvdc_offset..hvdc_offset + n_hvdc]
+                    .iter()
+                    .map(|&p| p * base)
+                    .collect()
+            } else {
+                vec![]
+            };
             let total_cost = sol.objective + c0_total;
 
             let va: Vec<f64> = theta.to_vec();
@@ -1651,13 +1661,28 @@ pub(crate) fn solve_dc_corrective_with_context(
     };
     let n_ang_c = angle_constrained_branches_c.len();
 
+    // Variable HVDC links from DcOpfOptions.
+    let all_hvdc_opf_links = options.dc_opf.hvdc_links.as_deref().unwrap_or(&[]);
+    let hvdc_var_c: Vec<&crate::dc::opf::HvdcOpfLink> = all_hvdc_opf_links
+        .iter()
+        .filter(|h| h.is_variable())
+        .collect();
+    let n_hvdc_c = hvdc_var_c.len();
+
+    let has_gen_slacks_c = options.dc_opf.gen_limit_penalty.is_some();
+    let n_gen_slacks_c = if has_gen_slacks_c { n_gen } else { 0 };
+
     // --- Pre-contingency variable layout ---
-    // x_base = [θ⁰ | Pg⁰ | s_upper_base | s_lower_base]
+    // x_base = [θ⁰ | Pg⁰ | P_hvdc⁰ | s_upper_base | s_lower_base
+    //           | sg_upper | sg_lower]
     let theta0_off = 0usize;
     let pg0_off = n_bus;
-    let s_upper_base_off = n_bus + n_gen;
-    let s_lower_base_off = n_bus + n_gen + n_flow;
-    let base_n_var = n_bus + n_gen + 2 * n_flow;
+    let hvdc0_off = n_bus + n_gen;
+    let s_upper_base_off = hvdc0_off + n_hvdc_c;
+    let s_lower_base_off = s_upper_base_off + n_flow;
+    let sg_upper_base_off = s_lower_base_off + n_flow;
+    let sg_lower_base_off = sg_upper_base_off + n_gen_slacks_c;
+    let base_n_var = sg_lower_base_off + n_gen_slacks_c;
 
     // Penalty cost per per-unit thermal violation (matches dc_opf_lp.rs)
     let thermal_penalty_per_pu = options.penalty_config.thermal.marginal_cost_at(0.0) * base;
@@ -1763,6 +1788,14 @@ pub(crate) fn solve_dc_corrective_with_context(
         obj_coeffs_base[s_upper_base_off + ci] = thermal_penalty_per_pu;
         obj_coeffs_base[s_lower_base_off + ci] = thermal_penalty_per_pu;
     }
+    // Gen-limit slack penalty costs.
+    if let Some(penalty) = options.dc_opf.gen_limit_penalty {
+        let penalty_pu = penalty * base;
+        for j in 0..n_gen {
+            obj_coeffs_base[sg_upper_base_off + j] = penalty_pu;
+            obj_coeffs_base[sg_lower_base_off + j] = penalty_pu;
+        }
+    }
 
     let has_quadratic = q_diag.iter().any(|&v| v.abs() > 1e-20);
 
@@ -1778,8 +1811,18 @@ pub(crate) fn solve_dc_corrective_with_context(
         &island_refs,
     );
     for (j, &gi) in gen_indices.iter().enumerate() {
-        col_lower_base[pg0_off + j] = network.generators[gi].pmin / base;
-        col_upper_base[pg0_off + j] = network.generators[gi].pmax / base;
+        if has_gen_slacks_c {
+            col_lower_base[pg0_off + j] = f64::NEG_INFINITY;
+            col_upper_base[pg0_off + j] = f64::INFINITY;
+        } else {
+            col_lower_base[pg0_off + j] = network.generators[gi].pmin / base;
+            col_upper_base[pg0_off + j] = network.generators[gi].pmax / base;
+        }
+    }
+    // HVDC variable bounds.
+    for (k, hvdc) in hvdc_var_c.iter().enumerate() {
+        col_lower_base[hvdc0_off + k] = hvdc.p_dc_min_mw / base;
+        col_upper_base[hvdc0_off + k] = hvdc.p_dc_max_mw / base;
     }
     // Base thermal slack bounds: [0, +∞)
     for ci in 0..n_flow {
@@ -1788,15 +1831,23 @@ pub(crate) fn solve_dc_corrective_with_context(
         col_lower_base[s_lower_base_off + ci] = 0.0;
         col_upper_base[s_lower_base_off + ci] = f64::INFINITY;
     }
+    // Gen-limit slack bounds.
+    for j in 0..n_gen_slacks_c {
+        col_lower_base[sg_upper_base_off + j] = 0.0;
+        col_upper_base[sg_upper_base_off + j] = f64::INFINITY;
+        col_lower_base[sg_lower_base_off + j] = 0.0;
+        col_upper_base[sg_lower_base_off + j] = f64::INFINITY;
+    }
 
     // --- Base constraint triplets (pre-contingency, fixed) ---
     // Row layout (base):
     //   0..n_flow                      : branch thermal limits Bf*θ⁰ ∈ [-fmax, fmax]
     //   n_flow..n_flow+n_ang_c         : angle diff limits θ_from - θ_to ∈ [angmin, angmax]
     //   n_flow+n_ang_c..+n_bus         : power balance B*θ⁰ - A_gen*Pg⁰ = -Pd
+    //   ..+2*n_gen_slacks              : gen-limit soft constraints (if enabled)
     //
     // These rows reference only base-variable columns (0..base_n_var).
-    let base_n_row = n_flow + n_ang_c + n_bus;
+    let base_n_row = n_flow + n_ang_c + n_bus + 2 * n_gen_slacks_c;
 
     let mut base_triplets: Vec<Triplet<f64>> = Vec::new();
 
@@ -1889,6 +1940,48 @@ pub(crate) fn solve_dc_corrective_with_context(
             val: -1.0,
         });
     }
+    // HVDC variable link power balance coefficients.
+    let hvdc_from_idx_c: Vec<usize> = hvdc_var_c.iter().map(|h| bus_map[&h.from_bus]).collect();
+    let hvdc_to_idx_c: Vec<usize> = hvdc_var_c.iter().map(|h| bus_map[&h.to_bus]).collect();
+    for (k, hvdc) in hvdc_var_c.iter().enumerate() {
+        base_triplets.push(Triplet {
+            row: n_flow + n_ang_c + hvdc_from_idx_c[k],
+            col: hvdc0_off + k,
+            val: 1.0,
+        });
+        base_triplets.push(Triplet {
+            row: n_flow + n_ang_c + hvdc_to_idx_c[k],
+            col: hvdc0_off + k,
+            val: -(1.0 - hvdc.loss_b_frac),
+        });
+    }
+    // Gen-limit soft constraint rows.
+    if has_gen_slacks_c {
+        let gen_pmax_row_c = n_flow + n_ang_c + n_bus;
+        let gen_pmin_row_c = gen_pmax_row_c + n_gen;
+        for j in 0..n_gen {
+            base_triplets.push(Triplet {
+                row: gen_pmax_row_c + j,
+                col: pg0_off + j,
+                val: 1.0,
+            });
+            base_triplets.push(Triplet {
+                row: gen_pmax_row_c + j,
+                col: sg_upper_base_off + j,
+                val: -1.0,
+            });
+            base_triplets.push(Triplet {
+                row: gen_pmin_row_c + j,
+                col: pg0_off + j,
+                val: -1.0,
+            });
+            base_triplets.push(Triplet {
+                row: gen_pmin_row_c + j,
+                col: sg_lower_base_off + j,
+                val: -1.0,
+            });
+        }
+    }
 
     // --- Base row bounds ---
     let mut base_row_lower: Vec<f64> = Vec::with_capacity(base_n_row);
@@ -1921,14 +2014,29 @@ pub(crate) fn solve_dc_corrective_with_context(
         pbusinj_corrective[to_idx] -= pf;
     }
 
-    // Fixed HVDC link injections (lossless approximation).
-    let hvdc_links_corrective = surge_hvdc::interop::links_from_network(network);
-    for link in &hvdc_links_corrective {
-        if let Some(&fi) = bus_map.get(&link.from_bus()) {
-            pbusinj_corrective[fi] += link.p_dc_mw() / base;
+    // HVDC link injections.
+    if !all_hvdc_opf_links.is_empty() {
+        for hvdc in all_hvdc_opf_links.iter().filter(|h| !h.is_variable()) {
+            let p_dc = hvdc.p_dc_min_mw;
+            let p_inv = hvdc.p_inv_mw(p_dc);
+            let fi = bus_map[&hvdc.from_bus];
+            pbusinj_corrective[fi] += p_dc / base;
+            let ti = bus_map[&hvdc.to_bus];
+            pbusinj_corrective[ti] -= p_inv / base;
         }
-        if let Some(&ti) = bus_map.get(&link.to_bus()) {
-            pbusinj_corrective[ti] -= link.p_dc_mw() / base;
+        for (k, hvdc) in hvdc_var_c.iter().enumerate() {
+            let ti = hvdc_to_idx_c[k];
+            pbusinj_corrective[ti] += hvdc.loss_a_mw / base;
+        }
+    } else {
+        let hvdc_links_corrective = surge_hvdc::interop::links_from_network(network);
+        for link in &hvdc_links_corrective {
+            if let Some(&fi) = bus_map.get(&link.from_bus()) {
+                pbusinj_corrective[fi] += link.p_dc_mw() / base;
+            }
+            if let Some(&ti) = bus_map.get(&link.to_bus()) {
+                pbusinj_corrective[ti] -= link.p_dc_mw() / base;
+            }
         }
     }
 
@@ -1977,6 +2085,19 @@ pub(crate) fn solve_dc_corrective_with_context(
         let rhs = -pd_pu - gs_pu - pbusinj_corrective[i];
         base_row_lower.push(rhs);
         base_row_upper.push(rhs);
+    }
+    // Gen-limit soft constraint row bounds.
+    if has_gen_slacks_c {
+        for &gi in gen_indices {
+            let g = &network.generators[gi];
+            base_row_lower.push(f64::NEG_INFINITY);
+            base_row_upper.push(g.pmax / base);
+        }
+        for &gi in gen_indices {
+            let g = &network.generators[gi];
+            base_row_lower.push(f64::NEG_INFINITY);
+            base_row_upper.push(-g.pmin / base);
+        }
     }
 
     // --- Iterative corrective constraint generation ---
@@ -2048,8 +2169,8 @@ pub(crate) fn solve_dc_corrective_with_context(
                     q_value_vec.push(qd);
                 }
             }
-            // Base thermal slack columns (2*n_flow) + extra corrective columns: no Hessian
-            for _ in 0..(2 * n_flow + n_extra_col) {
+            // HVDC + thermal slacks + gen-limit slacks + extra corrective columns: no Hessian
+            for _ in 0..(n_hvdc_c + 2 * n_flow + 2 * n_gen_slacks_c + n_extra_col) {
                 q_start_vec.push(q_index_vec.len() as i32);
             }
             q_start_vec.push(q_index_vec.len() as i32);
@@ -4037,5 +4158,101 @@ mod tests {
         // The mixed contingency has 1 branch, so it goes into ctg_data
         // with the gen shift tracked in mixed_gen_shifts
         assert!(result.total_contingencies_evaluated > 0);
+    }
+
+    #[test]
+    fn test_scopf_gen_limit_slacks_case9() {
+        let net = surge_io::load(case_path("case9")).unwrap();
+        let opts = ScopfOptions {
+            dc_opf: DcOpfOptions {
+                gen_limit_penalty: Some(1000.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = solve_dc_preventive(&net, &opts).unwrap();
+        assert!(result.converged);
+        assert!(result.base_opf.total_cost > 0.0);
+    }
+
+    #[test]
+    fn test_scopf_loss_factors_case9() {
+        let net = surge_io::load(case_path("case9")).unwrap();
+        let opts_no_loss = ScopfOptions::default();
+        let opts_loss = ScopfOptions {
+            dc_opf: DcOpfOptions {
+                use_loss_factors: true,
+                max_loss_iter: 3,
+                loss_tol: 1e-3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result_no = solve_dc_preventive(&net, &opts_no_loss).unwrap();
+        let result_yes = solve_dc_preventive(&net, &opts_loss).unwrap();
+        assert!(result_yes.converged);
+        // With loss compensation, cost should be >= lossless (generators
+        // must produce more to cover losses).
+        assert!(
+            result_yes.base_opf.total_cost >= result_no.base_opf.total_cost - 0.01,
+            "loss-compensated cost ({:.2}) should be >= lossless ({:.2})",
+            result_yes.base_opf.total_cost,
+            result_no.base_opf.total_cost,
+        );
+    }
+
+    #[test]
+    fn test_scopf_no_angle_limits_case9() {
+        let net = surge_io::load(case_path("case9")).unwrap();
+        let opts_on = ScopfOptions {
+            enforce_angle_limits: true,
+            ..Default::default()
+        };
+        let opts_off = ScopfOptions {
+            enforce_angle_limits: false,
+            ..Default::default()
+        };
+        let result_on = solve_dc_preventive(&net, &opts_on).unwrap();
+        let result_off = solve_dc_preventive(&net, &opts_off).unwrap();
+        assert!(result_on.converged);
+        assert!(result_off.converged);
+        // With angle limits off, cost should be <= cost with limits on
+        // (less constrained problem).
+        assert!(
+            result_off.base_opf.total_cost <= result_on.base_opf.total_cost + 0.01,
+            "no-angle cost ({:.2}) should be <= with-angle cost ({:.2})",
+            result_off.base_opf.total_cost,
+            result_on.base_opf.total_cost,
+        );
+    }
+
+    #[test]
+    fn test_scopf_corrective_case9() {
+        let net = surge_io::load(case_path("case9")).unwrap();
+        let opts = ScopfOptions {
+            mode: ScopfMode::Corrective,
+            ..Default::default()
+        };
+        let result =
+            solve_dc_corrective_with_context(&net, &opts, &ScopfRunContext::default()).unwrap();
+        assert!(result.converged);
+        assert!(result.base_opf.total_cost > 0.0);
+    }
+
+    #[test]
+    fn test_scopf_corrective_gen_slacks_case9() {
+        let net = surge_io::load(case_path("case9")).unwrap();
+        let opts = ScopfOptions {
+            mode: ScopfMode::Corrective,
+            dc_opf: DcOpfOptions {
+                gen_limit_penalty: Some(1000.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result =
+            solve_dc_corrective_with_context(&net, &opts, &ScopfRunContext::default()).unwrap();
+        assert!(result.converged);
+        assert!(result.base_opf.total_cost > 0.0);
     }
 }
