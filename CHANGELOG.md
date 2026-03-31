@@ -21,6 +21,11 @@ and this project follows Semantic Versioning intent.
   hardcoded to `false`.
 - **Corrective mode Hessian** — Hessian column count updated to account for
   HVDC and generator-limit slack variables.
+- **SCOPF loss factor results** — `total_losses_mw` and `lmp_loss` are now
+  computed from the final theta solution when loss factors are active.
+  Previously hardcoded to zero.
+- **SCOPF contingency count** — `total_contingencies_evaluated` now includes
+  HVDC contingencies.
 
 ### Added
 
@@ -37,7 +42,7 @@ and this project follows Semantic Versioning intent.
 - **`--no-angle-limits`** CLI flag and `enforce_angle_limits` option to disable
   SCOPF angle-difference constraints entirely.
 - **`--gen-limit-penalty`**, **`--use-loss-factors`**, **`--loss-iterations`**,
-  **`--loss-tolerance`** CLI flags for new SCOPF features.
+  **`--loss-tolerance`** CLI flags for DC-OPF and SCOPF.
 - **SCOPF defaults to LP costs** — PWL (piecewise-linear) cost formulation is
   now the default for DC-SCOPF, avoiding HiGHS QP numerical issues on large
   cases.
@@ -54,6 +59,8 @@ and this project follows Semantic Versioning intent.
 - **Solver error messages** — HiGHS and Ipopt "not found" errors now
   explicitly note that `pip install highspy` / `pip install cyipopt` do not
   provide the C shared libraries Surge needs.
+- **`surge-bindings` now published to crates.io** — users can install the
+  CLI via `cargo install surge-bindings`.
 
 ### Documentation
 
