@@ -6,6 +6,62 @@ this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows Semantic Versioning intent.
 
+## [0.1.1] — 2026-03-31
+
+### Fixed
+
+- **SCOPF angle constraints** — angle-difference constraints now use penalty
+  slack variables instead of hard constraints, fixing infeasibility on cases
+  with tight angle limits (e.g. ACTIVSg2000).
+- **SCOPF HVDC power balance** — fixed HVDC and MTDC grid injections are now
+  included in the power balance RHS for both preventive and corrective modes.
+  Previously omitted, causing incorrect dispatch on networks with DC links.
+- **SCOPF PWL cost passthrough** — `use_pwl_costs` and
+  `quadratic_pwl_local_indices` now read from `DcOpfOptions` instead of being
+  hardcoded to `false`.
+- **Corrective mode Hessian** — Hessian column count updated to account for
+  HVDC and generator-limit slack variables.
+
+### Added
+
+- **SCOPF PAR setpoints** — PAR branches are excluded from the B-bus matrix
+  and replaced by scheduled-interchange injections, matching DC-OPF behavior.
+- **SCOPF variable HVDC dispatch** — `DcOpfOptions::hvdc_links` with variable
+  P_dc bounds adds co-optimized HVDC decision variables with linear loss
+  modeling.
+- **SCOPF generator limit slacks** — soft Pmin/Pmax constraints via
+  `--gen-limit-penalty` (CLI) or `DcOpfOptions(generator_limit_mode=Soft)`.
+- **SCOPF loss factor iteration** — iterative loss compensation wrapping the
+  cutting-plane loop, enabled via `--use-loss-factors` (CLI) or
+  `DcOpfOptions(loss_model=Iterative)`. Preventive mode only.
+- **`--no-angle-limits`** CLI flag and `enforce_angle_limits` option to disable
+  SCOPF angle-difference constraints entirely.
+- **`--gen-limit-penalty`**, **`--use-loss-factors`**, **`--loss-iterations`**,
+  **`--loss-tolerance`** CLI flags for new SCOPF features.
+- **SCOPF defaults to LP costs** — PWL (piecewise-linear) cost formulation is
+  now the default for DC-SCOPF, avoiding HiGHS QP numerical issues on large
+  cases.
+- **Gurobi pip discovery** — `gurobipy/.libs/` in Python site-packages is now
+  searched when looking for `libgurobi130.so`.
+- **Python `ScopfOptions.dc_opf`** field for passing DC-OPF sub-options
+  (cost model, gen-limit penalty, loss factors) through to SCOPF.
+
+### Changed
+
+- **README quick start** — Python section now leads with `pip install surge-py`
+  instead of build-from-source. CLI section includes Rust installation
+  instructions.
+- **Solver error messages** — HiGHS and Ipopt "not found" errors now
+  explicitly note that `pip install highspy` / `pip install cyipopt` do not
+  provide the C shared libraries Surge needs.
+
+### Documentation
+
+- Added pip shared library warnings to quickstart, support-compatibility, and
+  surge-py README.
+- Updated SCOPF tutorial, CLI reference, notebook, and surge-opf crate docs
+  with new options and defaults.
+
 ## [0.1.0] — 2026-03-29
 
 Initial public release of the Surge power systems analysis engine.
