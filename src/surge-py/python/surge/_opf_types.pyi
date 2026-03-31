@@ -157,6 +157,8 @@ class ScopfOptions:
     enforce_voltage_security: bool = True
     max_contingencies: int = 0
     minimum_branch_rating_a_mva: float = 1.0
+    enforce_angle_limits: bool = True
+    dc_opf: DcOpfOptions | None = None
     def to_native_kwargs(self, network: object | None = None) -> dict[str, object]: ...
 
 

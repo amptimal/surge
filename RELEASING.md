@@ -66,9 +66,10 @@ Manually verify:
 - if you need a full publishability dry-run before the first public release,
   use a staged local registry or equivalent publish simulation rather than the
   workspace-wide command above
-- do not publish `surge-bindings` or `surge-py` to crates.io; those remain
-  interface/packaging crates distributed via the binary and Python release
-  paths
+- do not publish `surge-py` to crates.io; it is distributed as a Python
+  wheel via PyPI
+- `surge-bindings` (the `surge-solve` CLI) is published to crates.io so
+  users can install via `cargo install surge-bindings`
 
 ### Python
 

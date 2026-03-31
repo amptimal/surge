@@ -917,14 +917,6 @@ pub(crate) fn solve_dc_preventive_with_context(
 
             // Build PF solution from optimal dispatch
             let gen_p_mw: Vec<f64> = pg_pu.iter().map(|&p| p * base).collect();
-            let _hvdc_dispatch_mw: Vec<f64> = if n_hvdc > 0 {
-                sol.x[hvdc_offset..hvdc_offset + n_hvdc]
-                    .iter()
-                    .map(|&p| p * base)
-                    .collect()
-            } else {
-                vec![]
-            };
             let total_cost = sol.objective + c0_total;
 
             let va: Vec<f64> = theta.to_vec();
