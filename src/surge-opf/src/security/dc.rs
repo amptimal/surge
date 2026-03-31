@@ -900,11 +900,12 @@ pub(crate) fn solve_dc_preventive_with_context(
                 }
             }
 
-            // Total congestion = LMP - per-island energy
+            // Total congestion = LMP - energy - loss
             let lmp_congestion: Vec<f64> = lmp
                 .iter()
                 .zip(lmp_energy.iter())
-                .map(|(&l, &e)| l - e)
+                .zip(lmp_loss.iter())
+                .map(|((&l, &e), &lo)| l - e - lo)
                 .collect();
 
             // Branch shadow prices (base-case)
@@ -1951,13 +1952,16 @@ pub(crate) fn solve_dc_corrective_with_context(
         });
     }
     // -A_gen block
+    let mut gen_balance_triplet_indices_c = Vec::with_capacity(gen_bus_idx.len());
     for (j, &bus_idx) in gen_bus_idx.iter().enumerate() {
+        gen_balance_triplet_indices_c.push(base_triplets.len());
         base_triplets.push(Triplet {
             row: n_flow + n_ang_c + bus_idx,
             col: pg0_off + j,
             val: -1.0,
         });
     }
+    let balance_row_offset_c = n_flow + n_ang_c;
     // HVDC variable link power balance coefficients.
     let hvdc_from_idx_c: Vec<usize> = hvdc_var_c.iter().map(|h| bus_map[&h.from_bus]).collect();
     let hvdc_to_idx_c: Vec<usize> = hvdc_var_c.iter().map(|h| bus_map[&h.to_bus]).collect();
@@ -2147,6 +2151,11 @@ pub(crate) fn solve_dc_corrective_with_context(
         .map_err(DcOpfError::SolverError)?;
 
     let mut scopf_iter = 0u32;
+    let use_loss_factors_c = options.dc_opf.use_loss_factors;
+    let max_loss_iter_c = options.dc_opf.max_loss_iter;
+    let loss_tol_c = options.dc_opf.loss_tol;
+    let mut prev_dloss_c = vec![0.0f64; n_bus];
+    let mut loss_iter_count_c = 0usize;
 
     loop {
         // --- Build current LP dimensions ---
@@ -2337,16 +2346,75 @@ pub(crate) fn solve_dc_corrective_with_context(
                 n_ctg_constraints
             );
 
+            // Cutting-plane converged. Check if loss iteration is needed.
+            if use_loss_factors_c && loss_iter_count_c < max_loss_iter_c {
+                use crate::dc::loss_factors::{
+                    compute_dc_loss_sensitivities, compute_total_dc_losses,
+                };
+                let dloss_dp = compute_dc_loss_sensitivities(network, theta0, bus_map, &ptdf);
+
+                let need_resolve = if loss_iter_count_c > 0 {
+                    let max_change = dloss_dp
+                        .iter()
+                        .zip(prev_dloss_c.iter())
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0f64, f64::max);
+                    max_change >= loss_tol_c
+                } else {
+                    true
+                };
+
+                if need_resolve {
+                    prev_dloss_c.copy_from_slice(&dloss_dp);
+
+                    for (j, &ti) in gen_balance_triplet_indices_c.iter().enumerate() {
+                        let bus_idx = gen_bus_idx[j];
+                        let pf_inv = (1.0 - dloss_dp[bus_idx]).clamp(0.5, 1.5);
+                        base_triplets[ti].val = -pf_inv;
+                    }
+
+                    let total_loss_pu = compute_total_dc_losses(network, theta0, bus_map);
+                    let total_load_pu: f64 = bus_pd_mw
+                        .iter()
+                        .map(|&pd| pd / base)
+                        .sum::<f64>()
+                        .abs()
+                        .max(1e-10);
+                    for i in 0..n_bus {
+                        let load_share = (bus_pd_mw[i] / base).abs() / total_load_pu;
+                        let loss_at_bus = total_loss_pu * load_share;
+                        let pd_pu = bus_pd_mw[i] / base;
+                        let gs_pu = network.buses[i].shunt_conductance_mw / base;
+                        let rhs = -pd_pu - gs_pu - pbusinj_corrective[i] - loss_at_bus;
+                        base_row_lower[balance_row_offset_c + i] = rhs;
+                        base_row_upper[balance_row_offset_c + i] = rhs;
+                    }
+
+                    loss_iter_count_c += 1;
+                    info!(
+                        loss_iter = loss_iter_count_c,
+                        "corrective loss factor iteration — re-solving"
+                    );
+                    continue;
+                }
+            }
+
             // --- Extract results ---
             let gen_p_mw: Vec<f64> = pg0_pu.iter().map(|&p| p * base).collect();
             let total_cost = sol.objective + c0_total;
 
-            // LMPs from power balance duals (rows n_flow+n_ang_c..n_flow+n_ang_c+n_bus)
+            // LMPs from power balance duals
             let lmp: Vec<f64> = (0..n_bus)
                 .map(|i| sol.row_dual[n_flow + n_ang_c + i] / base)
                 .collect();
             let (lmp_energy, lmp_congestion, lmp_loss) =
-                crate::dc::island_lmp::decompose_lmp_lossless(&lmp, &island_refs);
+                if use_loss_factors_c && loss_iter_count_c > 0 {
+                    use crate::dc::loss_factors::compute_dc_loss_sensitivities;
+                    let dloss_dp = compute_dc_loss_sensitivities(network, theta0, bus_map, &ptdf);
+                    crate::dc::island_lmp::decompose_lmp_with_losses(&lmp, &dloss_dp, &island_refs)
+                } else {
+                    crate::dc::island_lmp::decompose_lmp_lossless(&lmp, &island_refs)
+                };
 
             // Branch shadow prices
             let mut branch_shadow_prices = vec![0.0f64; n_br];
@@ -2432,7 +2500,12 @@ pub(crate) fn solve_dc_corrective_with_context(
                 })
                 .collect();
             let total_generation_mw_cscopf: f64 = gen_p_mw.iter().sum();
-            let total_losses_mw_cscopf = 0.0; // DC corrective SCOPF is lossless
+            let total_losses_mw_cscopf = if use_loss_factors_c && loss_iter_count_c > 0 {
+                use crate::dc::loss_factors::compute_total_dc_losses;
+                compute_total_dc_losses(network, theta0, bus_map) * base
+            } else {
+                0.0
+            };
 
             // Extract generator bound duals from LP column duals.
             // Pre-contingency Pg⁰ variables are at columns pg0_off + j.
@@ -2857,6 +2930,7 @@ mod tests {
     use super::*;
     use crate::dc::opf::DcOpfOptions;
     use surge_network::network::Contingency;
+    use surge_solution::OpfSolution;
 
     /// Convenience wrapper: calls `solve_dc_preventive_with_context` with a default context.
     fn solve_dc_preventive(
@@ -2866,14 +2940,43 @@ mod tests {
         solve_dc_preventive_with_context(network, options, &ScopfRunContext::default())
     }
 
+    fn exact_cost_scopf_options() -> ScopfOptions {
+        ScopfOptions {
+            dc_opf: DcOpfOptions {
+                use_pwl_costs: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn assert_lmp_decomposition(opf: &OpfSolution) {
+        for i in 0..opf.pricing.lmp.len() {
+            let recomposed =
+                opf.pricing.lmp_energy[i] + opf.pricing.lmp_congestion[i] + opf.pricing.lmp_loss[i];
+            assert!(
+                (opf.pricing.lmp[i] - recomposed).abs() < 1e-8,
+                "bus {} LMP decomposition mismatch: {:.8} != {:.8} + {:.8} + {:.8}",
+                i,
+                opf.pricing.lmp[i],
+                opf.pricing.lmp_energy[i],
+                opf.pricing.lmp_congestion[i],
+                opf.pricing.lmp_loss[i]
+            );
+        }
+    }
+
     #[test]
     fn test_scopf_cost_geq_dcopf_case9() {
         let net = surge_io::load(case_path("case9")).unwrap();
 
-        let dcopf_opts = DcOpfOptions::default();
+        let dcopf_opts = DcOpfOptions {
+            use_pwl_costs: false,
+            ..Default::default()
+        };
         let dcopf_sol = crate::dc::opf::solve_dc_opf(&net, &dcopf_opts).unwrap().opf;
 
-        let scopf_opts = ScopfOptions::default();
+        let scopf_opts = exact_cost_scopf_options();
         let scopf_sol = solve_dc_preventive(&net, &scopf_opts).unwrap();
 
         assert!(
@@ -3361,7 +3464,7 @@ mod tests {
     fn test_corrective_scopf_cost_leq_preventive_case9() {
         let net = surge_io::load(case_path("case9")).unwrap();
 
-        let opts = ScopfOptions::default();
+        let opts = exact_cost_scopf_options();
         let preventive =
             solve_dc_preventive_with_context(&net, &opts, &ScopfRunContext::default()).unwrap();
         let corrective =
@@ -3402,12 +3505,18 @@ mod tests {
     fn test_corrective_scopf_cost_geq_dcopf_case9() {
         let net = surge_io::load(case_path("case9")).unwrap();
 
-        let dcopf_sol = crate::dc::opf::solve_dc_opf(&net, &DcOpfOptions::default())
-            .unwrap()
-            .opf;
+        let dcopf_sol = crate::dc::opf::solve_dc_opf(
+            &net,
+            &DcOpfOptions {
+                use_pwl_costs: false,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .opf;
         let corr_sol = solve_dc_corrective_with_context(
             &net,
-            &ScopfOptions::default(),
+            &exact_cost_scopf_options(),
             &ScopfRunContext::default(),
         )
         .unwrap();
@@ -3519,7 +3628,7 @@ mod tests {
     fn test_corrective_scopf_leq_preventive_case118() {
         let net = surge_io::load(case_path("case118")).unwrap();
 
-        let opts = ScopfOptions::default();
+        let opts = exact_cost_scopf_options();
         let preventive =
             solve_dc_preventive_with_context(&net, &opts, &ScopfRunContext::default()).unwrap();
         let corrective =
@@ -4217,6 +4326,81 @@ mod tests {
             result_yes.base_opf.total_cost,
             result_no.base_opf.total_cost,
         );
+        assert!(
+            result_yes.base_opf.total_generation_mw
+                >= result_no.base_opf.total_generation_mw - 0.01,
+            "loss-compensated generation ({:.3}) should be >= lossless ({:.3})",
+            result_yes.base_opf.total_generation_mw,
+            result_no.base_opf.total_generation_mw,
+        );
+        assert!(
+            result_yes.base_opf.total_losses_mw > 0.0,
+            "loss-compensated preventive SCOPF should report positive losses"
+        );
+        assert!(
+            result_yes
+                .base_opf
+                .pricing
+                .lmp_loss
+                .iter()
+                .any(|loss| loss.abs() > 1e-8),
+            "loss-compensated preventive SCOPF should expose a non-zero loss LMP component"
+        );
+        assert_lmp_decomposition(&result_yes.base_opf);
+    }
+
+    #[test]
+    fn test_scopf_corrective_loss_factors_case9() {
+        let net = surge_io::load(case_path("case9")).unwrap();
+        let opts_no_loss = ScopfOptions {
+            mode: ScopfMode::Corrective,
+            ..Default::default()
+        };
+        let opts_loss = ScopfOptions {
+            mode: ScopfMode::Corrective,
+            dc_opf: DcOpfOptions {
+                use_loss_factors: true,
+                max_loss_iter: 3,
+                loss_tol: 1e-3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result_no =
+            solve_dc_corrective_with_context(&net, &opts_no_loss, &ScopfRunContext::default())
+                .unwrap();
+        let result_yes =
+            solve_dc_corrective_with_context(&net, &opts_loss, &ScopfRunContext::default())
+                .unwrap();
+
+        assert!(result_yes.converged);
+        assert!(
+            result_yes.base_opf.total_cost >= result_no.base_opf.total_cost - 0.01,
+            "loss-compensated corrective cost ({:.2}) should be >= lossless ({:.2})",
+            result_yes.base_opf.total_cost,
+            result_no.base_opf.total_cost,
+        );
+        assert!(
+            result_yes.base_opf.total_generation_mw
+                >= result_no.base_opf.total_generation_mw - 0.01,
+            "loss-compensated corrective generation ({:.3}) should be >= lossless ({:.3})",
+            result_yes.base_opf.total_generation_mw,
+            result_no.base_opf.total_generation_mw,
+        );
+        assert!(
+            result_yes.base_opf.total_losses_mw > 0.0,
+            "loss-compensated corrective SCOPF should report positive losses"
+        );
+        assert!(
+            result_yes
+                .base_opf
+                .pricing
+                .lmp_loss
+                .iter()
+                .any(|loss| loss.abs() > 1e-8),
+            "loss-compensated corrective SCOPF should expose a non-zero loss LMP component"
+        );
+        assert_lmp_decomposition(&result_yes.base_opf);
     }
 
     #[test]

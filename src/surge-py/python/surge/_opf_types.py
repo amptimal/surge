@@ -588,10 +588,15 @@ class ScopfOptions:
             evaluates all N-1 branch contingencies.
         minimum_branch_rating_a_mva: Branches with rate_a below this
             value are treated as unconstrained. Default 1.0.
-        dc_opf: Optional DC-OPF sub-options for DC-SCOPF. Use
-            ``DcOpfOptions(cost_model=DcCostModel.PIECEWISE_LINEAR)`` for
-            large cases to avoid HiGHS QP numerical issues. Default None
-            (uses DcOpfOptions defaults).
+        cost_model: DC-SCOPF cost formulation. PIECEWISE_LINEAR
+            (default) uses the LP epigraph and avoids HiGHS QP
+            numerical issues on large cases. QUADRATIC uses the exact
+            quadratic objective on small cases where the QP backend is
+            stable.
+        dc_opf: Optional DC-OPF sub-options for DC-SCOPF such as PWL
+            breakpoint count, loss-factor iteration, and soft
+            generator-limit penalties. SCOPF cost selection uses the
+            top-level ``cost_model`` field above. Default None.
     """
 
     formulation: ScopfFormulation = ScopfFormulation.DC
@@ -604,6 +609,7 @@ class ScopfOptions:
     max_contingencies: int = 0
     minimum_branch_rating_a_mva: float = 1.0
     enforce_angle_limits: bool = True
+    cost_model: DcCostModel = DcCostModel.PIECEWISE_LINEAR
     dc_opf: "DcOpfOptions | None" = None
 
     def __post_init__(self) -> None:
@@ -632,7 +638,10 @@ class ScopfOptions:
             "max_contingencies": self.max_contingencies,
             "min_rate_a": self.minimum_branch_rating_a_mva,
             "enforce_angle_limits": self.enforce_angle_limits,
-            "use_pwl_costs": dc.cost_model is DcCostModel.PIECEWISE_LINEAR if dc else True,
+            # SCOPF uses the top-level cost_model; dc_opf carries the
+            # remaining DC sub-options such as breakpoints, losses,
+            # and soft-limit penalties.
+            "use_pwl_costs": self.cost_model is not DcCostModel.QUADRATIC,
             "pwl_cost_breakpoints": dc.piecewise_linear_breakpoints if dc else 20,
             "gen_limit_penalty": (
                 dc.generator_limit_penalty_per_mw

@@ -38,18 +38,20 @@ and this project follows Semantic Versioning intent.
   `--gen-limit-penalty` (CLI) or `DcOpfOptions(generator_limit_mode=Soft)`.
 - **SCOPF loss factor iteration** — iterative loss compensation wrapping the
   cutting-plane loop, enabled via `--use-loss-factors` (CLI) or
-  `DcOpfOptions(loss_model=Iterative)`. Preventive mode only.
+  `DcOpfOptions(loss_model=Iterative)`. Available in preventive and
+  corrective DC-SCOPF.
 - **`--no-angle-limits`** CLI flag and `enforce_angle_limits` option to disable
   SCOPF angle-difference constraints entirely.
 - **`--gen-limit-penalty`**, **`--use-loss-factors`**, **`--loss-iterations`**,
   **`--loss-tolerance`** CLI flags for DC-OPF and SCOPF.
 - **SCOPF defaults to LP costs** — PWL (piecewise-linear) cost formulation is
-  now the default for DC-SCOPF, avoiding HiGHS QP numerical issues on large
-  cases.
+  now the default for DC-SCOPF in both Rust and Python, avoiding HiGHS QP
+  numerical issues on large cases.
 - **Gurobi pip discovery** — `gurobipy/.libs/` in Python site-packages is now
   searched when looking for `libgurobi130.so`.
-- **Python `ScopfOptions.dc_opf`** field for passing DC-OPF sub-options
-  (cost model, gen-limit penalty, loss factors) through to SCOPF.
+- **Python `ScopfOptions.cost_model` and `ScopfOptions.dc_opf`** fields for
+  selecting the SCOPF cost formulation and passing DC sub-options such as
+  gen-limit penalty, loss factors, and PWL breakpoints through to SCOPF.
 
 ### Changed
 

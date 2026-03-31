@@ -223,7 +223,10 @@ impl Default for ScopfOptions {
             enforce_angle_limits: true,
             screener: Some(ScopfScreeningPolicy::default()),
             penalty_config: PenaltyConfig::default(),
-            dc_opf: DcOpfOptions::default(),
+            dc_opf: DcOpfOptions {
+                use_pwl_costs: true,
+                ..DcOpfOptions::default()
+            },
             ac: ScopfAcSettings::default(),
             corrective: ScopfCorrectiveSettings::default(),
         }

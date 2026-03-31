@@ -267,11 +267,12 @@ between the two in `to_native_kwargs()`.
 | `voltage_threshold_pu` | float | `0.01` | Voltage violation threshold (AC only) |
 | `max_contingencies` | int | `0` | Cap on contingencies evaluated (0 = all) |
 | `minimum_branch_rating_a_mva` | float | `1.0` | Minimum rating for thermal constraints |
-| `dc_opf` | `DcOpfOptions` | default | DC-OPF sub-options (cost model, tolerances, etc.) |
+| `cost_model` | enum | `PiecewiseLinear` | `PiecewiseLinear` (LP, default) or `Quadratic` (QP) |
+| `dc_opf` | `DcOpfOptions` | default | DC-OPF sub-options (PWL breakpoints, loss factors, gen-limit penalties, etc.) |
 
 > **Note:** DC-SCOPF defaults to piecewise-linear (LP) costs. This avoids
 > HiGHS QP numerical issues on large cases. Use `--dc-cost-mode qp` (CLI) or
-> `dc_opf=DcOpfOptions(cost_model=DcCostModel.QUADRATIC)` (Python) to override
+> `cost_model=DcCostModel.QUADRATIC` (Python) to override
 > with exact quadratic costs on small cases where HiGHS QP is stable.
 
 The `dc_opf` sub-options expose the following DC-OPF features to SCOPF:
@@ -283,7 +284,7 @@ The `dc_opf` sub-options expose the following DC-OPF features to SCOPF:
 - **Generator limit slacks** — `generator_limit_mode=Soft` with
   `generator_limit_penalty_per_mw` relaxes hard Pmin/Pmax with penalty cost
 - **Loss factor iteration** — `loss_model=Iterative` wraps the cutting-plane
-  loop in an outer loss iteration (preventive mode only)
+  loop in an outer loss iteration for both preventive and corrective DC-SCOPF
 
 ## ScopfRuntime Reference
 
