@@ -1669,18 +1669,21 @@ pub(crate) fn solve_dc_corrective_with_context(
 
     // --- Pre-contingency variable layout ---
     // x_base = [θ⁰ | Pg⁰ | P_hvdc⁰ | s_upper_base | s_lower_base
-    //           | sg_upper | sg_lower]
+    //           | sa_upper | sa_lower | sg_upper | sg_lower]
     let theta0_off = 0usize;
     let pg0_off = n_bus;
     let hvdc0_off = n_bus + n_gen;
     let s_upper_base_off = hvdc0_off + n_hvdc_c;
     let s_lower_base_off = s_upper_base_off + n_flow;
-    let sg_upper_base_off = s_lower_base_off + n_flow;
+    let sa_upper_base_off = s_lower_base_off + n_flow;
+    let sa_lower_base_off = sa_upper_base_off + n_ang_c;
+    let sg_upper_base_off = sa_lower_base_off + n_ang_c;
     let sg_lower_base_off = sg_upper_base_off + n_gen_slacks_c;
     let base_n_var = sg_lower_base_off + n_gen_slacks_c;
 
     // Penalty cost per per-unit thermal violation (matches dc_opf_lp.rs)
     let thermal_penalty_per_pu = options.penalty_config.thermal.marginal_cost_at(0.0) * base;
+    let angle_penalty_per_rad = options.penalty_config.angle.marginal_cost_at(0.0);
 
     // --- PTDF for LODF calculation ---
     let all_branches_ptdf: Vec<usize> = (0..n_br).collect();
@@ -1783,6 +1786,11 @@ pub(crate) fn solve_dc_corrective_with_context(
         obj_coeffs_base[s_upper_base_off + ci] = thermal_penalty_per_pu;
         obj_coeffs_base[s_lower_base_off + ci] = thermal_penalty_per_pu;
     }
+    // Angle slack penalty costs.
+    for ai in 0..n_ang_c {
+        obj_coeffs_base[sa_upper_base_off + ai] = angle_penalty_per_rad;
+        obj_coeffs_base[sa_lower_base_off + ai] = angle_penalty_per_rad;
+    }
     // Gen-limit slack penalty costs.
     if let Some(penalty) = options.dc_opf.gen_limit_penalty {
         let penalty_pu = penalty * base;
@@ -1825,6 +1833,13 @@ pub(crate) fn solve_dc_corrective_with_context(
         col_upper_base[s_upper_base_off + ci] = f64::INFINITY;
         col_lower_base[s_lower_base_off + ci] = 0.0;
         col_upper_base[s_lower_base_off + ci] = f64::INFINITY;
+    }
+    // Angle slack bounds: [0, +∞)
+    for ai in 0..n_ang_c {
+        col_lower_base[sa_upper_base_off + ai] = 0.0;
+        col_upper_base[sa_upper_base_off + ai] = f64::INFINITY;
+        col_lower_base[sa_lower_base_off + ai] = 0.0;
+        col_upper_base[sa_lower_base_off + ai] = f64::INFINITY;
     }
     // Gen-limit slack bounds.
     for j in 0..n_gen_slacks_c {
@@ -1878,7 +1893,7 @@ pub(crate) fn solve_dc_corrective_with_context(
         });
     }
 
-    // Angle difference rows (n_flow..n_flow+n_ang_c): θ_from - θ_to ∈ [angmin, angmax]
+    // Angle difference rows (n_flow..n_flow+n_ang_c): soft via penalty slacks
     for (ai, &l) in angle_constrained_branches_c.iter().enumerate() {
         let br = &network.branches[l];
         let from = bus_map[&br.from_bus];
@@ -1893,6 +1908,16 @@ pub(crate) fn solve_dc_corrective_with_context(
             row: ang_row,
             col: theta0_off + to,
             val: -1.0,
+        });
+        base_triplets.push(Triplet {
+            row: ang_row,
+            col: sa_upper_base_off + ai,
+            val: -1.0,
+        });
+        base_triplets.push(Triplet {
+            row: ang_row,
+            col: sa_lower_base_off + ai,
+            val: 1.0,
         });
     }
 
@@ -2164,8 +2189,8 @@ pub(crate) fn solve_dc_corrective_with_context(
                     q_value_vec.push(qd);
                 }
             }
-            // HVDC + thermal slacks + gen-limit slacks + extra corrective columns: no Hessian
-            for _ in 0..(n_hvdc_c + 2 * n_flow + 2 * n_gen_slacks_c + n_extra_col) {
+            // HVDC + thermal slacks + angle slacks + gen-limit slacks + extra corrective columns: no Hessian
+            for _ in 0..(n_hvdc_c + 2 * n_flow + 2 * n_ang_c + 2 * n_gen_slacks_c + n_extra_col) {
                 q_start_vec.push(q_index_vec.len() as i32);
             }
             q_start_vec.push(q_index_vec.len() as i32);
