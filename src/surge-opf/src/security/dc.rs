@@ -20,7 +20,7 @@ use surge_solution::{
 use tracing::{debug, info, warn};
 
 use super::dc_contingencies::prepare_preventive_contingencies;
-use super::dc_model::build_preventive_base_model;
+use super::dc_model::{build_preventive_base_model, collect_par_branch_set};
 use super::dc_support::{
     ContingencyData, CorrectiveCtgBlock, CutInfo, CutType, ViolationInfo, get_ptdf,
 };
@@ -63,6 +63,85 @@ fn update_variable_hvdc_injections_from_solution(
         hvdc_injections[inj_idx].2 = -p_dc_pu; // rectifier draws from the AC grid
         hvdc_injections[inj_idx].3 = p_dc_pu * (1.0 - loss_b_frac) - loss_a_pu;
     }
+}
+
+fn extract_angle_shadow_prices(
+    n_branches: usize,
+    angle_constrained_branches: &[usize],
+    row_duals: &[f64],
+    row_offset: usize,
+    base: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    let mut shadow_price_angmin = vec![0.0_f64; n_branches];
+    let mut shadow_price_angmax = vec![0.0_f64; n_branches];
+
+    for (angle_row_idx, &branch_idx) in angle_constrained_branches.iter().enumerate() {
+        let lam = row_duals[row_offset + angle_row_idx] / base;
+        if lam > 0.0 {
+            shadow_price_angmin[branch_idx] = lam;
+        } else {
+            shadow_price_angmax[branch_idx] = -lam;
+        }
+    }
+
+    (shadow_price_angmin, shadow_price_angmax)
+}
+
+fn extract_par_results(
+    network: &Network,
+    bus_map: &HashMap<u32, usize>,
+    theta: &[f64],
+    base: f64,
+    par_setpoints: &[surge_solution::ParSetpoint],
+) -> Vec<surge_solution::ParResult> {
+    par_setpoints
+        .iter()
+        .map(|ps| {
+            if let Some(br_idx) = network.branches.iter().position(|br| {
+                br.in_service
+                    && br.from_bus == ps.from_bus
+                    && br.to_bus == ps.to_bus
+                    && br.circuit == ps.circuit
+            }) {
+                let br = &network.branches[br_idx];
+                let from_i = bus_map[&ps.from_bus];
+                let to_i = bus_map[&ps.to_bus];
+                let b_dc = br.b_dc();
+                let implied_shift_rad = if b_dc.abs() > 1e-20 {
+                    theta[from_i] - theta[to_i] - ps.target_mw / (base * b_dc)
+                } else {
+                    0.0
+                };
+                let implied_shift_deg = implied_shift_rad.to_degrees();
+                let within_limits = br
+                    .opf_control
+                    .as_ref()
+                    .map(|control| {
+                        implied_shift_rad >= control.phase_min_rad
+                            && implied_shift_rad <= control.phase_max_rad
+                    })
+                    .unwrap_or(false);
+
+                surge_solution::ParResult {
+                    from_bus: ps.from_bus,
+                    to_bus: ps.to_bus,
+                    circuit: ps.circuit.clone(),
+                    target_mw: ps.target_mw,
+                    implied_shift_deg,
+                    within_limits,
+                }
+            } else {
+                surge_solution::ParResult {
+                    from_bus: ps.from_bus,
+                    to_bus: ps.to_bus,
+                    circuit: ps.circuit.clone(),
+                    target_mw: ps.target_mw,
+                    implied_shift_deg: 0.0,
+                    within_limits: false,
+                }
+            }
+        })
+        .collect()
 }
 
 /// Solve SCOPF using sparse B-theta formulation with HiGHS.
@@ -118,10 +197,12 @@ pub(crate) fn solve_dc_preventive_with_context(
     let theta_offset = 0;
     let pg_offset = n_bus;
     let thermal_penalty_per_pu = options.penalty_config.thermal.marginal_cost_at(0.0) * base;
+    let par_branch_set = collect_par_branch_set(network, options, &ctx);
     let base_model = build_preventive_base_model(network, options, &ctx)?;
     let ctg_fg_indices = base_model.active_contingency_flowgate_indices.clone();
     let super::dc_model::PreventiveBaseModel {
         constrained_branches,
+        angle_constrained_branches,
         active_interface_indices: active_iface_indices,
         active_base_flowgate_indices: active_fg_indices,
         active_contingency_flowgate_indices: _,
@@ -164,6 +245,7 @@ pub(crate) fn solve_dc_preventive_with_context(
             bus_map,
             gen_indices,
             gen_bus_idx: &gen_bus_idx,
+            par_branch_set: &par_branch_set,
             ptdf: &ptdf,
             n_bus,
             n_branches: n_br,
@@ -942,6 +1024,13 @@ pub(crate) fn solve_dc_preventive_with_context(
             for (ci, &l) in constrained_branches.iter().enumerate() {
                 branch_shadow_prices[l] = sol.row_dual[ci] / base;
             }
+            let (shadow_price_angmin, shadow_price_angmax) = extract_angle_shadow_prices(
+                n_br,
+                &angle_constrained_branches,
+                &sol.row_dual,
+                n_flow,
+                base,
+            );
 
             // Build PF solution from optimal dispatch
             let gen_p_mw: Vec<f64> = pg_pu.iter().map(|&p| p * base).collect();
@@ -1130,6 +1219,8 @@ pub(crate) fn solve_dc_preventive_with_context(
             let mu_pg_max_scopf: Vec<f64> = (0..n_gen)
                 .map(|j| sol.col_dual[pg_offset + j].max(0.0) / base)
                 .collect();
+            let par_results =
+                extract_par_results(network, bus_map, theta, base, &options.dc_opf.par_setpoints);
 
             return Ok(ScopfResult {
                 base_opf: OpfSolution {
@@ -1157,8 +1248,8 @@ pub(crate) fn solve_dc_preventive_with_context(
                     branches: OpfBranchResults {
                         branch_loading_pct,
                         branch_shadow_prices,
-                        shadow_price_angmin: vec![],
-                        shadow_price_angmax: vec![],
+                        shadow_price_angmin,
+                        shadow_price_angmax,
                         flowgate_shadow_prices: {
                             let mut v = vec![0.0; network.flowgates.len()];
                             for (ri, &fi) in active_fg_indices.iter().enumerate() {
@@ -1183,7 +1274,7 @@ pub(crate) fn solve_dc_preventive_with_context(
                     total_load_mw,
                     total_generation_mw: total_generation_mw_scopf,
                     total_losses_mw: total_losses_mw_scopf,
-                    par_results: vec![],
+                    par_results,
                     virtual_bid_results: vec![],
                     benders_cut_duals: vec![],
                     solve_time_secs: solve_time,
@@ -1632,17 +1723,7 @@ pub(crate) fn solve_dc_corrective_with_context(
         .collect();
 
     // --- PAR branch exclusion ---
-    let par_branch_set: HashSet<usize> = options
-        .dc_opf
-        .par_setpoints
-        .iter()
-        .filter_map(|ps| {
-            ctx.branch_idx_map
-                .get(&(ps.from_bus, ps.to_bus, ps.circuit.clone()))
-                .copied()
-                .filter(|&idx| network.branches[idx].in_service)
-        })
-        .collect();
+    let par_branch_set = collect_par_branch_set(network, options, &ctx);
 
     // --- Constrained branches ---
     let constrained_branches: Vec<usize> = if options.dc_opf.enforce_thermal_limits {
@@ -1730,7 +1811,7 @@ pub(crate) fn solve_dc_corrective_with_context(
     let monitored_branches: Vec<usize> = (0..n_br)
         .filter(|&l| {
             let br = &network.branches[l];
-            br.in_service && br.rating_a_mva >= options.min_rate_a
+            br.in_service && !par_branch_set.contains(&l) && br.rating_a_mva >= options.min_rate_a
         })
         .collect();
 
@@ -1746,7 +1827,10 @@ pub(crate) fn solve_dc_corrective_with_context(
                 continue;
             }
             let outaged_br = ctg.branch_indices[0];
-            if outaged_br >= n_br || !network.branches[outaged_br].in_service {
+            if outaged_br >= n_br
+                || par_branch_set.contains(&outaged_br)
+                || !network.branches[outaged_br].in_service
+            {
                 continue;
             }
             let br = &network.branches[outaged_br];
@@ -2450,6 +2534,13 @@ pub(crate) fn solve_dc_corrective_with_context(
             for (ci, &l) in constrained_branches.iter().enumerate() {
                 branch_shadow_prices[l] = sol.row_dual[ci] / base;
             }
+            let (shadow_price_angmin, shadow_price_angmax) = extract_angle_shadow_prices(
+                n_br,
+                &angle_constrained_branches_c,
+                &sol.row_dual,
+                n_flow,
+                base,
+            );
 
             let va: Vec<f64> = theta0.to_vec();
             let mut p_inject = vec![0.0f64; n_bus];
@@ -2545,6 +2636,13 @@ pub(crate) fn solve_dc_corrective_with_context(
             let mu_pg_max_cscopf: Vec<f64> = (0..n_gen)
                 .map(|j| sol.col_dual[pg0_off + j].max(0.0) / base)
                 .collect();
+            let par_results = extract_par_results(
+                network,
+                bus_map,
+                theta0,
+                base,
+                &options.dc_opf.par_setpoints,
+            );
 
             return Ok(ScopfResult {
                 base_opf: OpfSolution {
@@ -2572,8 +2670,8 @@ pub(crate) fn solve_dc_corrective_with_context(
                     branches: OpfBranchResults {
                         branch_loading_pct,
                         branch_shadow_prices,
-                        shadow_price_angmin: vec![],
-                        shadow_price_angmax: vec![],
+                        shadow_price_angmin,
+                        shadow_price_angmax,
                         flowgate_shadow_prices: vec![],
                         interface_shadow_prices: vec![],
                         shadow_price_vm_min: vec![],
@@ -2584,7 +2682,7 @@ pub(crate) fn solve_dc_corrective_with_context(
                     total_load_mw,
                     total_generation_mw: total_generation_mw_cscopf,
                     total_losses_mw: total_losses_mw_cscopf,
-                    par_results: vec![],
+                    par_results,
                     virtual_bid_results: vec![],
                     benders_cut_duals: vec![],
                     solve_time_secs: solve_time,
@@ -2958,6 +3056,7 @@ mod tests {
 
     use super::*;
     use crate::dc::opf::DcOpfOptions;
+    use crate::security::{dc_contingencies, dc_model};
     use surge_network::network::Contingency;
     use surge_solution::OpfSolution;
 
@@ -2977,6 +3076,66 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    fn make_par_scopf_test_network() -> Network {
+        use surge_network::market::CostCurve;
+        use surge_network::network::{Branch, BranchOpfControl, Bus, BusType, Generator};
+
+        let mut net = Network::new("par_scopf_test");
+        net.base_mva = 100.0;
+        net.buses.push(Bus::new(1, BusType::Slack, 100.0));
+        net.buses.push(Bus::new(2, BusType::PQ, 100.0));
+        net.buses.push(Bus::new(3, BusType::PQ, 100.0));
+
+        net.loads
+            .push(surge_network::network::Load::new(2, 80.0, 0.0));
+        net.loads
+            .push(surge_network::network::Load::new(3, 60.0, 0.0));
+
+        let mut par_branch = Branch::new_line(1, 2, 0.0, 0.2, 0.0);
+        par_branch.circuit = "1".to_string();
+        par_branch.rating_a_mva = 200.0;
+        par_branch.opf_control = Some(BranchOpfControl {
+            phase_min_rad: (-30.0_f64).to_radians(),
+            phase_max_rad: 30.0_f64.to_radians(),
+            ..BranchOpfControl::default()
+        });
+        net.branches.push(par_branch);
+
+        let mut br13 = Branch::new_line(1, 3, 0.0, 0.1, 0.0);
+        br13.circuit = "1".to_string();
+        br13.rating_a_mva = 200.0;
+        br13.angle_diff_min_rad = Some((-0.5_f64).to_radians());
+        br13.angle_diff_max_rad = Some(0.5_f64.to_radians());
+        net.branches.push(br13);
+
+        let mut br23 = Branch::new_line(2, 3, 0.0, 0.1, 0.0);
+        br23.circuit = "1".to_string();
+        br23.rating_a_mva = 200.0;
+        net.branches.push(br23);
+
+        let mut gen1 = Generator::new(1, 0.0, 1.0);
+        gen1.pmin = 0.0;
+        gen1.pmax = 200.0;
+        gen1.cost = Some(CostCurve::Polynomial {
+            startup: 0.0,
+            shutdown: 0.0,
+            coeffs: vec![20.0, 0.0],
+        });
+        net.generators.push(gen1);
+
+        let mut gen2 = Generator::new(3, 0.0, 1.0);
+        gen2.pmin = 0.0;
+        gen2.pmax = 100.0;
+        gen2.cost = Some(CostCurve::Polynomial {
+            startup: 0.0,
+            shutdown: 0.0,
+            coeffs: vec![25.0, 0.0],
+        });
+        net.generators.push(gen2);
+
+        net
     }
 
     fn assert_lmp_decomposition(opf: &OpfSolution) {
@@ -4114,10 +4273,164 @@ mod tests {
         assert!(result.total_contingencies_evaluated > 0);
     }
 
-    /// SCOPF rejects flowgate constraints until aggregate corridor security cuts
-    /// are modeled as first-class constraints.
     #[test]
-    fn test_scopf_flowgate_constraints_are_rejected() {
+    fn test_prepare_preventive_contingencies_excludes_par_branches() {
+        let net = make_par_scopf_test_network();
+        let opts = ScopfOptions {
+            contingencies: Some(vec![
+                Contingency {
+                    id: "par_n1".into(),
+                    label: "Trip PAR branch".into(),
+                    branch_indices: vec![0],
+                    ..Default::default()
+                },
+                Contingency {
+                    id: "line_n1".into(),
+                    label: "Trip non-PAR branch".into(),
+                    branch_indices: vec![1],
+                    ..Default::default()
+                },
+                Contingency {
+                    id: "par_n2".into(),
+                    label: "Trip PAR and non-PAR branches".into(),
+                    branch_indices: vec![0, 2],
+                    ..Default::default()
+                },
+            ]),
+            dc_opf: DcOpfOptions {
+                par_setpoints: vec![surge_solution::ParSetpoint {
+                    from_bus: 1,
+                    to_bus: 2,
+                    circuit: "1".to_string(),
+                    target_mw: 30.0,
+                }],
+                ..Default::default()
+            },
+            screener: None,
+            ..Default::default()
+        };
+        let ctx = OpfNetworkContext::for_dc(&net).expect("PAR test context should build");
+        let base_model = dc_model::build_preventive_base_model(&net, &opts, &ctx)
+            .expect("preventive base model should build");
+        let par_branch_set = dc_model::collect_par_branch_set(&net, &opts, &ctx);
+        let prepared = dc_contingencies::prepare_preventive_contingencies(
+            &net,
+            &opts,
+            &ScopfRunContext::default(),
+            dc_contingencies::PreventiveContingencyInputs {
+                bus_map: &ctx.bus_map,
+                gen_indices: &ctx.gen_indices,
+                gen_bus_idx: &base_model.gen_bus_idx,
+                par_branch_set: &par_branch_set,
+                ptdf: &base_model.ptdf,
+                n_bus: ctx.n_bus,
+                n_branches: ctx.n_branches,
+                n_base_rows: base_model.n_base_rows,
+                n_var_base: base_model.n_var_base,
+                theta_offset: 0,
+                thermal_penalty_per_pu: opts.penalty_config.thermal.marginal_cost_at(0.0)
+                    * ctx.base_mva,
+                base: ctx.base_mva,
+            },
+        );
+
+        assert!(
+            par_branch_set.contains(&0),
+            "branch 0 should be recognized as PAR"
+        );
+        assert!(
+            !prepared.monitored_branches.contains(&0),
+            "PAR branches must not be monitored in preventive screening"
+        );
+        assert!(
+            prepared.ctg_data.iter().all(|cd| cd.outaged_br != 0),
+            "PAR outages must not be turned into single-branch contingency data"
+        );
+        assert!(
+            prepared
+                .n2_ctg_data
+                .iter()
+                .all(|n2| n2.k1 != 0 && n2.k2 != 0),
+            "PAR outages must not be turned into N-2 contingency data"
+        );
+        assert!(
+            prepared.ctg_data.iter().any(|cd| cd.outaged_br == 1),
+            "non-PAR outages should still be prepared"
+        );
+    }
+
+    #[test]
+    fn test_scopf_preventive_exposes_par_results_and_angle_duals() {
+        let net = make_par_scopf_test_network();
+        let opts = ScopfOptions {
+            contingencies: Some(vec![]),
+            dc_opf: DcOpfOptions {
+                enforce_thermal_limits: false,
+                par_setpoints: vec![surge_solution::ParSetpoint {
+                    from_bus: 1,
+                    to_bus: 2,
+                    circuit: "1".to_string(),
+                    target_mw: 30.0,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let result = solve_dc_preventive(&net, &opts).expect("preventive PAR SCOPF should solve");
+        assert_eq!(result.base_opf.par_results.len(), 1);
+        assert_eq!(
+            result.base_opf.branches.shadow_price_angmin.len(),
+            net.branches.len()
+        );
+        assert_eq!(
+            result.base_opf.branches.shadow_price_angmax.len(),
+            net.branches.len()
+        );
+        assert!(
+            result.base_opf.par_results[0].implied_shift_deg.is_finite(),
+            "preventive PAR result should include a finite implied shift"
+        );
+    }
+
+    #[test]
+    fn test_scopf_corrective_exposes_par_results_and_angle_duals() {
+        let net = make_par_scopf_test_network();
+        let opts = ScopfOptions {
+            mode: ScopfMode::Corrective,
+            contingencies: Some(vec![]),
+            dc_opf: DcOpfOptions {
+                enforce_thermal_limits: false,
+                par_setpoints: vec![surge_solution::ParSetpoint {
+                    from_bus: 1,
+                    to_bus: 2,
+                    circuit: "1".to_string(),
+                    target_mw: 30.0,
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let result = solve_dc_corrective_with_context(&net, &opts, &ScopfRunContext::default())
+            .expect("corrective PAR SCOPF should solve");
+        assert_eq!(result.base_opf.par_results.len(), 1);
+        assert_eq!(
+            result.base_opf.branches.shadow_price_angmin.len(),
+            net.branches.len()
+        );
+        assert_eq!(
+            result.base_opf.branches.shadow_price_angmax.len(),
+            net.branches.len()
+        );
+        assert!(
+            result.base_opf.par_results[0].implied_shift_deg.is_finite(),
+            "corrective PAR result should include a finite implied shift"
+        );
+    }
+
+    #[test]
+    fn test_scopf_preventive_flowgate_constraints_are_supported() {
         let mut net = surge_io::load(case_path("case9")).unwrap();
 
         // Add a tight base-case flowgate on the first branch
@@ -4140,22 +4453,25 @@ mod tests {
         });
 
         let opts = ScopfOptions {
+            contingencies: Some(vec![]),
             enforce_flowgates: true,
             screener: None,
             ..Default::default()
         };
-        let err =
-            crate::security::solve_scopf(&net, &opts).expect_err("SCOPF should reject flowgates");
+        let result = crate::security::solve_scopf(&net, &opts)
+            .expect("preventive SCOPF should enforce flowgates");
         assert!(
-            matches!(err, ScopfError::UnsupportedSecurityConstraint { .. }),
-            "unexpected error: {err}"
+            result.base_opf.branches.flowgate_shadow_prices.len() == net.flowgates.len(),
+            "flowgate shadow prices should align with network.flowgates"
+        );
+        assert!(
+            result.base_opf.branches.flowgate_shadow_prices[0].abs() > 1e-4,
+            "binding flowgate should expose a non-zero shadow price"
         );
     }
 
-    /// SCOPF rejects interface constraints until aggregate corridor security cuts
-    /// are modeled as first-class constraints.
     #[test]
-    fn test_scopf_interface_constraints_are_rejected() {
+    fn test_scopf_preventive_interface_constraints_are_supported() {
         let mut net = surge_io::load(case_path("case9")).unwrap();
 
         // Add a tight interface on branch 0
@@ -4176,12 +4492,85 @@ mod tests {
         });
 
         let opts = ScopfOptions {
+            contingencies: Some(vec![]),
             enforce_flowgates: true,
             screener: None,
             ..Default::default()
         };
-        let err =
-            crate::security::solve_scopf(&net, &opts).expect_err("SCOPF should reject interfaces");
+        let result = crate::security::solve_scopf(&net, &opts)
+            .expect("preventive SCOPF should enforce interfaces");
+        assert!(
+            result.base_opf.branches.interface_shadow_prices.len() == net.interfaces.len(),
+            "interface shadow prices should align with network.interfaces"
+        );
+        assert!(
+            result.base_opf.branches.interface_shadow_prices[0].abs() > 1e-4,
+            "binding interface should expose a non-zero shadow price"
+        );
+    }
+
+    #[test]
+    fn test_scopf_corrective_flowgate_constraints_are_rejected() {
+        let mut net = surge_io::load(case_path("case9")).unwrap();
+        let br = &net.branches[0];
+        net.flowgates.push(surge_network::network::Flowgate {
+            name: "FG1".into(),
+            monitored: vec![surge_network::network::WeightedBranchRef::new(
+                br.from_bus,
+                br.to_bus,
+                br.circuit.clone(),
+                1.0,
+            )],
+            contingency_branch: None,
+            limit_mw: 50.0,
+            in_service: true,
+            limit_reverse_mw: 0.0,
+            limit_mw_schedule: vec![],
+            limit_reverse_mw_schedule: vec![],
+            hvdc_coefficients: vec![],
+        });
+
+        let opts = ScopfOptions {
+            mode: ScopfMode::Corrective,
+            enforce_flowgates: true,
+            screener: None,
+            ..Default::default()
+        };
+        let err = crate::security::solve_scopf(&net, &opts)
+            .expect_err("corrective SCOPF should still reject flowgates");
+        assert!(
+            matches!(err, ScopfError::UnsupportedSecurityConstraint { .. }),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_scopf_corrective_interface_constraints_are_rejected() {
+        let mut net = surge_io::load(case_path("case9")).unwrap();
+        let br = &net.branches[0];
+        net.interfaces.push(surge_network::network::Interface {
+            name: "IF1".into(),
+            members: vec![surge_network::network::WeightedBranchRef::new(
+                br.from_bus,
+                br.to_bus,
+                br.circuit.clone(),
+                1.0,
+            )],
+            limit_forward_mw: 50.0,
+            limit_reverse_mw: 50.0,
+            in_service: true,
+            limit_forward_mw_schedule: vec![],
+            limit_reverse_mw_schedule: vec![],
+        });
+
+        let opts = ScopfOptions {
+            mode: ScopfMode::Corrective,
+            enforce_flowgates: true,
+            screener: None,
+            ..Default::default()
+        };
+        let err = crate::security::solve_scopf(&net, &opts)
+            .expect_err("corrective SCOPF should still reject interfaces");
         assert!(
             matches!(err, ScopfError::UnsupportedSecurityConstraint { .. }),
             "unexpected error: {err}"

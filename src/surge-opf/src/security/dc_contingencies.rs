@@ -43,6 +43,7 @@ pub(crate) struct PreventiveContingencyInputs<'a> {
     pub bus_map: &'a HashMap<u32, usize>,
     pub gen_indices: &'a [usize],
     pub gen_bus_idx: &'a [usize],
+    pub par_branch_set: &'a HashSet<usize>,
     pub ptdf: &'a PtdfRows,
     pub n_bus: usize,
     pub n_branches: usize,
@@ -160,7 +161,9 @@ pub(crate) fn prepare_preventive_contingencies(
     let monitored_branches: Vec<usize> = (0..inputs.n_branches)
         .filter(|&branch_idx| {
             let br = &network.branches[branch_idx];
-            br.in_service && br.rating_a_mva >= options.min_rate_a
+            br.in_service
+                && !inputs.par_branch_set.contains(&branch_idx)
+                && br.rating_a_mva >= options.min_rate_a
         })
         .collect();
 
@@ -190,7 +193,10 @@ pub(crate) fn prepare_preventive_contingencies(
 
         if n_branches == 1 {
             let outaged_br = ctg.branch_indices[0];
-            if outaged_br >= inputs.n_branches || !network.branches[outaged_br].in_service {
+            if outaged_br >= inputs.n_branches
+                || inputs.par_branch_set.contains(&outaged_br)
+                || !network.branches[outaged_br].in_service
+            {
                 continue;
             }
 
@@ -220,6 +226,8 @@ pub(crate) fn prepare_preventive_contingencies(
             let k2 = ctg.branch_indices[1];
             if k1 >= inputs.n_branches
                 || k2 >= inputs.n_branches
+                || inputs.par_branch_set.contains(&k1)
+                || inputs.par_branch_set.contains(&k2)
                 || !network.branches[k1].in_service
                 || !network.branches[k2].in_service
             {
@@ -366,6 +374,11 @@ pub(crate) fn prepare_preventive_contingencies(
                 continue;
             }
             let monitored_branch_idx = cut.monitored_branch_idx;
+            if monitored_branch_idx >= inputs.n_branches
+                || inputs.par_branch_set.contains(&monitored_branch_idx)
+            {
+                continue;
+            }
             let Some(contingency) = ctg_data
                 .iter()
                 .find(|contingency| contingency.outaged_br == cut.outaged_branch_indices[0])
@@ -424,7 +437,9 @@ pub(crate) fn prepare_preventive_contingencies(
 
         let mut approx_flow = vec![0.0f64; inputs.n_branches];
         for (branch_idx, flow) in approx_flow.iter_mut().enumerate() {
-            if !network.branches[branch_idx].in_service {
+            if !network.branches[branch_idx].in_service
+                || inputs.par_branch_set.contains(&branch_idx)
+            {
                 continue;
             }
             for (bus_idx, injection) in net_inject.iter().enumerate().take(inputs.n_bus) {

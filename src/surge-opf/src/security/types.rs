@@ -117,8 +117,9 @@ pub struct ScopfOptions {
     pub contingency_rating: ThermalRating,
     /// Enforce flowgate and interface constraints.
     ///
-    /// SCOPF currently rejects these corridor constraints entirely instead of
-    /// silently approximating them as single-branch cuts.
+    /// Supported in preventive DC-SCOPF and preventive AC-SCOPF. DC corrective
+    /// SCOPF still rejects corridor constraints instead of silently ignoring
+    /// them.
     pub enforce_flowgates: bool,
     /// Enforce branch angle-difference limits as soft constraints.
     /// Default: `true`.  Set to `false` to skip angle constraints entirely,

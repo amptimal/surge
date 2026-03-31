@@ -18,6 +18,7 @@ use super::types::ScopfOptions;
 
 pub(crate) struct PreventiveBaseModel {
     pub constrained_branches: Vec<usize>,
+    pub angle_constrained_branches: Vec<usize>,
     pub active_interface_indices: Vec<usize>,
     pub active_base_flowgate_indices: Vec<usize>,
     pub active_contingency_flowgate_indices: Vec<usize>,
@@ -67,17 +68,7 @@ pub(crate) fn build_preventive_base_model(
     let bus_pd_mw = network.bus_load_p_mw();
 
     // PAR branches are removed from B_bus and replaced by fixed injections.
-    let par_branch_set: HashSet<usize> = options
-        .dc_opf
-        .par_setpoints
-        .iter()
-        .filter_map(|ps| {
-            ctx.branch_idx_map
-                .get(&(ps.from_bus, ps.to_bus, ps.circuit.clone()))
-                .copied()
-                .filter(|&idx| network.branches[idx].in_service)
-        })
-        .collect();
+    let par_branch_set = collect_par_branch_set(network, options, ctx);
 
     let constrained_branches = if options.dc_opf.enforce_thermal_limits {
         ctx.constrained_branch_indices(options.min_rate_a)
@@ -607,6 +598,7 @@ pub(crate) fn build_preventive_base_model(
 
     Ok(PreventiveBaseModel {
         constrained_branches,
+        angle_constrained_branches,
         active_interface_indices,
         active_base_flowgate_indices,
         active_contingency_flowgate_indices,
@@ -633,6 +625,24 @@ pub(crate) fn build_preventive_base_model(
         balance_row_offset,
         pbusinj,
     })
+}
+
+pub(crate) fn collect_par_branch_set(
+    network: &Network,
+    options: &ScopfOptions,
+    ctx: &OpfNetworkContext,
+) -> HashSet<usize> {
+    options
+        .dc_opf
+        .par_setpoints
+        .iter()
+        .filter_map(|ps| {
+            ctx.branch_idx_map
+                .get(&(ps.from_bus, ps.to_bus, ps.circuit.clone()))
+                .copied()
+                .filter(|&idx| network.branches[idx].in_service)
+        })
+        .collect()
 }
 
 fn collect_angle_constrained_branches(network: &Network) -> Vec<usize> {

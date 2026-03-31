@@ -261,7 +261,7 @@ between the two in `to_native_kwargs()`.
 | `mode` | enum | `Preventive` | `Preventive` or `Corrective` |
 | `corrective_ramp_window_minutes` | float | `10.0` | Corrective action time window |
 | `contingency_rating` | enum | `RateA` | Post-contingency thermal rating tier |
-| `enforce_flowgates` | bool | `true` | Include flowgate constraints |
+| `enforce_flowgates` | bool | `true` | Include interface and flowgate constraints in preventive SCOPF; DC corrective mode still rejects corridor constraints |
 | `enforce_angle_limits` | bool | `true` | Enforce branch angle-difference limits as soft constraints |
 | `enforce_voltage_security` | bool | `true` | Post-contingency voltage limits (AC only) |
 | `voltage_threshold_pu` | float | `0.01` | Voltage violation threshold (AC only) |

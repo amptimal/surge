@@ -41,13 +41,7 @@ pub fn solve_scopf_with_runtime(
     network
         .validate()
         .map_err(|e| ScopfError::InvalidNetwork(e.to_string()))?;
-    if options.enforce_flowgates
-        && (!network.flowgates.is_empty() || !network.interfaces.is_empty())
-    {
-        return Err(ScopfError::UnsupportedSecurityConstraint {
-            detail: "flowgate/interface security constraints are not released in SCOPF yet; use base-case OPF or transfer studies instead".to_string(),
-        });
-    }
+    let has_corridor_constraints = !network.flowgates.is_empty() || !network.interfaces.is_empty();
     let context = ScopfRunContext {
         runtime: runtime.clone(),
     };
@@ -57,6 +51,11 @@ pub fn solve_scopf_with_runtime(
                 .map_err(ScopfError::from)
         }
         (ScopfFormulation::Dc, ScopfMode::Corrective) => {
+            if options.enforce_flowgates && has_corridor_constraints {
+                return Err(ScopfError::UnsupportedSecurityConstraint {
+                    detail: "DC corrective SCOPF does not yet model flowgate/interface security constraints; use preventive SCOPF or base-case OPF for corridor enforcement".to_string(),
+                });
+            }
             self::dc::solve_dc_corrective_with_context(&network, options, &context)
                 .map_err(ScopfError::from)
         }

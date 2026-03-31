@@ -10,66 +10,27 @@ and this project follows Semantic Versioning intent.
 
 ### Fixed
 
-- **SCOPF angle constraints** — angle-difference constraints now use penalty
-  slack variables instead of hard constraints, fixing infeasibility on cases
-  with tight angle limits (e.g. ACTIVSg2000).
-- **SCOPF HVDC power balance** — fixed HVDC and MTDC grid injections are now
-  included in the power balance RHS for both preventive and corrective modes.
-  Previously omitted, causing incorrect dispatch on networks with DC links.
-- **SCOPF PWL cost passthrough** — `use_pwl_costs` and
-  `quadratic_pwl_local_indices` now read from `DcOpfOptions` instead of being
-  hardcoded to `false`.
-- **Corrective mode Hessian** — Hessian column count updated to account for
-  HVDC and generator-limit slack variables.
-- **SCOPF loss factor results** — `total_losses_mw` and `lmp_loss` are now
-  computed from the final theta solution when loss factors are active.
-  Previously hardcoded to zero.
-- **SCOPF contingency count** — `total_contingencies_evaluated` now includes
-  HVDC contingencies.
+- Corrected several DC-SCOPF issues affecting angle-limit handling, HVDC and
+  MTDC power balance, piecewise-linear cost passthrough, corrective Hessian
+  sizing, loss-factor outputs, and HVDC contingency accounting.
 
 ### Added
 
-- **SCOPF PAR setpoints** — PAR branches are excluded from the B-bus matrix
-  and replaced by scheduled-interchange injections, matching DC-OPF behavior.
-- **SCOPF variable HVDC dispatch** — `DcOpfOptions::hvdc_links` with variable
-  P_dc bounds adds co-optimized HVDC decision variables with linear loss
-  modeling.
-- **SCOPF generator limit slacks** — soft Pmin/Pmax constraints via
-  `--gen-limit-penalty` (CLI) or `DcOpfOptions(generator_limit_mode=Soft)`.
-- **SCOPF loss factor iteration** — iterative loss compensation wrapping the
-  cutting-plane loop, enabled via `--use-loss-factors` (CLI) or
-  `DcOpfOptions(loss_model=Iterative)`. Available in preventive and
-  corrective DC-SCOPF.
-- **`--no-angle-limits`** CLI flag and `enforce_angle_limits` option to disable
-  SCOPF angle-difference constraints entirely.
-- **`--gen-limit-penalty`**, **`--use-loss-factors`**, **`--loss-iterations`**,
-  **`--loss-tolerance`** CLI flags for DC-OPF and SCOPF.
-- **SCOPF defaults to LP costs** — PWL (piecewise-linear) cost formulation is
-  now the default for DC-SCOPF in both Rust and Python, avoiding HiGHS QP
-  numerical issues on large cases.
-- **Gurobi pip discovery** — `gurobipy/.libs/` in Python site-packages is now
-  searched when looking for `libgurobi130.so`.
-- **Python `ScopfOptions.cost_model` and `ScopfOptions.dc_opf`** fields for
-  selecting the SCOPF cost formulation and passing DC sub-options such as
-  gen-limit penalty, loss factors, and PWL breakpoints through to SCOPF.
+- Added co-optimized variable HVDC dispatch, PAR scheduled-interchange
+  treatment, soft generator limits, iterative loss-factor support, and the
+  related CLI and Python SCOPF options.
 
 ### Changed
 
-- **README quick start** — Python section now leads with `pip install surge-py`
-  instead of build-from-source. CLI section includes Rust installation
-  instructions.
-- **Solver error messages** — HiGHS and Ipopt "not found" errors now
-  explicitly note that `pip install highspy` / `pip install cyipopt` do not
-  provide the C shared libraries Surge needs.
-- **`surge-bindings` now published to crates.io** — users can install the
-  CLI via `cargo install surge-bindings`.
+- DC-SCOPF now defaults to LP costs in Rust and Python for more robust HiGHS
+  behavior on large cases.
+- `surge-bindings` is now published on crates.io, and installation guidance now
+  leads with `cargo install surge-bindings` and `pip install surge-py`.
 
 ### Documentation
 
-- Added pip shared library warnings to quickstart, support-compatibility, and
-  surge-py README.
-- Updated SCOPF tutorial, CLI reference, notebook, and surge-opf crate docs
-  with new options and defaults.
+- Refreshed the quickstart, support matrix, SCOPF tutorial, CLI reference,
+  notebook, and crate docs to match the new defaults and release packaging.
 
 ## [0.1.0] — 2026-03-29
 
