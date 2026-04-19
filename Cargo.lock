@@ -2271,7 +2271,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "surge-ac"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "dyn-stack",
@@ -2292,7 +2292,7 @@ dependencies = [
 
 [[package]]
 name = "surge-bindings"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -2314,7 +2314,7 @@ dependencies = [
 
 [[package]]
 name = "surge-contingency"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "faer",
@@ -2337,7 +2337,7 @@ dependencies = [
 
 [[package]]
 name = "surge-dc"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "faer",
  "serde",
@@ -2355,7 +2355,7 @@ dependencies = [
 
 [[package]]
 name = "surge-dispatch"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -2382,7 +2382,7 @@ dependencies = [
 
 [[package]]
 name = "surge-hvdc"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "faer",
  "num-complex",
@@ -2399,7 +2399,7 @@ dependencies = [
 
 [[package]]
 name = "surge-io"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "ciborium",
@@ -2425,7 +2425,7 @@ dependencies = [
 
 [[package]]
 name = "surge-market"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "serde",
@@ -2440,7 +2440,7 @@ dependencies = [
 
 [[package]]
 name = "surge-network"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "chrono",
  "num-complex",
@@ -2453,7 +2453,7 @@ dependencies = [
 
 [[package]]
 name = "surge-opf"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "clarabel",
@@ -2476,7 +2476,7 @@ dependencies = [
 
 [[package]]
 name = "surge-py"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "chrono",
  "faer",
@@ -2506,7 +2506,7 @@ dependencies = [
 
 [[package]]
 name = "surge-solution"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "serde",
  "serde-value",
@@ -2519,7 +2519,7 @@ dependencies = [
 
 [[package]]
 name = "surge-sparse"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "faer",
  "num-complex",
@@ -2528,7 +2528,7 @@ dependencies = [
 
 [[package]]
 name = "surge-topology"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "serde_json",
  "surge-network",
@@ -2538,7 +2538,7 @@ dependencies = [
 
 [[package]]
 name = "surge-transfer"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "faer",
