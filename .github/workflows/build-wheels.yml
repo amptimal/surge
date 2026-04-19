@@ -295,6 +295,13 @@ jobs:
           COPT_HOME: ${{ steps.setup-copt.outputs.copt_home }}
           PKG_CONFIG_PATH: /opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/suite-sparse/lib/pkgconfig
           SURGE_PY_REQUIRE_COPT_NLP_SHIM: "1"
+          # Homebrew's openblas (pulled in transitively via suite-sparse) links
+          # against libquadmath.0.dylib via @rpath. The file lives in the gcc
+          # bottle that brew installs as an openblas dep, but delocate does
+          # not search that subdirectory by default. Exposing it here lets the
+          # wheel-repair step copy libquadmath + libgfortran into .dylibs/ so
+          # the wheel is self-contained on end-user machines.
+          DYLD_FALLBACK_LIBRARY_PATH: /opt/homebrew/opt/gcc/lib/gcc/current
 
       - name: Verify wheel legal metadata and packaged shim
         run: |
