@@ -102,7 +102,8 @@ These define the generic PyPI wheel matrix. Additional targeted
 - The Rust crates intended for crates.io publication are:
   `surge-network`, `surge-solution`, `surge-sparse`, `surge-io`,
   `surge-topology`, `surge-dc`, `surge-ac`, `surge-hvdc`,
-  `surge-contingency`, `surge-transfer`, `surge-opf`, and `surge-bindings`.
+  `surge-contingency`, `surge-transfer`, `surge-opf`,
+  `surge-dispatch`, `surge-market`, and `surge-bindings`.
 - The interface/packaging crate `surge-py` is a workspace member but is not
   published to crates.io.
 - Generic Python wheels are published to PyPI as part of the coordinated

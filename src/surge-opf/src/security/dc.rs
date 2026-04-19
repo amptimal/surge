@@ -374,6 +374,8 @@ pub(crate) fn solve_dc_preventive_with_context(
             q_start: q_start_ext,
             q_index: q_index_ext,
             q_value: q_value_ext,
+            col_names: None,
+            row_names: None,
             integrality: None,
         };
         let lp_opts = LpOptions {
@@ -1250,6 +1252,8 @@ pub(crate) fn solve_dc_preventive_with_context(
                         branch_shadow_prices,
                         shadow_price_angmin,
                         shadow_price_angmax,
+                        thermal_limit_slack_from_mva: vec![],
+                        thermal_limit_slack_to_mva: vec![],
                         flowgate_shadow_prices: {
                             let mut v = vec![0.0; network.flowgates.len()];
                             for (ri, &fi) in active_fg_indices.iter().enumerate() {
@@ -1277,10 +1281,21 @@ pub(crate) fn solve_dc_preventive_with_context(
                     par_results,
                     virtual_bid_results: vec![],
                     benders_cut_duals: vec![],
+                    objective_terms: vec![],
+                    audit: Default::default(),
                     solve_time_secs: solve_time,
                     iterations: Some(sol.iterations),
                     solver_name: Some(lp_solver.name().to_string()),
                     solver_version: Some(lp_solver.version().to_string()),
+                    ac_opf_timings: None,
+                    bus_q_slack_pos_mvar: vec![],
+                    bus_q_slack_neg_mvar: vec![],
+                    bus_p_slack_pos_mw: vec![],
+                    bus_p_slack_neg_mw: vec![],
+                    vm_slack_high_pu: vec![],
+                    vm_slack_low_pu: vec![],
+                    angle_diff_slack_high_rad: vec![],
+                    angle_diff_slack_low_rad: vec![],
                 },
                 formulation: ScopfFormulation::Dc,
                 mode: ScopfMode::Preventive,
@@ -2370,6 +2385,8 @@ pub(crate) fn solve_dc_corrective_with_context(
             } else {
                 None
             },
+            col_names: None,
+            row_names: None,
             integrality: None,
         };
         let lp_opts = LpOptions {
@@ -2672,6 +2689,8 @@ pub(crate) fn solve_dc_corrective_with_context(
                         branch_shadow_prices,
                         shadow_price_angmin,
                         shadow_price_angmax,
+                        thermal_limit_slack_from_mva: vec![],
+                        thermal_limit_slack_to_mva: vec![],
                         flowgate_shadow_prices: vec![],
                         interface_shadow_prices: vec![],
                         shadow_price_vm_min: vec![],
@@ -2685,10 +2704,21 @@ pub(crate) fn solve_dc_corrective_with_context(
                     par_results,
                     virtual_bid_results: vec![],
                     benders_cut_duals: vec![],
+                    objective_terms: vec![],
+                    audit: Default::default(),
                     solve_time_secs: solve_time,
                     iterations: Some(sol.iterations),
                     solver_name: Some(lp_solver.name().to_string()),
                     solver_version: Some(lp_solver.version().to_string()),
+                    ac_opf_timings: None,
+                    bus_q_slack_pos_mvar: vec![],
+                    bus_q_slack_neg_mvar: vec![],
+                    bus_p_slack_pos_mw: vec![],
+                    bus_p_slack_neg_mw: vec![],
+                    vm_slack_high_pu: vec![],
+                    vm_slack_low_pu: vec![],
+                    angle_diff_slack_high_rad: vec![],
+                    angle_diff_slack_low_rad: vec![],
                 },
                 formulation: ScopfFormulation::Dc,
                 mode: ScopfMode::Corrective,
@@ -4450,6 +4480,8 @@ mod tests {
             limit_mw_schedule: vec![],
             limit_reverse_mw_schedule: vec![],
             hvdc_coefficients: vec![],
+            hvdc_band_coefficients: vec![],
+            limit_mw_active_period: None,
         });
 
         let opts = ScopfOptions {
@@ -4528,6 +4560,8 @@ mod tests {
             limit_mw_schedule: vec![],
             limit_reverse_mw_schedule: vec![],
             hvdc_coefficients: vec![],
+            hvdc_band_coefficients: vec![],
+            limit_mw_active_period: None,
         });
 
         let opts = ScopfOptions {

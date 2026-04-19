@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Surge · Dashboards</title>
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v=20260418">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:          #030305;
+    --bg-elevated: #0a0a0f;
+    --bg-card:     #0f0f14;
+    --bg-hover:    #161620;
+    --border:      #1a1a24;
+    --purple:      #a78bfa;
+    --purple-dim:  rgba(167,139,250,0.15);
+    --brand:       #5B3D9B;
+    --text:        #e2e8f0;
+    --text-muted:  #94a3b8;
+    --text-dim:    #475569;
+    --font:  'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    --mono:  'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    --gradient-headline: linear-gradient(135deg, #e8e3f8 0%, #c084fc 50%, #818cf8 100%);
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: var(--font);
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.5;
+    font-size: 14px;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* ── nav ── */
+  .top-nav {
+    height: 52px;
+    display: flex;
+    align-items: center;
+    padding: 0 1.5rem;
+    background: rgba(3,3,5,0.85);
+    backdrop-filter: blur(14px);
+    border-bottom: 1px solid var(--border);
+    gap: 1.5rem;
+  }
+  .nav-logo { display: flex; align-items: center; gap: 0.55rem; text-decoration: none; color: inherit; }
+  .nav-logo-name {
+    font-size: 0.82rem;
+    font-weight: 800;
+    letter-spacing: 0.14em;
+    background: linear-gradient(135deg, var(--purple), var(--brand));
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .nav-section-label {
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    padding-left: 1rem;
+    border-left: 1px solid var(--border);
+  }
+
+  /* ── hero ── */
+  .hero {
+    padding: 5rem 2rem 3rem;
+    text-align: center;
+    max-width: 1040px;
+    margin: 0 auto;
+  }
+  .hero h1 {
+    font-size: clamp(2rem, 4vw, 3.2rem);
+    font-weight: 800;
+    line-height: 1.15;
+    background: var(--gradient-headline);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    letter-spacing: -0.02em;
+  }
+  .hero p {
+    margin-top: 1rem;
+    color: var(--text-muted);
+    font-size: 1.05rem;
+    max-width: 620px;
+    margin-left: auto;
+    margin-right: auto;
+  }
+
+  /* ── cards ── */
+  .card-grid {
+    max-width: 1040px;
+    margin: 0 auto;
+    padding: 2rem 2rem 5rem;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 1.25rem;
+  }
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 1.5rem;
+    text-decoration: none;
+    color: inherit;
+    display: flex;
+    flex-direction: column;
+    transition: all 0.15s;
+    position: relative;
+    overflow: hidden;
+    min-height: 200px;
+  }
+  .card::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(135deg, var(--purple-dim), transparent 40%);
+    opacity: 0;
+    transition: opacity 0.25s;
+    pointer-events: none;
+  }
+  .card:hover { border-color: rgba(167,139,250,0.45); transform: translateY(-2px); }
+  .card:hover::before { opacity: 1; }
+  .card-header { display: flex; align-items: flex-start; gap: 0.85rem; margin-bottom: 0.75rem; }
+  .card-icon {
+    font-size: 1.5rem;
+    width: 40px;
+    height: 40px;
+    background: var(--purple-dim);
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+  .card-title {
+    font-size: 1.1rem;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+  .card-route {
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    color: var(--text-dim);
+    margin-top: 0.2rem;
+  }
+  .card-desc {
+    color: var(--text-muted);
+    font-size: 0.9rem;
+    margin-top: 0.25rem;
+    flex-grow: 1;
+  }
+  .card-footer {
+    margin-top: 1rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 0.78rem;
+  }
+  .card-tag {
+    padding: 3px 10px;
+    background: var(--purple-dim);
+    color: var(--purple);
+    border-radius: 12px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    font-size: 0.65rem;
+  }
+  .card-tag:empty { display: none; }
+  .card-open {
+    color: var(--purple);
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+  .card-open::after { content: " →"; margin-left: 2px; transition: margin-left 0.15s; }
+  .card:hover .card-open::after { margin-left: 6px; }
+
+  /* ── empty ── */
+  .empty {
+    text-align: center;
+    padding: 3rem;
+    color: var(--text-muted);
+  }
+  .empty code {
+    font-family: var(--mono);
+    color: var(--purple);
+    background: var(--purple-dim);
+    padding: 2px 8px;
+    border-radius: 4px;
+  }
+</style>
+</head>
+<body>
+
+<nav class="top-nav">
+  <a class="nav-logo" href="/">
+    <svg width="22" height="22" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <circle cx="256" cy="256" r="180" fill="none" stroke="#a78bfa" stroke-width="32"/>
+      <path d="M 60 380 Q 140 380, 200 200 Q 256 80, 312 200 Q 372 380, 452 380" fill="none" stroke="#a78bfa" stroke-width="32" stroke-linecap="round"/>
+    </svg>
+    <span class="nav-logo-name">AMPTIMAL</span>
+  </a>
+  <div class="nav-section-label">Surge Dashboards</div>
+</nav>
+
+<section class="hero">
+  <h1>Interactive market studies</h1>
+  <p>Pick a dashboard. Each one wraps a market specification from the <code style="font-family: var(--mono); color: var(--purple);">markets/</code> tree with live editing, solve, and inspection.</p>
+</section>
+
+<main id="card-grid" class="card-grid"></main>
+
+<script>
+  async function loadDashboards() {
+    const grid = document.getElementById('card-grid');
+    try {
+      const res = await fetch('api/dashboards', { cache: 'no-store' });
+      const data = await res.json();
+      const list = data.dashboards || [];
+      if (list.length === 0) {
+        grid.innerHTML = `
+          <div class="empty">
+            No dashboards discovered.<br><br>
+            Add a <code>manifest.json</code> to a folder under
+            <code>dashboards/</code> and restart the server.
+          </div>`;
+        return;
+      }
+      grid.innerHTML = list.map(d => `
+        <a class="card" href="${d.route}/">
+          <div class="card-header">
+            <div class="card-icon">${d.icon || '●'}</div>
+            <div>
+              <div class="card-title">${escapeHtml(d.title)}</div>
+              <div class="card-route">/${escapeHtml(d.route)}</div>
+            </div>
+          </div>
+          <div class="card-desc">${escapeHtml(d.description || '')}</div>
+          <div class="card-footer">
+            <span class="card-tag">${escapeHtml(d.tag || '')}</span>
+            <span class="card-open">Open</span>
+          </div>
+        </a>
+      `).join('');
+    } catch (err) {
+      grid.innerHTML = `<div class="empty">Failed to load dashboards: ${escapeHtml(String(err))}</div>`;
+    }
+  }
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({
+      '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+    }[c]));
+  }
+  loadDashboards();
+</script>
+</body>
+</html>

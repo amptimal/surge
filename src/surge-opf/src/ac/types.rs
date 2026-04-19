@@ -30,6 +30,10 @@ pub struct WarmStart {
     pub pg: Vec<f64>,
     /// Generator reactive power outputs in pu (indexed by generator order).
     pub qg: Vec<f64>,
+    /// Dispatchable-load served real power in pu (indexed by in-service load order).
+    pub dispatchable_load_p: Vec<f64>,
+    /// Dispatchable-load served reactive power in pu (indexed by in-service load order).
+    pub dispatchable_load_q: Vec<f64>,
 }
 
 impl WarmStart {
@@ -44,6 +48,64 @@ impl WarmStart {
             voltage_angle_rad: solution.voltage_angle_rad.clone(),
             pg: Vec::new(),
             qg: Vec::new(),
+            dispatchable_load_p: Vec::new(),
+            dispatchable_load_q: Vec::new(),
+        }
+    }
+
+    /// Build a WarmStart from a [`PfSolution`] plus the solved network snapshot.
+    ///
+    /// In addition to voltage magnitudes and angles, this recovers approximate
+    /// generator `Pg/Qg` seeds from the network operating point and the PF
+    /// result. `Pg` is seeded from the network generator dispatch with any
+    /// recorded distributed-slack contribution applied; `Qg` is reconstructed
+    /// from the solved bus reactive injections.
+    pub fn from_pf_with_network(network: &Network, solution: &PfSolution) -> Self {
+        let base_mva = network.base_mva;
+        let pg = network
+            .generators
+            .iter()
+            .enumerate()
+            .filter(|(_, generator)| generator.in_service)
+            .map(|(idx, generator)| {
+                let slack_mw = solution
+                    .gen_slack_contribution_mw
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(0.0);
+                (generator.p + slack_mw) / base_mva
+            })
+            .collect();
+        let solved_qg_mvar = solution.generator_reactive_power_mvar(network);
+        let qg = network
+            .generators
+            .iter()
+            .enumerate()
+            .filter(|(_, generator)| generator.in_service)
+            .map(|(idx, _)| solved_qg_mvar.get(idx).copied().unwrap_or(0.0) / base_mva)
+            .collect();
+        let dispatchable_load_p = network
+            .market_data
+            .dispatchable_loads
+            .iter()
+            .filter(|load| load.in_service)
+            .map(|load| load.p_sched_pu)
+            .collect();
+        let dispatchable_load_q = network
+            .market_data
+            .dispatchable_loads
+            .iter()
+            .filter(|load| load.in_service)
+            .map(|load| load.q_sched_pu)
+            .collect();
+
+        Self {
+            voltage_magnitude_pu: solution.voltage_magnitude_pu.clone(),
+            voltage_angle_rad: solution.voltage_angle_rad.clone(),
+            pg,
+            qg,
+            dispatchable_load_p,
+            dispatchable_load_q,
         }
     }
 
@@ -68,7 +130,48 @@ impl WarmStart {
                 .iter()
                 .map(|&q| q / base_mva)
                 .collect(),
+            dispatchable_load_p: result
+                .devices
+                .dispatchable_load_served_mw
+                .iter()
+                .map(|&p| p / base_mva)
+                .collect(),
+            dispatchable_load_q: result
+                .devices
+                .dispatchable_load_served_q_mvar
+                .iter()
+                .map(|&q| q / base_mva)
+                .collect(),
         }
+    }
+
+    /// Build a WarmStart from a prior [`OpfSolution`], but use the current
+    /// network snapshot's real-power dispatch targets for generators and
+    /// dispatchable loads.
+    pub fn from_opf_with_network_targets(network: &Network, result: &OpfSolution) -> Self {
+        let mut warm_start = Self::from_opf(result);
+        let base_mva = result.base_mva;
+        warm_start.pg = network
+            .generators
+            .iter()
+            .filter(|generator| generator.in_service)
+            .map(|generator| generator.p / base_mva)
+            .collect();
+        warm_start.dispatchable_load_p = network
+            .market_data
+            .dispatchable_loads
+            .iter()
+            .filter(|load| load.in_service)
+            .map(|load| load.p_sched_pu)
+            .collect();
+        warm_start.dispatchable_load_q = network
+            .market_data
+            .dispatchable_loads
+            .iter()
+            .filter(|load| load.in_service)
+            .map(|load| load.q_sched_pu)
+            .collect();
+        warm_start
     }
 }
 
@@ -76,7 +179,7 @@ impl WarmStart {
 ///
 /// This type carries backend selection and transient solve state that should
 /// not be mixed into the serializable/public AC-OPF problem specification.
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct AcOpfRuntime {
     /// Override NLP solver backend. `None` = use the canonical default NLP policy.
     pub nlp_solver: Option<Arc<dyn NlpSolver>>,
@@ -88,6 +191,20 @@ pub struct AcOpfRuntime {
     /// `Some(true)` = force DC-OPF warm-start regardless of problem size.
     /// `Some(false)` = disable (use simple DC power flow for initial angles).
     pub use_dc_opf_warm_start: Option<bool>,
+    /// Optional additive quadratic penalties on active-power deviations from target schedules.
+    #[doc(hidden)]
+    pub objective_target_tracking: Option<AcObjectiveTargetTracking>,
+    /// When `Some(path)` and the discrete polish runs, serialize the
+    /// FIRST-pass `OpfSolution` to that path as pretty-printed JSON
+    /// before the polish takes over. Captures the high-value debug
+    /// surface — bus voltages, generator P/Q, continuous-vs-rounded
+    /// discrete dispatch, bus balance slack values, discrete-feasibility
+    /// flag — so a "bad" first-pass result can be inspected after the
+    /// polish has rewritten the public solution. No-op when the polish
+    /// doesn't run (continuous mode, no discrete devices, polish
+    /// disabled). Caller is responsible for picking a unique path per
+    /// AC-OPF call (e.g. include period index).
+    pub pre_polish_dump_path: Option<std::path::PathBuf>,
 }
 
 impl AcOpfRuntime {
@@ -108,9 +225,193 @@ impl AcOpfRuntime {
         self.use_dc_opf_warm_start = Some(enabled);
         self
     }
+
+    /// Attach additive target-tracking penalties to the AC-OPF objective.
+    #[doc(hidden)]
+    pub fn with_objective_target_tracking(mut self, tracking: AcObjectiveTargetTracking) -> Self {
+        self.objective_target_tracking = if tracking.is_empty() {
+            None
+        } else {
+            Some(tracking)
+        };
+        self
+    }
+
+    /// Tee the pre-polish OpfSolution to the given path as pretty JSON
+    /// (builder pattern). See [`AcOpfRuntime::pre_polish_dump_path`].
+    pub fn with_pre_polish_dump_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.pre_polish_dump_path = Some(path.into());
+        self
+    }
 }
 
-#[derive(Clone, Default)]
+/// Per-direction quadratic penalty pair for tracking a single resource.
+///
+/// The AC OPF objective applies
+/// `upward_per_mw2 * max(0, Pg - target)² + downward_per_mw2 * max(0, target - Pg)²`
+/// so callers can encode asymmetric costs — e.g. free renewables get a
+/// large `downward_per_mw2` (penalise curtailment) and a small or zero
+/// `upward_per_mw2` (let AC physics use the full capacity if it can),
+/// while thermals get symmetric coefficients.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AcTargetTrackingCoefficients {
+    /// Penalty when `Pg - target > 0` (the resource is running harder
+    /// than the DC target), `$/MW²-hr`.
+    pub upward_per_mw2: f64,
+    /// Penalty when `Pg - target < 0` (the resource is backed off
+    /// relative to the DC target), `$/MW²-hr`.
+    pub downward_per_mw2: f64,
+}
+
+impl AcTargetTrackingCoefficients {
+    pub const ZERO: Self = Self {
+        upward_per_mw2: 0.0,
+        downward_per_mw2: 0.0,
+    };
+
+    /// Build a symmetric pair where both directions share the same
+    /// coefficient. The default case that matches the legacy
+    /// `generator_p_penalty_per_mw2` scalar.
+    pub fn symmetric(penalty_per_mw2: f64) -> Self {
+        let clamped = penalty_per_mw2.max(0.0);
+        Self {
+            upward_per_mw2: clamped,
+            downward_per_mw2: clamped,
+        }
+    }
+
+    /// True when neither direction is actively penalised — the resource
+    /// is effectively free to move.
+    pub fn is_zero(&self) -> bool {
+        self.upward_per_mw2 <= 0.0 && self.downward_per_mw2 <= 0.0
+    }
+
+    /// Maximum coefficient across both directions. Used to decide
+    /// whether the NLP objective needs to carry the one-sided quadratic
+    /// contribution for this resource at all.
+    pub fn max(&self) -> f64 {
+        self.upward_per_mw2.max(self.downward_per_mw2)
+    }
+}
+
+impl Default for AcTargetTrackingCoefficients {
+    fn default() -> Self {
+        Self::ZERO
+    }
+}
+
+/// Additive quadratic penalties for tracking target active-power schedules.
+///
+/// The objective is constructed by iterating resources (generators and
+/// dispatchable loads) with a target set. For each one, the coefficient
+/// lookup order is:
+///
+///   1. If an entry exists in `generator_p_penalty_overrides_by_idx`
+///      (resp. `dispatchable_load_p_penalty_overrides_by_idx`), use it.
+///   2. Otherwise use `generator_p_coefficients_default` (resp.
+///      `dispatchable_load_p_coefficients_default`).
+///
+/// Backward compatibility: when a caller sets only the legacy scalar
+/// `generator_p_penalty_per_mw2`, the builder in
+/// [`Self::with_generator_scalar_penalty`] fills
+/// `generator_p_coefficients_default` with a symmetric pair. That means
+/// the previous single-scalar API remains a no-op for this change.
+#[derive(Debug, Clone, Default)]
+pub struct AcObjectiveTargetTracking {
+    /// **Legacy field** — symmetric penalty coefficient for generator
+    /// real-power deviation. When nonzero, the builder threads it into
+    /// `generator_p_coefficients_default` as a symmetric pair. New
+    /// callers should prefer the per-direction fields instead.
+    pub generator_p_penalty_per_mw2: f64,
+    /// Default per-direction penalty coefficients for generators that
+    /// do not have a per-index override. Set via
+    /// [`Self::with_generator_default_coefficients`] (or populated from
+    /// the legacy scalar). Applies to every generator in
+    /// `generator_p_targets_mw` that is not overridden.
+    pub generator_p_coefficients_default: AcTargetTrackingCoefficients,
+    /// Per-generator penalty coefficient overrides keyed by global
+    /// `network.generators` index. When an entry exists, it replaces
+    /// the default for that generator.
+    pub generator_p_coefficients_overrides: HashMap<usize, AcTargetTrackingCoefficients>,
+    /// Generator active-power targets keyed by global `network.generators` index.
+    pub generator_p_targets_mw: HashMap<usize, f64>,
+    /// **Legacy field** — symmetric penalty coefficient for
+    /// dispatchable-load served-power deviation.
+    pub dispatchable_load_p_penalty_per_mw2: f64,
+    /// Default per-direction penalty coefficients for dispatchable
+    /// loads that do not have a per-index override.
+    pub dispatchable_load_p_coefficients_default: AcTargetTrackingCoefficients,
+    /// Per-load penalty coefficient overrides keyed by global
+    /// dispatchable-load index.
+    pub dispatchable_load_p_coefficients_overrides: HashMap<usize, AcTargetTrackingCoefficients>,
+    /// Dispatchable-load served-power targets keyed by global load index.
+    pub dispatchable_load_p_targets_mw: HashMap<usize, f64>,
+}
+
+impl AcObjectiveTargetTracking {
+    pub fn is_empty(&self) -> bool {
+        let has_generator_penalty = self.generator_p_penalty_per_mw2 > 0.0
+            || !self.generator_p_coefficients_default.is_zero()
+            || self
+                .generator_p_coefficients_overrides
+                .values()
+                .any(|pair| !pair.is_zero());
+        let has_load_penalty = self.dispatchable_load_p_penalty_per_mw2 > 0.0
+            || !self.dispatchable_load_p_coefficients_default.is_zero()
+            || self
+                .dispatchable_load_p_coefficients_overrides
+                .values()
+                .any(|pair| !pair.is_zero());
+        (!has_generator_penalty || self.generator_p_targets_mw.is_empty())
+            && (!has_load_penalty || self.dispatchable_load_p_targets_mw.is_empty())
+    }
+
+    /// Look up the effective coefficient pair for a generator, falling
+    /// back to the default (and to the legacy scalar when the default
+    /// is zero).
+    pub fn generator_coefficients_for(
+        &self,
+        global_gen_index: usize,
+    ) -> AcTargetTrackingCoefficients {
+        if let Some(pair) = self
+            .generator_p_coefficients_overrides
+            .get(&global_gen_index)
+        {
+            return *pair;
+        }
+        if !self.generator_p_coefficients_default.is_zero() {
+            return self.generator_p_coefficients_default;
+        }
+        if self.generator_p_penalty_per_mw2 > 0.0 {
+            return AcTargetTrackingCoefficients::symmetric(self.generator_p_penalty_per_mw2);
+        }
+        AcTargetTrackingCoefficients::ZERO
+    }
+
+    /// Look up the effective coefficient pair for a dispatchable load.
+    pub fn dispatchable_load_coefficients_for(
+        &self,
+        global_load_index: usize,
+    ) -> AcTargetTrackingCoefficients {
+        if let Some(pair) = self
+            .dispatchable_load_p_coefficients_overrides
+            .get(&global_load_index)
+        {
+            return *pair;
+        }
+        if !self.dispatchable_load_p_coefficients_default.is_zero() {
+            return self.dispatchable_load_p_coefficients_default;
+        }
+        if self.dispatchable_load_p_penalty_per_mw2 > 0.0 {
+            return AcTargetTrackingCoefficients::symmetric(
+                self.dispatchable_load_p_penalty_per_mw2,
+            );
+        }
+        AcTargetTrackingCoefficients::ZERO
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub(crate) struct AcOpfRunContext {
     pub(crate) runtime: AcOpfRuntime,
     pub(crate) benders_cuts: Vec<BendersCut>,
@@ -152,6 +453,57 @@ pub struct AcOpfOptions {
     pub print_level: i32,
     /// Whether to enforce branch thermal limits.
     pub enforce_thermal_limits: bool,
+    /// Penalty for explicit branch thermal-limit slack variables ($/MVA-h).
+    ///
+    /// When positive, each enforced branch-end thermal constraint gets a
+    /// nonnegative overflow variable `sigma >= 0` and the apparent-power limit
+    /// becomes `|S| <= rate_a + sigma`. The objective adds
+    /// `thermal_limit_slack_penalty_per_mva * sigma_mva`, allowing AC-OPF to
+    /// return the minimum-overflow solution instead of hard-failing.
+    ///
+    /// Default: `0.0` (disabled; historical hard-limit behavior).
+    pub thermal_limit_slack_penalty_per_mva: f64,
+    /// Penalty for per-bus active-power balance slack variables ($/MW-h).
+    ///
+    /// When positive, each bus balance equality gains nonnegative surplus and
+    /// deficit slack variables so the AC-OPF can return a minimum-mismatch
+    /// solution instead of hard-failing on exact nodal active balance.
+    ///
+    /// Default: `0.0` (disabled; historical exact-balance behavior).
+    pub bus_active_power_balance_slack_penalty_per_mw: f64,
+    /// Penalty for per-bus reactive-power balance slack variables ($/MVAr-h).
+    ///
+    /// When positive, each bus reactive balance equality gains nonnegative
+    /// surplus and deficit slack variables so the AC-OPF can return a
+    /// minimum-mismatch solution instead of hard-failing on exact nodal
+    /// reactive balance.
+    ///
+    /// Default: `0.0` (disabled; historical exact-balance behavior).
+    pub bus_reactive_power_balance_slack_penalty_per_mvar: f64,
+    /// Penalty for per-bus voltage-magnitude slack variables ($/pu-h).
+    ///
+    /// When positive, each bus voltage magnitude variable gains nonnegative
+    /// slack variables `σ_high` and `σ_low` so the AC-OPF can exceed the
+    /// original `[vm_min, vm_max]` box bounds at a cost. The Vm bounds are
+    /// widened and two inequality constraints per bus enforce
+    /// `vm - σ_high ≤ vm_max` and `vm_min - vm ≤ σ_low`. The objective adds
+    /// `voltage_magnitude_slack_penalty_per_pu * base_mva * (σ_high + σ_low)`.
+    ///
+    /// Default: `0.0` (disabled; historical hard-bound behavior).
+    pub voltage_magnitude_slack_penalty_per_pu: f64,
+    /// Penalty for per-branch angle-difference slack variables ($/rad-h).
+    ///
+    /// When positive AND `enforce_angle_limits` is true, each angle-constrained
+    /// branch gains nonnegative slack variables so the NLP can return a
+    /// minimum-violation solution instead of hard-failing. The angle constraint
+    /// residual becomes `g = Va_from - Va_to - sigma_high + sigma_low` with the
+    /// original `[angmin, angmax]` bounds, so positive `sigma_high` absorbs
+    /// upper-limit violations and positive `sigma_low` absorbs lower-limit
+    /// violations. The objective adds
+    /// `angle_difference_slack_penalty_per_rad * base_mva * (sigma_high + sigma_low)`.
+    ///
+    /// Default: `0.0` (disabled; historical hard-limit behavior).
+    pub angle_difference_slack_penalty_per_rad: f64,
     /// Minimum rate_a (MVA) to consider a branch as having a thermal limit.
     pub min_rate_a: f64,
     /// Whether to enforce branch angle-difference limits (angmin/angmax).
@@ -229,18 +581,19 @@ pub struct AcOpfOptions {
     /// - `Some(true)` = force HVDC inclusion.
     /// - `Some(false)` = disable HVDC (ignore any DC line data).
     pub include_hvdc: Option<bool>,
-    /// Per-generator SoC override (MWh) for storage generators co-optimized as NLP variables.
+    /// Per-generator SoC override (MWh) for storage generators co-optimized as native AC variables.
     ///
-    /// Storage generators in the network with `StorageDispatchMode::CostMinimization` are
-    /// automatically co-optimized as native NLP variables:
+    /// Storage generators in the network with dispatch modes other than
+    /// `StorageDispatchMode::SelfSchedule` are automatically co-optimized as
+    /// native AC variables:
     ///   - `dis[s] ∈ [0, discharge_mw_max/base]`  (discharge power, pu)
     ///   - `ch[s]  ∈ [0, charge_mw_max/base]`     (charge power, pu)
     ///
     /// This map overrides the per-generator `soc_initial_mwh` field for SoC-derived bounds,
     /// keyed by global generator index. Generators not in the map use `soc_initial_mwh`.
     ///
-    /// `SelfSchedule` and `OfferCurve` units must be dispatched by the caller
-    /// before passing the network to AC-OPF.
+    /// `SelfSchedule` units must be dispatched by the caller before passing the
+    /// network to AC-OPF.
     ///
     /// Default: `None` (use `soc_initial_mwh` from each generator's `StorageParams`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -291,6 +644,26 @@ pub struct AcOpfOptions {
     /// whether `pq_curve` data is present — useful for screening studies where
     /// exact reactive capability doesn't matter.
     pub enforce_capability_curves: bool,
+    /// Treat per-bus voltage setpoints from regulating generators as hard
+    /// equality constraints (`Vm = Vset`) on the AC-OPF.
+    ///
+    /// When `true` (default), each bus that has at least one in-service
+    /// voltage-regulating generator gets `lb_vm = ub_vm = Vset`, mirroring the
+    /// classical PSS/E "PV bus" assumption used by Newton-Raphson power flow.
+    /// This is appropriate for studies where the operator setpoints are part
+    /// of the schedule and must be honored exactly.
+    ///
+    /// When `false`, regulated buses keep their normal `[Vmin, Vmax]` bounds
+    /// and the setpoint becomes a *soft* target only — i.e. the AC-OPF is
+    /// free to move `Vm` anywhere inside the bus voltage limits. Use this for
+    /// market-style formulations where the optimizer should choose
+    /// the operating voltage subject to bounds and generator reactive
+    /// capability rather than honouring an exogenous setpoint, and
+    /// the warm-start `Vm` from a prior solve should be respected
+    /// instead of being overwritten by the regulator target.
+    ///
+    /// Default: `true` (preserve historical behavior).
+    pub enforce_regulated_bus_vm_targets: bool,
     /// Discrete control rounding mode for transformer taps, phase shifters, and
     /// switched shunts.
     ///
@@ -301,15 +674,30 @@ pub struct AcOpfOptions {
     ///   verify feasibility. Reports violations if rounding causes constraint
     ///   violations.
     pub discrete_mode: DiscreteMode,
+    /// When `true` and `discrete_mode == RoundAndCheck`, run a final
+    /// AC-OPF "polish" pass with all discrete devices (taps, phase
+    /// shifters, switched shunts) PINNED at their rounded values. This
+    /// lets generator Q dispatch and bus voltages re-balance against the
+    /// quantized topology, eliminating the post-rounding residual that
+    /// the validator otherwise scores as bus Q-balance violations. The
+    /// polish reuses the first solve's primal as a warm start, so the
+    /// extra cost is typically a few Ipopt iterations per period. No
+    /// effect when there are no discrete devices to round.
+    pub discrete_polish: bool,
 }
 
 impl Default for AcOpfOptions {
     fn default() -> Self {
         Self {
-            tolerance: 1e-6,
+            tolerance: 1e-8,
             max_iterations: 0, // 0 = auto: max(500, n_buses / 20)
             print_level: 0,
             enforce_thermal_limits: true,
+            thermal_limit_slack_penalty_per_mva: 0.0,
+            bus_active_power_balance_slack_penalty_per_mw: 0.0,
+            bus_reactive_power_balance_slack_penalty_per_mvar: 0.0,
+            voltage_magnitude_slack_penalty_per_pu: 0.0,
+            angle_difference_slack_penalty_per_rad: 0.0,
             min_rate_a: 1.0,
             enforce_angle_limits: false,
             exact_hessian: true,
@@ -326,7 +714,9 @@ impl Default for AcOpfOptions {
             constraint_screening_min_buses: 1000,
             screening_fallback_enabled: false,
             enforce_capability_curves: true,
+            enforce_regulated_bus_vm_targets: true,
             discrete_mode: DiscreteMode::Continuous,
+            discrete_polish: true,
         }
     }
 }
@@ -421,6 +811,13 @@ pub(crate) struct BranchAdmittance {
     pub(crate) s_max_sq: f64,
 }
 
+impl BranchAdmittance {
+    #[inline]
+    pub(crate) fn s_max_pu(&self) -> f64 {
+        self.s_max_sq.sqrt()
+    }
+}
+
 /// Compute admittance parameters for a single branch.
 ///
 /// `s_max_sq` is set to `(rating_a_mva / base_mva)^2`. Callers that don't
@@ -493,3 +890,59 @@ pub(super) fn branch_flow_to(ba: &BranchAdmittance, vm: &[f64], va: &[f64]) -> (
 // ---------------------------------------------------------------------------
 // Hessian direct-index lookup (eliminates HashMap in hot eval_hessian paths)
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use surge_network::market::DispatchableLoad;
+    use surge_network::network::bus::{Bus, BusType};
+    use surge_network::network::generator::Generator;
+    use surge_network::network::load::Load;
+    use surge_solution::{PfModel, SolveStatus};
+
+    #[test]
+    fn warm_start_from_pf_with_network_seeds_pg_and_qg() {
+        let mut net = Network::new("warm-start");
+        net.buses.push(Bus::new(1, BusType::Slack, 138.0));
+        net.buses.push(Bus::new(2, BusType::PQ, 138.0));
+        let mut gen_a = Generator::with_id("g1", 1, 50.0, 1.0);
+        gen_a.qmin = -10.0;
+        gen_a.qmax = 20.0;
+        let mut gen_b = Generator::with_id("g2", 1, 25.0, 1.0);
+        gen_b.qmin = -5.0;
+        gen_b.qmax = 5.0;
+        net.generators.push(gen_a);
+        net.generators.push(gen_b);
+        net.loads.push(Load::new(2, 60.0, 15.0));
+        net.market_data
+            .dispatchable_loads
+            .push(DispatchableLoad::curtailable(
+                2,
+                30.0,
+                7.5,
+                10.0,
+                100.0,
+                net.base_mva,
+            ));
+
+        let pf_sol = PfSolution {
+            pf_model: PfModel::Ac,
+            status: SolveStatus::Converged,
+            voltage_magnitude_pu: vec![1.0, 1.0],
+            voltage_angle_rad: vec![0.02, -0.01],
+            active_power_injection_pu: vec![0.0, 0.0],
+            reactive_power_injection_pu: vec![0.40, -0.15],
+            bus_numbers: vec![1, 2],
+            gen_slack_contribution_mw: vec![5.0, -5.0],
+            ..Default::default()
+        };
+
+        let warm_start = WarmStart::from_pf_with_network(&net, &pf_sol);
+        assert_eq!(warm_start.voltage_magnitude_pu, vec![1.0, 1.0]);
+        assert_eq!(warm_start.voltage_angle_rad, vec![0.02, -0.01]);
+        assert_eq!(warm_start.pg, vec![0.55, 0.20]);
+        assert_eq!(warm_start.qg, vec![0.30, 0.10]);
+        assert_eq!(warm_start.dispatchable_load_p, vec![0.30]);
+        assert_eq!(warm_start.dispatchable_load_q, vec![0.075]);
+    }
+}

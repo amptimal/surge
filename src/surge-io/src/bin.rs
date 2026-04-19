@@ -39,11 +39,11 @@ use surge_network::network::protection::ProtectionData;
 use surge_network::network::scheduled_area_transfer::ScheduledAreaTransfer;
 use surge_network::network::{
     AreaSchedule, Branch, BranchConditionalRatings, BranchOpfControl, BranchType, Bus, BusType,
-    FactsDevice, FixedShunt, Flowgate, FuelSupply, GenType, Generator, HarmonicData, HvdcModel,
-    Interface, LineData, Load, LoadClass, LoadConnection, Network, NodeBreakerTopology, OltcSpec,
-    Owner, OwnershipEntry, ParSpec, PhaseMode, PowerInjection, Region, SeriesCompData,
-    StorageParams, SwitchedShunt, SwitchedShuntOpf, TapMode, TransformerConnection,
-    TransformerData, WindingConnection, ZeroSeqData,
+    FactsDevice, FixedShunt, Flowgate, FuelSupply, GenType, Generator, GeneratorTechnology,
+    HarmonicData, HvdcModel, Interface, LineData, Load, LoadClass, LoadConnection, Network,
+    NodeBreakerTopology, OltcSpec, Owner, OwnershipEntry, ParSpec, PhaseMode, PowerInjection,
+    Region, SeriesCompData, StorageParams, SwitchedShunt, SwitchedShuntOpf, TapMode,
+    TransformerConnection, TransformerData, WindingConnection, ZeroSeqData,
 };
 use thiserror::Error;
 
@@ -51,7 +51,7 @@ pub const SURGE_BIN_FORMAT: &str = "surge-bin";
 pub const SURGE_BIN_SCHEMA_VERSION: &str = "0.1.0";
 
 const MAGIC: &[u8; 8] = b"SRGBIN02";
-const BINARY_REVISION: u16 = 1;
+const BINARY_REVISION: u16 = 2;
 const HEADER_LEN: usize = 8 + 2 + 2 + 4 + 8 + 4;
 const SECTION_HEADER_LEN: usize = 2 + 2 + 4 + 8;
 
@@ -437,6 +437,8 @@ struct IndexedGeneratorExtra {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GeneratorExtra {
+    technology: Option<GeneratorTechnology>,
+    source_technology_code: Option<String>,
     xs: Option<f64>,
     x2_pu: Option<f64>,
     r2_pu: Option<f64>,
@@ -491,6 +493,8 @@ impl GeneratorExtra {
         let mk = generator.market.as_ref();
         let rc = generator.reactive_capability.as_ref();
         let extra = Self {
+            technology: generator.technology,
+            source_technology_code: generator.source_technology_code.clone(),
             xs: fd.and_then(|f| f.xs),
             x2_pu: fd.and_then(|f| f.x2_pu),
             r2_pu: fd.and_then(|f| f.r2_pu),
@@ -545,6 +549,8 @@ impl GeneratorExtra {
 
     fn is_empty(&self) -> bool {
         self.xs.is_none()
+            && self.technology.is_none()
+            && self.source_technology_code.is_none()
             && self.x2_pu.is_none()
             && self.r2_pu.is_none()
             && self.x0_pu.is_none()
@@ -589,6 +595,8 @@ impl GeneratorExtra {
     }
 
     fn apply(self, generator: &mut Generator) {
+        generator.technology = self.technology;
+        generator.source_technology_code = self.source_technology_code;
         // Fault data
         if self.xs.is_some()
             || self.x2_pu.is_some()
@@ -2286,18 +2294,20 @@ fn decode_branch_type(value: u8) -> Result<BranchType, Error> {
 fn encode_gen_type(value: GenType) -> u8 {
     match value {
         GenType::Synchronous => 0,
-        GenType::Wind => 1,
-        GenType::Solar => 2,
-        GenType::InverterOther => 3,
+        GenType::Asynchronous => 1,
+        GenType::InverterBased => 2,
+        GenType::Hybrid => 3,
+        GenType::Unknown => 4,
     }
 }
 
 fn decode_gen_type(value: u8) -> Result<GenType, Error> {
     match value {
         0 => Ok(GenType::Synchronous),
-        1 => Ok(GenType::Wind),
-        2 => Ok(GenType::Solar),
-        3 => Ok(GenType::InverterOther),
+        1 => Ok(GenType::Asynchronous),
+        2 => Ok(GenType::InverterBased),
+        3 => Ok(GenType::Hybrid),
+        4 => Ok(GenType::Unknown),
         _ => Err(Error::InvalidDocument(format!(
             "invalid generator type code {value}"
         ))),
@@ -2376,7 +2386,9 @@ fn decode_load_class(value: u8) -> Result<LoadClass, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use surge_network::network::{Branch, Bus, Generator, OwnershipEntry};
+    use surge_network::network::{
+        Branch, Bus, GenType, Generator, GeneratorTechnology, OwnershipEntry,
+    };
 
     fn mini_network() -> Network {
         let mut network = Network::new("test_bin");
@@ -2395,6 +2407,13 @@ mod tests {
             shutdown: 5.0,
             coeffs: vec![0.01, 1.5, 3.0],
         });
+        generator.gen_type = GenType::InverterBased;
+        generator.technology = Some(GeneratorTechnology::SolarPv);
+        generator.source_technology_code = Some("PV".to_string());
+        generator
+            .fuel
+            .get_or_insert_with(Default::default)
+            .fuel_type = Some("solar".to_string());
         generator.storage = Some(StorageParams::with_energy_capacity_mwh(50.0));
         generator.owners = vec![OwnershipEntry {
             owner: 11,

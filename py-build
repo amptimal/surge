@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_PYTHON="$ROOT_DIR/.venv/bin/python3"
+VENV_MATURIN="$ROOT_DIR/.venv/bin/maturin"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./py-build [develop|build|check] [extra maturin args...]
+
+Modes:
+  develop  Build/install surge into the repo venv with maturin develop --release
+  build    Build a wheel into src/surge-py/dist with maturin build --release
+  check    Run the develop build, then verify the repo launcher can import surge
+
+Examples:
+  ./py-build
+  ./py-build develop
+  ./py-build build
+  ./py-build check
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+MODE="${1:-develop}"
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+
+if [[ ! -x "$VENV_PYTHON" ]]; then
+  cat >&2 <<'EOF'
+Repo Python environment is missing.
+
+Bootstrap:
+  python3 -m venv .venv
+  source .venv/bin/activate
+  pip install maturin numpy
+  cd src/surge-py
+  maturin develop --release
+  cd ../..
+EOF
+  exit 1
+fi
+
+if [[ ! -x "$VENV_MATURIN" ]]; then
+  cat >&2 <<'EOF'
+Repo venv is present, but maturin is not installed in it.
+
+Install it with:
+  .venv/bin/python3 -m pip install maturin
+EOF
+  exit 1
+fi
+
+export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+
+if [[ -n "${COPT_HOME:-}" && -d "${COPT_HOME}/include/coptcpp_inc" && -d "${COPT_HOME}/lib" ]]; then
+  export SURGE_PY_REQUIRE_COPT_NLP_SHIM="${SURGE_PY_REQUIRE_COPT_NLP_SHIM:-1}"
+  case "$(uname -s)" in
+    Darwin)
+      export DYLD_LIBRARY_PATH="${COPT_HOME}/lib${DYLD_LIBRARY_PATH:+:${DYLD_LIBRARY_PATH}}"
+      ;;
+    Linux)
+      export LD_LIBRARY_PATH="${COPT_HOME}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+      ;;
+  esac
+fi
+
+cd "$ROOT_DIR/src/surge-py"
+
+case "$MODE" in
+  develop|dev)
+    exec "$VENV_MATURIN" develop --release "$@"
+    ;;
+  build|wheel)
+    exec "$VENV_MATURIN" build --release --out dist "$@"
+    ;;
+  check)
+    "$VENV_MATURIN" develop --release "$@"
+    cd "$ROOT_DIR"
+    exec "$ROOT_DIR/py" - <<'PY'
+import surge
+print(surge.version())
+PY
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

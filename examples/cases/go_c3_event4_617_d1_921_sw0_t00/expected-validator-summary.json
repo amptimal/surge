@@ -1,0 +1,40 @@
+{
+  "error_diagnostics": "",
+  "feas": 0,
+  "infeas": 1,
+  "infeas_diagnostics": {
+    "viol_cs_t_p_off_max": {
+      "idx": {
+        "0": "sd_285",
+        "1": 0
+      },
+      "val": 1.5659823429756616
+    },
+    "viol_sd_t_p_ramp_dn_max": {
+      "idx": {
+        "0": "sd_354",
+        "1": 0
+      },
+      "val": 0.055012433527991844
+    },
+    "viol_sd_t_p_rrd_off_max": {
+      "idx": {
+        "0": "sd_285",
+        "1": 0
+      },
+      "val": 1.5659823429756616
+    }
+  },
+  "obj": 192978.17398820946,
+  "pass": 1,
+  "phys_feas": 0,
+  "problem_pass": 1,
+  "problem_surplus_total": 1443647.4566896267,
+  "z": 192978.17398820946,
+  "z_base": 193570.42338582381,
+  "z_cost": 97967.92071823691,
+  "z_k_average_case": -232.5633122706211,
+  "z_k_worst_case": -359.6860853437261,
+  "z_penalty": 1190663.5434244545,
+  "z_value": 1482201.8875285154
+}

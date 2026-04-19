@@ -61,3 +61,37 @@ The following cases are sourced from the Texas A&M repository, which states
 that its test cases are free for commercial or non-commercial use: case9,
 case14, case30, case57, case118, case300. These cases share common lineage
 with the corresponding MATPOWER case files.
+
+--------------------------------------------------------------------------------
+Formulation References
+
+The market and dispatch formulations implemented in src/surge-dispatch and
+src/surge-market — including SCUC with reactive reserves, branch switching,
+soft energy-window slacks, startup/shutdown trajectory power in bus balance,
+linearized N-1 security cuts, and the AC reconcile with reactive-reserve
+coupling — follow the problem formulation published for the ARPA-E Grid
+Optimization (GO) Competition Challenge 3:
+
+Holzer, J. T., Coffrin, C. J., DeMarco, C., Duthu, R., Elbert, S. T.,
+Eldridge, B. C., Elgindy, T., Garcia, M., Greene, S. L., Guo, N., Hale, E.,
+Lesieutre, B., Mak, T. W., McMillan, C., Mittelmann, H., Oh, H.,
+O'Neill, R. P., Overbye, T. J., Palmintier, B., Parker, R., Safdarian, F.,
+Tbaileh, A., Van Hentenryck, P., Veeramany, A., Wangen, S., and Wert, J. L.
+"Grid Optimization Competition Challenge 3 Problem Formulation."
+Pacific Northwest National Laboratory, Report PNNL-35792, April 2024.
+DOI: https://doi.org/10.2172/2337844
+
+The companion analysis paper is:
+
+Holzer, J. T., Elbert, S., Mittelmann, H., O'Neill, R., and Oh, H.
+"GO Competition Challenge 3: Problem, Solvers, and Solution Analysis."
+arXiv:2411.12033 [math.NA], November 2024.
+https://arxiv.org/abs/2411.12033
+
+The GO Competition Challenge 3 problem formulation and associated documents
+are U.S. Government works prepared by Pacific Northwest National Laboratory
+under contract with the U.S. Department of Energy. Competition datasets and
+reference winner submissions used internally for validation (under
+`target/benchmarks/` and the `benchmarks/go_c3/` dev-only tooling) are
+governed by the competition's own data-use terms; no Challenge 3 competitor
+source code is included in Surge.

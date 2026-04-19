@@ -19,9 +19,10 @@
 //! GPU-accelerated LP via `Method=6` (PDHG) + `PDHGGPU=1`.  Requires a
 //! CUDA-capable GPU and the GPU-enabled Gurobi 13 build.
 //!
-//! Quiet startup logging: set `SURGE_GUROBI_QUIET=1` to suppress Gurobi's
-//! environment startup banner and console logging unless a later solve
-//! explicitly raises `print_level`.
+//! Quiet startup logging: Gurobi's environment startup banner is suppressed
+//! by default. Set `SURGE_GUROBI_QUIET=0` (or `false`/`no`/`off`) to restore
+//! the banner. Per-solve console logging is independent and still follows
+//! `LpOptions::print_level`.
 
 pub use self::impl_::GurobiLpSolver;
 pub use self::impl_::GurobiNlpSolver;
@@ -29,8 +30,12 @@ pub use self::impl_::GurobiQcqpSolver;
 
 #[allow(unsafe_op_in_unsafe_fn)]
 mod impl_ {
-    use std::ffi::{CString, c_char, c_double, c_int};
+    use std::ffi::{CStr, CString, c_char, c_double, c_int, c_void};
+    use std::fs::{self, File};
+    use std::io::{BufWriter, Write};
+    use std::path::{Path, PathBuf};
     use std::ptr;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::ac::types::{BranchAdmittance, build_branch_admittances, compute_branch_admittance};
     use crate::backends::{
@@ -71,7 +76,9 @@ mod impl_ {
         // ── Optimization status codes (gurobi_c.h) ────────────────────────────
         pub const GRB_OPTIMAL: c_int = 2;
         pub const GRB_INFEASIBLE: c_int = 3;
+        pub const GRB_INF_OR_UNBD: c_int = 4;
         pub const GRB_UNBOUNDED: c_int = 5;
+        pub const GRB_TIME_LIMIT: c_int = 9;
         pub const GRB_SUBOPTIMAL: c_int = 13;
         pub const GRB_LOCALLY_OPTIMAL: c_int = 18;
 
@@ -95,12 +102,33 @@ mod impl_ {
         pub const ATTR_STATUS: &[u8] = b"Status\0";
         pub const ATTR_OBJVAL: &[u8] = b"ObjVal\0";
         pub const ATTR_X: &[u8] = b"X\0";
+        pub const ATTR_SOLCOUNT: &[u8] = b"SolCount\0";
         pub const ATTR_PI: &[u8] = b"Pi\0";
         pub const ATTR_RC: &[u8] = b"RC\0";
         pub const ATTR_ITERCOUNT: &[u8] = b"IterCount\0";
         pub const ATTR_BARITERCOUNT: &[u8] = b"BarIterCount\0";
         pub const ATTR_VTYPE: &[u8] = b"VType\0";
         pub const ATTR_MODELSENSE: &[u8] = b"ModelSense\0";
+        pub const ATTR_IIS_MINIMAL: &[u8] = b"IISMinimal\0";
+        pub const ATTR_IIS_LB: &[u8] = b"IISLB\0";
+        pub const ATTR_IIS_UB: &[u8] = b"IISUB\0";
+        pub const ATTR_IIS_CONSTR: &[u8] = b"IISConstr\0";
+        /// Wall-clock runtime of the most recent optimize call (seconds).
+        pub const ATTR_RUNTIME: &[u8] = b"Runtime\0";
+        /// Best dual bound from the most recent MIP optimize call.
+        pub const ATTR_OBJBOUND: &[u8] = b"ObjBound\0";
+        /// Model variable count (read on the original, pre-presolve model).
+        pub const ATTR_NUMVARS: &[u8] = b"NumVars\0";
+        /// Model binary variable count.
+        pub const ATTR_NUMBINVARS: &[u8] = b"NumBinVars\0";
+        /// Model integer (incl. binary) variable count.
+        pub const ATTR_NUMINTVARS: &[u8] = b"NumIntVars\0";
+        /// Model linear constraint count.
+        pub const ATTR_NUMCONSTRS: &[u8] = b"NumConstrs\0";
+        /// Model A-matrix nonzero count.
+        pub const ATTR_NUMNZS: &[u8] = b"NumNZs\0";
+        /// Number of branch-and-bound nodes explored in the most recent MIP solve.
+        pub const ATTR_NODECOUNT: &[u8] = b"NodeCount\0";
 
         // ── Parameter name strings (null-terminated byte literals) ────────────
         pub const PAR_OUTPUTFLAG: &[u8] = b"OutputFlag\0";
@@ -108,14 +136,31 @@ mod impl_ {
         pub const PAR_METHOD: &[u8] = b"Method\0";
         pub const PAR_FEASIBILITYTOL: &[u8] = b"FeasibilityTol\0";
         pub const PAR_OPTIMALITYTOL: &[u8] = b"OptimalityTol\0";
+        pub const PAR_MIPGAP: &[u8] = b"MIPGap\0";
         pub const PAR_TIMELIMIT: &[u8] = b"TimeLimit\0";
         pub const PAR_PDHGGPU: &[u8] = b"PDHGGPU\0";
         pub const PAR_NONCONVEX: &[u8] = b"NonConvex\0";
+        pub const PAR_DUALREDUCTIONS: &[u8] = b"DualReductions\0";
+        pub const PAR_INFUNBDINFO: &[u8] = b"InfUnbdInfo\0";
+        /// Thread count for solver work. 0 = Gurobi auto.
+        pub const PAR_THREADS: &[u8] = b"Threads\0";
+        /// Random seed for tie-breaking / pseudo-random choices.
+        pub const PAR_SEED: &[u8] = b"Seed\0";
         /// OptimalityTarget=1 → local NLP barrier (fast); default=0 → global B&B (slow).
         pub const PAR_OPTIMALITYTARGET: &[u8] = b"OptimalityTarget\0";
 
         // ── Attribute names for NLP ───────────────────────────────────────────
         pub const ATTR_START: &[u8] = b"Start\0";
+
+        // ── Callback `where` values (GRB_CB_*) ────────────────────────────────
+        pub const GRB_CB_MIP: c_int = 3;
+
+        // ── Callback `what` query codes (GRBcbget) ────────────────────────────
+        // Queried from where == GRB_CB_MIP:
+        pub const GRB_CB_MIP_OBJBST: c_int = 3000;
+        pub const GRB_CB_MIP_OBJBND: c_int = 3001;
+        // Queried from any callback location:
+        pub const GRB_CB_RUNTIME: c_int = 6001;
 
         // ── NL expression-tree opcode values (GRB_OPCODE_*) ──────────────────
         pub const OPCODE_CONSTANT: c_int = 0;
@@ -156,6 +201,7 @@ mod impl_ {
             c_int,
         ) -> c_int,
         GRBfreeenv: unsafe extern "C" fn(*mut ffi::GRBenv),
+        GRBgetenv: unsafe extern "C" fn(*mut ffi::GRBmodel) -> *mut ffi::GRBenv,
         GRBnewmodel: unsafe extern "C" fn(
             *mut ffi::GRBenv,
             *mut *mut ffi::GRBmodel,
@@ -239,6 +285,9 @@ mod impl_ {
             c_int,
             *const c_double,
         ) -> c_int,
+        GRBwrite: unsafe extern "C" fn(*mut ffi::GRBmodel, *const c_char) -> c_int,
+        GRBreset: unsafe extern "C" fn(*mut ffi::GRBmodel, c_int) -> c_int,
+        GRBcomputeIIS: unsafe extern "C" fn(*mut ffi::GRBmodel) -> c_int,
         GRBoptimize: unsafe extern "C" fn(*mut ffi::GRBmodel) -> c_int,
         GRBgetintattr: unsafe extern "C" fn(*mut ffi::GRBmodel, *const c_char, *mut c_int) -> c_int,
         GRBgetdblattr:
@@ -257,6 +306,7 @@ mod impl_ {
             c_int,
             *mut c_int,
         ) -> c_int,
+        GRBgetmerrormsg: unsafe extern "C" fn(*mut ffi::GRBmodel) -> *const c_char,
         GRBsetintparam: unsafe extern "C" fn(*mut ffi::GRBenv, *const c_char, c_int) -> c_int,
         GRBsetdblparam: unsafe extern "C" fn(*mut ffi::GRBenv, *const c_char, c_double) -> c_int,
         GRBisgpubuild: unsafe extern "C" fn() -> c_int,
@@ -270,7 +320,32 @@ mod impl_ {
             *const c_double,
             *const c_int,
         ) -> c_int,
+        // MIP progress callback surface. `GRBcbget` is queried from
+        // inside the callback; `GRBterminate` lets the callback request
+        // early termination; `GRBsetcallbackfunc` registers the callback
+        // on a model.
+        GRBsetcallbackfunc:
+            unsafe extern "C" fn(*mut ffi::GRBmodel, Option<GurobiCallback>, *mut c_void) -> c_int,
+        #[allow(dead_code)]
+        GRBcbget: unsafe extern "C" fn(*mut c_void, c_int, c_int, *mut c_void) -> c_int,
+        #[allow(dead_code)]
+        GRBterminate: unsafe extern "C" fn(*mut ffi::GRBmodel),
     }
+
+    /// Gurobi callback function pointer type.
+    ///
+    /// Signature matches `gurobiCB` in `gurobi_c.h`. On Linux and macOS
+    /// x86_64 the `__stdcall` attribute in the Gurobi header is a no-op;
+    /// both platforms use the System V AMD64 ABI, which is what
+    /// `extern "C"` selects. Windows x86_64 also uses a single default
+    /// calling convention so `__stdcall` is similarly ignored. Returns 0
+    /// for success, non-zero to signal an error that aborts optimization.
+    pub(super) type GurobiCallback = unsafe extern "C" fn(
+        model: *mut ffi::GRBmodel,
+        cbdata: *mut c_void,
+        where_: c_int,
+        usrdata: *mut c_void,
+    ) -> c_int;
 
     unsafe impl Send for GurobiLib {}
     unsafe impl Sync for GurobiLib {}
@@ -307,6 +382,18 @@ mod impl_ {
                 matches!(
                     value.trim().to_ascii_lowercase().as_str(),
                     "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    fn env_flag_disabled(name: &str) -> bool {
+        std::env::var(name)
+            .ok()
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "no" | "off"
                 )
             })
             .unwrap_or(false)
@@ -368,7 +455,7 @@ mod impl_ {
         use ffi::{PAR_LOGTOCONSOLE, PAR_OUTPUTFLAG, cstr};
 
         let mut env: *mut ffi::GRBenv = ptr::null_mut();
-        let quiet = env_flag_enabled("SURGE_GUROBI_QUIET");
+        let quiet = !env_flag_disabled("SURGE_GUROBI_QUIET");
         let rc = if quiet {
             silence_stdio(|| (lib.GRBloadenvinternal)(&mut env, ptr::null(), 13, 0, 1))
         } else {
@@ -413,6 +500,392 @@ mod impl_ {
 
         let _guard = EnvGuard(env, lib.GRBfreeenv);
         f(env)
+    }
+
+    fn gurobi_iis_export_requested() -> bool {
+        env_flag_enabled("SURGE_GUROBI_EXPORT_IIS")
+            || std::env::var_os("SURGE_GUROBI_IIS_PREFIX").is_some()
+    }
+
+    fn gurobi_iis_export_prefix() -> PathBuf {
+        if let Some(value) = std::env::var_os("SURGE_GUROBI_IIS_PREFIX") {
+            let trimmed = value.to_string_lossy().trim().to_string();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed);
+            }
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(format!("surge-gurobi-iis-{}-{now}", std::process::id()))
+    }
+
+    fn append_artifact_suffix(prefix: &Path, suffix: &str) -> PathBuf {
+        PathBuf::from(format!("{}{}", prefix.display(), suffix))
+    }
+
+    fn summary_field(value: &str) -> String {
+        value.replace(['\t', '\n', '\r'], " ")
+    }
+
+    fn raw_problem_name(names: Option<&[String]>, idx: usize, prefix: &str) -> String {
+        names
+            .and_then(|values| values.get(idx))
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .unwrap_or_else(|| format!("{prefix}_{idx}"))
+    }
+
+    fn sanitize_gurobi_name(raw: &str, prefix: &str, idx: usize) -> String {
+        let mut sanitized = String::with_capacity(raw.len() + 24);
+        sanitized.push_str(prefix);
+        sanitized.push('_');
+        sanitized.push_str(&idx.to_string());
+        sanitized.push('_');
+        for ch in raw.chars() {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.') {
+                sanitized.push(ch);
+            } else {
+                sanitized.push('_');
+            }
+        }
+        sanitized.truncate(255);
+        sanitized
+    }
+
+    fn build_gurobi_name_storage(
+        names: Option<&[String]>,
+        prefix: &str,
+        count: usize,
+    ) -> Vec<CString> {
+        (0..count)
+            .map(|idx| {
+                CString::new(sanitize_gurobi_name(
+                    &raw_problem_name(names, idx, prefix),
+                    prefix,
+                    idx,
+                ))
+                .expect("sanitized gurobi name contains no null bytes")
+            })
+            .collect()
+    }
+
+    fn cstring_ptrs(values: &[CString]) -> Vec<*const c_char> {
+        values.iter().map(|value| value.as_ptr()).collect()
+    }
+
+    unsafe fn gurobi_model_error_message(
+        lib: &GurobiLib,
+        model: *mut ffi::GRBmodel,
+    ) -> Option<String> {
+        let ptr = (lib.GRBgetmerrormsg)(model);
+        if ptr.is_null() {
+            None
+        } else {
+            Some(CStr::from_ptr(ptr).to_string_lossy().trim().to_string())
+                .filter(|message| !message.is_empty())
+        }
+    }
+
+    fn gurobi_call_error(call: &str, rc: c_int, detail: Option<&str>) -> String {
+        match detail {
+            Some(detail) if !detail.is_empty() => format!("{call} failed (rc={rc}): {detail}"),
+            _ => format!("{call} failed (rc={rc})"),
+        }
+    }
+
+    fn gurobi_status_from_code(stat: c_int, solution_count: Option<c_int>) -> LpSolveStatus {
+        use ffi::*;
+
+        match stat {
+            GRB_OPTIMAL | GRB_LOCALLY_OPTIMAL => LpSolveStatus::Optimal,
+            GRB_SUBOPTIMAL => LpSolveStatus::SubOptimal,
+            GRB_INFEASIBLE => LpSolveStatus::Infeasible,
+            GRB_UNBOUNDED => LpSolveStatus::Unbounded,
+            GRB_TIME_LIMIT if solution_count.unwrap_or(0) > 0 => LpSolveStatus::SubOptimal,
+            GRB_TIME_LIMIT => {
+                LpSolveStatus::SolverError("Gurobi status=9 (time limit, no incumbent)".to_string())
+            }
+            _ => LpSolveStatus::SolverError(format!("Gurobi status={stat}")),
+        }
+    }
+
+    unsafe fn resolve_gurobi_status(
+        lib: &GurobiLib,
+        env: *mut ffi::GRBenv,
+        model: *mut ffi::GRBmodel,
+    ) -> Result<(c_int, LpSolveStatus), String> {
+        use ffi::*;
+
+        let mut stat: c_int = 0;
+        let rc = (lib.GRBgetintattr)(model, cstr(ATTR_STATUS), &mut stat);
+        if rc != 0 {
+            return Err(gurobi_call_error(
+                "GRBgetintattr(Status)",
+                rc,
+                gurobi_model_error_message(lib, model).as_deref(),
+            ));
+        }
+        if stat == GRB_INF_OR_UNBD {
+            let model_env = (lib.GRBgetenv)(model);
+            let retry_env = if model_env.is_null() { env } else { model_env };
+            let rc = (lib.GRBsetintparam)(retry_env, cstr(PAR_DUALREDUCTIONS), 0);
+            if rc != 0 {
+                return Err(gurobi_call_error(
+                    "GRBsetintparam(DualReductions)",
+                    rc,
+                    gurobi_model_error_message(lib, model).as_deref(),
+                ));
+            }
+            let rc = (lib.GRBsetintparam)(retry_env, cstr(PAR_INFUNBDINFO), 1);
+            if rc != 0 {
+                return Err(gurobi_call_error(
+                    "GRBsetintparam(InfUnbdInfo)",
+                    rc,
+                    gurobi_model_error_message(lib, model).as_deref(),
+                ));
+            }
+            let rc = (lib.GRBreset)(model, 0);
+            if rc != 0 {
+                return Err(gurobi_call_error(
+                    "GRBreset",
+                    rc,
+                    gurobi_model_error_message(lib, model).as_deref(),
+                ));
+            }
+            let rc = (lib.GRBoptimize)(model);
+            if rc != 0 {
+                return Err(gurobi_call_error(
+                    "GRBoptimize",
+                    rc,
+                    gurobi_model_error_message(lib, model).as_deref(),
+                ));
+            }
+            let rc = (lib.GRBgetintattr)(model, cstr(ATTR_STATUS), &mut stat);
+            if rc != 0 {
+                return Err(gurobi_call_error(
+                    "GRBgetintattr(Status)",
+                    rc,
+                    gurobi_model_error_message(lib, model).as_deref(),
+                ));
+            }
+        }
+        let solution_count = if stat == GRB_TIME_LIMIT {
+            let mut count: c_int = 0;
+            let rc = (lib.GRBgetintattr)(model, cstr(ATTR_SOLCOUNT), &mut count);
+            if rc != 0 {
+                return Err(gurobi_call_error(
+                    "GRBgetintattr(SolCount)",
+                    rc,
+                    gurobi_model_error_message(lib, model).as_deref(),
+                ));
+            }
+            Some(count)
+        } else {
+            None
+        };
+        Ok((stat, gurobi_status_from_code(stat, solution_count)))
+    }
+
+    struct GurobiIisExport {
+        ilp_path: PathBuf,
+        summary_path: PathBuf,
+        n_rows: usize,
+        n_bounds: usize,
+        minimal: bool,
+    }
+
+    unsafe fn export_gurobi_iis(
+        lib: &GurobiLib,
+        model: *mut ffi::GRBmodel,
+        prob: &SparseProblem,
+        orig_to_grb: &[usize],
+    ) -> Result<GurobiIisExport, String> {
+        use ffi::*;
+
+        let rc = (lib.GRBcomputeIIS)(model);
+        if rc != 0 {
+            return Err(gurobi_call_error(
+                "GRBcomputeIIS",
+                rc,
+                gurobi_model_error_message(lib, model).as_deref(),
+            ));
+        }
+
+        let mut minimal = 0;
+        let rc = (lib.GRBgetintattr)(model, cstr(ATTR_IIS_MINIMAL), &mut minimal);
+        if rc != 0 {
+            return Err(gurobi_call_error(
+                "GRBgetintattr(IISMinimal)",
+                rc,
+                gurobi_model_error_message(lib, model).as_deref(),
+            ));
+        }
+
+        let mut iis_rows = vec![0; prob.n_row];
+        let rc = (lib.GRBgetintattrarray)(
+            model,
+            cstr(ATTR_IIS_CONSTR),
+            0,
+            prob.n_row as c_int,
+            iis_rows.as_mut_ptr(),
+        );
+        if rc != 0 {
+            return Err(gurobi_call_error(
+                "GRBgetintattrarray(IISConstr)",
+                rc,
+                gurobi_model_error_message(lib, model).as_deref(),
+            ));
+        }
+
+        let mut iis_lb = vec![0; prob.n_col];
+        let rc = (lib.GRBgetintattrarray)(
+            model,
+            cstr(ATTR_IIS_LB),
+            0,
+            prob.n_col as c_int,
+            iis_lb.as_mut_ptr(),
+        );
+        if rc != 0 {
+            return Err(gurobi_call_error(
+                "GRBgetintattrarray(IISLB)",
+                rc,
+                gurobi_model_error_message(lib, model).as_deref(),
+            ));
+        }
+
+        let mut iis_ub = vec![0; prob.n_col];
+        let rc = (lib.GRBgetintattrarray)(
+            model,
+            cstr(ATTR_IIS_UB),
+            0,
+            prob.n_col as c_int,
+            iis_ub.as_mut_ptr(),
+        );
+        if rc != 0 {
+            return Err(gurobi_call_error(
+                "GRBgetintattrarray(IISUB)",
+                rc,
+                gurobi_model_error_message(lib, model).as_deref(),
+            ));
+        }
+
+        let prefix = gurobi_iis_export_prefix();
+        if let Some(parent) = prefix.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|err| {
+                    format!(
+                        "failed to create IIS export directory {}: {err}",
+                        parent.display()
+                    )
+                })?;
+            }
+        }
+        let ilp_path = append_artifact_suffix(&prefix, ".ilp");
+        let summary_path = append_artifact_suffix(&prefix, ".summary.txt");
+
+        let ilp_path_c = CString::new(ilp_path.to_string_lossy().into_owned())
+            .expect("artifact path contains no null bytes");
+        let rc = (lib.GRBwrite)(model, ilp_path_c.as_ptr());
+        if rc != 0 {
+            return Err(gurobi_call_error(
+                "GRBwrite",
+                rc,
+                gurobi_model_error_message(lib, model).as_deref(),
+            ));
+        }
+
+        let gurobi_row_names =
+            build_gurobi_name_storage(prob.row_names.as_deref(), "r", prob.n_row);
+        let gurobi_col_names =
+            build_gurobi_name_storage(prob.col_names.as_deref(), "c", prob.n_col);
+        let mut summary = BufWriter::new(
+            File::create(&summary_path)
+                .map_err(|err| format!("failed to create {}: {err}", summary_path.display()))?,
+        );
+
+        let row_count = orig_to_grb
+            .iter()
+            .enumerate()
+            .filter(|(idx, grb_idx)| **grb_idx < iis_rows.len() && iis_rows[orig_to_grb[*idx]] != 0)
+            .count();
+        let bound_count = iis_lb.iter().filter(|&&flag| flag != 0).count()
+            + iis_ub.iter().filter(|&&flag| flag != 0).count();
+
+        writeln!(
+            summary,
+            "kind\tindex\tgurobi_index\tgurobi_name\tname\tbound\tlower\tupper"
+        )
+        .map_err(|err| format!("failed to write {}: {err}", summary_path.display()))?;
+        writeln!(
+            summary,
+            "# minimal={}\trows={}\tbounds={}",
+            minimal != 0,
+            row_count,
+            bound_count
+        )
+        .map_err(|err| format!("failed to write {}: {err}", summary_path.display()))?;
+
+        for row_idx in 0..prob.n_row {
+            let grb_idx = orig_to_grb[row_idx];
+            if grb_idx >= iis_rows.len() || iis_rows[grb_idx] == 0 {
+                continue;
+            }
+            writeln!(
+                summary,
+                "row\t{}\t{}\t{}\t{}\t-\t{}\t{}",
+                row_idx,
+                grb_idx,
+                gurobi_row_names[row_idx].to_string_lossy(),
+                summary_field(&raw_problem_name(prob.row_names.as_deref(), row_idx, "row")),
+                prob.row_lower[row_idx],
+                prob.row_upper[row_idx]
+            )
+            .map_err(|err| format!("failed to write {}: {err}", summary_path.display()))?;
+        }
+
+        for col_idx in 0..prob.n_col {
+            if iis_lb[col_idx] != 0 {
+                writeln!(
+                    summary,
+                    "col\t{}\t{}\t{}\t{}\tlb\t{}\t{}",
+                    col_idx,
+                    col_idx,
+                    gurobi_col_names[col_idx].to_string_lossy(),
+                    summary_field(&raw_problem_name(prob.col_names.as_deref(), col_idx, "col")),
+                    prob.col_lower[col_idx],
+                    prob.col_upper[col_idx]
+                )
+                .map_err(|err| format!("failed to write {}: {err}", summary_path.display()))?;
+            }
+            if iis_ub[col_idx] != 0 {
+                writeln!(
+                    summary,
+                    "col\t{}\t{}\t{}\t{}\tub\t{}\t{}",
+                    col_idx,
+                    col_idx,
+                    gurobi_col_names[col_idx].to_string_lossy(),
+                    summary_field(&raw_problem_name(prob.col_names.as_deref(), col_idx, "col")),
+                    prob.col_lower[col_idx],
+                    prob.col_upper[col_idx]
+                )
+                .map_err(|err| format!("failed to write {}: {err}", summary_path.display()))?;
+            }
+        }
+        summary
+            .flush()
+            .map_err(|err| format!("failed to finalize {}: {err}", summary_path.display()))?;
+
+        Ok(GurobiIisExport {
+            ilp_path,
+            summary_path,
+            n_rows: row_count,
+            n_bounds: bound_count,
+            minimal: minimal != 0,
+        })
     }
 
     fn gurobi_lib_paths() -> Vec<std::path::PathBuf> {
@@ -494,6 +967,10 @@ mod impl_ {
                 ) -> c_int
             ),
             GRBfreeenv: sym!(b"GRBfreeenv\0", unsafe extern "C" fn(*mut ffi::GRBenv)),
+            GRBgetenv: sym!(
+                b"GRBgetenv\0",
+                unsafe extern "C" fn(*mut ffi::GRBmodel) -> *mut ffi::GRBenv
+            ),
             GRBnewmodel: sym!(
                 b"GRBnewmodel\0",
                 unsafe extern "C" fn(
@@ -610,6 +1087,18 @@ mod impl_ {
                     *const c_double,
                 ) -> c_int
             ),
+            GRBwrite: sym!(
+                b"GRBwrite\0",
+                unsafe extern "C" fn(*mut ffi::GRBmodel, *const c_char) -> c_int
+            ),
+            GRBreset: sym!(
+                b"GRBreset\0",
+                unsafe extern "C" fn(*mut ffi::GRBmodel, c_int) -> c_int
+            ),
+            GRBcomputeIIS: sym!(
+                b"GRBcomputeIIS\0",
+                unsafe extern "C" fn(*mut ffi::GRBmodel) -> c_int
+            ),
             GRBoptimize: sym!(
                 b"GRBoptimize\0",
                 unsafe extern "C" fn(*mut ffi::GRBmodel) -> c_int
@@ -642,6 +1131,10 @@ mod impl_ {
                     *mut c_int,
                 ) -> c_int
             ),
+            GRBgetmerrormsg: sym!(
+                b"GRBgetmerrormsg\0",
+                unsafe extern "C" fn(*mut ffi::GRBmodel) -> *const c_char
+            ),
             GRBsetintparam: sym!(
                 b"GRBsetintparam\0",
                 unsafe extern "C" fn(*mut ffi::GRBenv, *const c_char, c_int) -> c_int
@@ -667,6 +1160,19 @@ mod impl_ {
                     *const c_int,
                 ) -> c_int
             ),
+            GRBsetcallbackfunc: sym!(
+                b"GRBsetcallbackfunc\0",
+                unsafe extern "C" fn(
+                    *mut ffi::GRBmodel,
+                    Option<GurobiCallback>,
+                    *mut c_void,
+                ) -> c_int
+            ),
+            GRBcbget: sym!(
+                b"GRBcbget\0",
+                unsafe extern "C" fn(*mut c_void, c_int, c_int, *mut c_void) -> c_int
+            ),
+            GRBterminate: sym!(b"GRBterminate\0", unsafe extern "C" fn(*mut ffi::GRBmodel)),
             _lib: lib,
         })
     }
@@ -766,6 +1272,93 @@ mod impl_ {
         (row_start, col_ind, csr_val)
     }
 
+    // ── MIP progress callback ─────────────────────────────────────────────────
+
+    /// Minimal set of Gurobi C function pointers needed inside the callback.
+    /// Plain function pointers (no lifetimes, `Copy`) so the callback can
+    /// invoke them without reaching back through an `Arc`.
+    #[allow(dead_code)]
+    #[derive(Copy, Clone)]
+    struct MipCallbackPtrs {
+        cbget: unsafe extern "C" fn(*mut c_void, c_int, c_int, *mut c_void) -> c_int,
+        terminate: unsafe extern "C" fn(*mut ffi::GRBmodel),
+    }
+
+    /// User-data payload passed to `gurobi_mip_progress_callback` through
+    /// `GRBsetcallbackfunc`. Owned on the Rust stack for the duration of
+    /// `GRBoptimize` and reclaimed when the solve returns.
+    #[allow(dead_code)]
+    struct MipCallbackContext {
+        ptrs: MipCallbackPtrs,
+        monitor: crate::backends::MipProgressMonitor,
+    }
+
+    /// Gurobi progress callback. Reads `runtime`/`objbst`/`objbnd` on every
+    /// `GRB_CB_MIP` tick, feeds them into the solver-agnostic
+    /// [`crate::backends::MipProgressMonitor`], and requests termination via
+    /// `GRBterminate` when the monitor signals that the scheduled gap has
+    /// been reached.
+    #[allow(dead_code)]
+    unsafe extern "C" fn gurobi_mip_progress_callback(
+        model: *mut ffi::GRBmodel,
+        cbdata: *mut c_void,
+        where_: c_int,
+        usrdata: *mut c_void,
+    ) -> c_int {
+        use ffi::*;
+
+        if where_ != GRB_CB_MIP || usrdata.is_null() {
+            return 0;
+        }
+        let ctx = unsafe { &mut *(usrdata as *mut MipCallbackContext) };
+        let ptrs = ctx.ptrs;
+
+        let mut runtime: c_double = 0.0;
+        let mut objbst: c_double = 0.0;
+        let mut objbnd: c_double = 0.0;
+        unsafe {
+            if (ptrs.cbget)(
+                cbdata,
+                where_,
+                GRB_CB_RUNTIME,
+                (&mut runtime as *mut c_double).cast(),
+            ) != 0
+            {
+                return 0;
+            }
+            if (ptrs.cbget)(
+                cbdata,
+                where_,
+                GRB_CB_MIP_OBJBST,
+                (&mut objbst as *mut c_double).cast(),
+            ) != 0
+            {
+                return 0;
+            }
+            if (ptrs.cbget)(
+                cbdata,
+                where_,
+                GRB_CB_MIP_OBJBND,
+                (&mut objbnd as *mut c_double).cast(),
+            ) != 0
+            {
+                return 0;
+            }
+        }
+        // GRB_CB_MIP reports OBJBST as +inf (for minimization) until the
+        // first incumbent is known. Don't record events until then.
+        if !objbst.is_finite() {
+            return 0;
+        }
+        let should_terminate = ctx.monitor.tick(runtime, objbst, objbnd);
+        if should_terminate {
+            unsafe {
+                (ptrs.terminate)(model);
+            }
+        }
+        0
+    }
+
     // ── Core solve ────────────────────────────────────────────────────────────
 
     unsafe fn solve_inner(
@@ -785,14 +1378,19 @@ mod impl_ {
             GRBfreemodel,
             GRBaddvars,
             GRBsetcharattrarray,
+            GRBsetdblattrarray,
             GRBaddqpterms,
             GRBaddconstrs,
             GRBaddrangeconstrs,
+            _GRBwrite,
+            _GRBreset,
+            _GRBcomputeIIS,
             GRBoptimize,
             GRBgetintattr,
             GRBgetdblattr,
             GRBgetdblattrarray,
             _GRBgetintattrarray,
+            _GRBgetmerrormsg,
             GRBisgpubuild,
             GRBisgpusupported,
         ) = (
@@ -802,20 +1400,28 @@ mod impl_ {
             lib.GRBfreemodel,
             lib.GRBaddvars,
             lib.GRBsetcharattrarray,
+            lib.GRBsetdblattrarray,
             lib.GRBaddqpterms,
             lib.GRBaddconstrs,
             lib.GRBaddrangeconstrs,
+            lib.GRBwrite,
+            lib.GRBreset,
+            lib.GRBcomputeIIS,
             lib.GRBoptimize,
             lib.GRBgetintattr,
             lib.GRBgetdblattr,
             lib.GRBgetdblattrarray,
             lib.GRBgetintattrarray,
+            lib.GRBgetmerrormsg,
             lib.GRBisgpubuild,
             lib.GRBisgpusupported,
         );
 
         // ── Configure environment parameters ─────────────────────────────────
-        let print = c_int::from(opts.print_level > 0);
+        // `SURGE_GUROBI_PRINT=1` forces Gurobi's console output on from
+        // the outside for diagnostics without editing caller code.
+        let env_print = std::env::var("SURGE_GUROBI_PRINT").as_deref() == Ok("1");
+        let print = c_int::from(opts.print_level > 0 || env_print);
         GRBsetintparam(env, cstr(PAR_OUTPUTFLAG), print);
         GRBsetintparam(env, cstr(PAR_LOGTOCONSOLE), print);
         let tol = opts.tolerance.clamp(1e-10, 1e-4);
@@ -824,12 +1430,80 @@ mod impl_ {
         if let Some(tl) = opts.time_limit_secs {
             GRBsetdblparam(env, cstr(PAR_TIMELIMIT), tl);
         }
+        // Always set Gurobi's MIPGap parameter explicitly. The caller's
+        // `mip_rel_gap` wins; when absent we default to a deliberately-
+        // loose 10 % so it is OBVIOUS in a diagnostic run that nobody
+        // configured a gap (objectives at 10 % off the bound stand out
+        // in any regression or SLA check). Gurobi's own unset default is
+        // 1e-4 which would silently drag a hard SCUC to timeout.
+        //
+        // The `mip_gap_schedule` path is intentionally ignored here —
+        // it introduced a subtle override where `sched.min_gap()` took
+        // precedence over `mip_rel_gap`, which combined with any tight
+        // first step (e.g. 1e-5) pushed Gurobi into a "keep going until
+        // provably optimal" regime. Schedule data still flows through
+        // the public API for callers that want to wire their own
+        // callback logic, but this backend no longer honours it.
+        const FALLBACK_MIP_GAP_WHEN_UNSET: f64 = 1e-1;
+        let safety_net_gap = opts.mip_rel_gap.unwrap_or(FALLBACK_MIP_GAP_WHEN_UNSET);
+        GRBsetdblparam(env, cstr(PAR_MIPGAP), safety_net_gap);
 
         // GPU: enable PDHG + PDHGGPU when GRB_USE_GPU=1 is set.
         let use_gpu = std::env::var("GRB_USE_GPU").as_deref() == Ok("1");
         if use_gpu && GRBisgpubuild() != 0 && GRBisgpusupported(env) != 0 {
             GRBsetintparam(env, cstr(PAR_METHOD), GRB_METHOD_PDHG);
             GRBsetintparam(env, cstr(PAR_PDHGGPU), 1);
+        }
+
+        // ── Default LP algorithm + thread count ──────────────────────────
+        //
+        // `Method = 3` is Gurobi's non-deterministic concurrent LP
+        // algorithm: it races primal simplex, dual simplex, and
+        // barrier on separate threads, takes the first to converge,
+        // and terminates the rest. The default auto-method (`-1`)
+        // tends to pick primal simplex for post-presolve SCUC LPs,
+        // which handles densified rows poorly; concurrent avoids that
+        // bad guess whenever there is at least one other thread to
+        // spare for a parallel branch.
+        //
+        // `Threads = 8` gives Method 3 room to actually race (one
+        // thread per algorithm plus headroom for the branch-and-bound
+        // tree). On a 1-thread box this would collapse to Method 3
+        // serialised, so callers that need single-threaded runs (e.g.
+        // reproducible A/B benchmarking) should override via
+        // `SURGE_GUROBI_THREADS=1` AND `SURGE_GUROBI_METHOD=1` (dual
+        // simplex, the fastest deterministic single-thread choice we
+        // measured on SCUC).
+        const DEFAULT_METHOD: c_int = 3;
+        const DEFAULT_THREADS: c_int = 8;
+        GRBsetintparam(env, cstr(PAR_METHOD), DEFAULT_METHOD);
+        GRBsetintparam(env, cstr(PAR_THREADS), DEFAULT_THREADS);
+
+        // Env-var overrides: honoured last so benchmarking / debugging
+        // can pin any parameter without touching policy structures.
+        // `SURGE_GUROBI_THREADS=1 SURGE_GUROBI_SEED=0 SURGE_GUROBI_METHOD=1`
+        // is the canonical deterministic configuration for MIP-
+        // tightening A/Bs.
+        if let Ok(v) = std::env::var("SURGE_GUROBI_THREADS") {
+            if let Ok(n) = v.parse::<c_int>() {
+                GRBsetintparam(env, cstr(PAR_THREADS), n);
+            }
+        }
+        if let Ok(v) = std::env::var("SURGE_GUROBI_SEED") {
+            if let Ok(n) = v.parse::<c_int>() {
+                GRBsetintparam(env, cstr(PAR_SEED), n);
+            }
+        }
+        if let Ok(v) = std::env::var("SURGE_GUROBI_METHOD") {
+            if let Ok(n) = v.parse::<c_int>() {
+                GRBsetintparam(env, cstr(PAR_METHOD), n);
+            }
+        }
+        if let Ok(v) = std::env::var("SURGE_GUROBI_PRESOLVE") {
+            if let Ok(n) = v.parse::<c_int>() {
+                const PAR_PRESOLVE: &[u8] = b"Presolve\0";
+                GRBsetintparam(env, cstr(PAR_PRESOLVE), n);
+            }
         }
 
         // ── Create model ──────────────────────────────────────────────────────
@@ -861,6 +1535,10 @@ mod impl_ {
         }
         let _guard = ModelGuard(model, GRBfreemodel);
 
+        let col_name_storage =
+            build_gurobi_name_storage(prob.col_names.as_deref(), "c", prob.n_col);
+        let col_name_ptrs = cstring_ptrs(&col_name_storage);
+
         // ── Add variables ─────────────────────────────────────────────────────
         // All variables are continuous by default; MIP types set below.
         let vtypes: Vec<c_char> = vec![GRB_CONTINUOUS; prob.n_col];
@@ -875,7 +1553,11 @@ mod impl_ {
             prob.col_lower.as_ptr(),
             prob.col_upper.as_ptr(),
             vtypes.as_ptr(),
-            ptr::null(),
+            if col_name_ptrs.is_empty() {
+                ptr::null()
+            } else {
+                col_name_ptrs.as_ptr()
+            },
         );
         if rc != 0 {
             return Err(format!("GRBaddvars failed (rc={rc})"));
@@ -904,6 +1586,61 @@ mod impl_ {
             );
             if rc != 0 {
                 return Err(format!("GRBsetcharattrarray(VType) failed (rc={rc})"));
+            }
+        }
+
+        // ── Primal start (warm-start hint) ────────────────────────────────────
+        //
+        // Gurobi's `Start` attribute works for both MIP (MIPSTART-equivalent)
+        // and LP (interpreted as a basis hint). Accepting `LpPrimalStart`
+        // on the LP path lets callers warm-start a re-solve from a prior
+        // solution — e.g. the SCUC loss-factor LP re-solve reusing the
+        // MIP's dispatch when the RHS shifts by only 1-3 % for loss
+        // allocation. Cold re-solves on a 440k-col LP cost several
+        // seconds; a good primal hint cuts that to sub-second.
+        if let Some(start) = opts.primal_start.as_ref() {
+            // Gurobi sentinel for "no start value at this index" is
+            // GRB_UNDEFINED = 1e101. Use it for sparse starts so only
+            // the supplied indices warm-start while everything else
+            // remains free for the solver to initialize.
+            const GRB_UNDEFINED: c_double = 1e101;
+            let start_values: Option<Vec<c_double>> = match start {
+                crate::backends::LpPrimalStart::Dense(values) => {
+                    if values.len() == prob.n_col {
+                        Some(values.to_vec())
+                    } else {
+                        None
+                    }
+                }
+                crate::backends::LpPrimalStart::Sparse { indices, values } => {
+                    let mut dense = vec![GRB_UNDEFINED; prob.n_col];
+                    let mut ok = true;
+                    for (&idx, &val) in indices.iter().zip(values.iter()) {
+                        if idx >= prob.n_col {
+                            ok = false;
+                            break;
+                        }
+                        dense[idx] = val;
+                    }
+                    if ok { Some(dense) } else { None }
+                }
+            };
+            if let Some(values) = start_values {
+                let rc = GRBsetdblattrarray(
+                    model,
+                    cstr(ATTR_START),
+                    0,
+                    prob.n_col as c_int,
+                    values.as_ptr(),
+                );
+                if rc != 0 {
+                    // Log but don't fail — a bad start hint shouldn't
+                    // abort an otherwise-valid solve.
+                    tracing::warn!(
+                        rc,
+                        "Gurobi: GRBsetdblattrarray(Start) failed; continuing cold"
+                    );
+                }
             }
         }
 
@@ -950,64 +1687,86 @@ mod impl_ {
 
         // ── Add constraints ───────────────────────────────────────────────────
         //
-        // Convert the CSC constraint matrix A to full CSR, then split rows into:
-        //   (a) Non-range: equality (=), ≤, ≥  → GRBaddconstrs
-        //   (b) Range: lb ≤ Ax ≤ ub             → GRBaddrangeconstrs
+        // Classify each row as range (`lb <= Ax <= ub` with distinct finite
+        // bounds) vs non-range (equality, ≤, ≥), then distribute each CSC
+        // entry directly into the appropriate row-oriented buffer in a
+        // single O(nnz) pass. This replaces the previous
+        // `csc_to_csr` + per-row slice-extend pair, saving one
+        // matrix-sized allocation and one full-matrix memcpy per solve.
         //
-        // We track orig_to_grb[i] = Gurobi constraint index for original row i,
-        // needed to reassemble duals in the original SparseProblem row order.
+        // We track orig_to_grb[i] = Gurobi constraint index for original
+        // row i, needed to reassemble duals in the original SparseProblem
+        // row order.
+        let row_name_storage =
+            build_gurobi_name_storage(prob.row_names.as_deref(), "r", prob.n_row);
 
-        let (csr_start, csr_col, csr_val) = csc_to_csr(
-            prob.n_row,
-            prob.n_col,
-            &prob.a_start,
-            &prob.a_index,
-            &prob.a_value,
-        );
-
-        // Gurobi constraint index assigned to each original row.
-        let mut orig_to_grb = vec![0usize; prob.n_row];
+        // Classify rows and count nonzeros per row in a single CSC scan,
+        // so we can pre-size the split CSR buffers.
+        let mut row_is_range = vec![false; prob.n_row];
+        let mut row_nnz = vec![0i32; prob.n_row];
         let mut n_non_range = 0usize;
         let mut n_range = 0usize;
-
-        // -- Non-range batch --------------------------------------------------
-        let mut nr_cbeg: Vec<c_int> = Vec::new();
-        let mut nr_cind: Vec<c_int> = Vec::new();
-        let mut nr_cval: Vec<c_double> = Vec::new();
-        let mut nr_sense: Vec<c_char> = Vec::new();
-        let mut nr_rhs: Vec<c_double> = Vec::new();
-
-        // -- Range batch ------------------------------------------------------
-        let mut rng_cbeg: Vec<c_int> = Vec::new();
-        let mut rng_cind: Vec<c_int> = Vec::new();
-        let mut rng_cval: Vec<c_double> = Vec::new();
-        let mut rng_lower: Vec<c_double> = Vec::new();
-        let mut rng_upper: Vec<c_double> = Vec::new();
-
         for i in 0..prob.n_row {
             let lb = prob.row_lower[i];
             let ub = prob.row_upper[i];
-            let rs = csr_start[i] as usize;
-            let re = csr_start[i + 1] as usize;
-
             let is_range = lb > -1e29 && ub < 1e29 && (ub - lb).abs() > 1e-12 * ub.abs().max(1.0);
-
+            row_is_range[i] = is_range;
             if is_range {
-                orig_to_grb[i] = prob.n_row; // placeholder; filled after we know n_non_range
-                // Temporarily accumulate — will assign Gurobi index after non-range pass.
-                rng_cbeg.push(rng_cind.len() as c_int);
-                rng_cind.extend_from_slice(&csr_col[rs..re]);
-                rng_cval.extend_from_slice(&csr_val[rs..re]);
-                rng_lower.push(lb);
-                rng_upper.push(ub);
                 n_range += 1;
             } else {
-                orig_to_grb[i] = n_non_range;
-                nr_cbeg.push(nr_cind.len() as c_int);
-                nr_cind.extend_from_slice(&csr_col[rs..re]);
-                nr_cval.extend_from_slice(&csr_val[rs..re]);
+                n_non_range += 1;
+            }
+        }
+        for &ri in &prob.a_index {
+            row_nnz[ri as usize] += 1;
+        }
 
-                // Determine constraint sense. Must guard against inf before the
+        // Assign Gurobi row indices: non-range rows first, then range rows.
+        // orig_to_grb lets us remap later when reading back row duals.
+        let mut orig_to_grb = vec![0usize; prob.n_row];
+        {
+            let mut nr_idx = 0usize;
+            let mut rn_idx = n_non_range;
+            for i in 0..prob.n_row {
+                if row_is_range[i] {
+                    orig_to_grb[i] = rn_idx;
+                    rn_idx += 1;
+                } else {
+                    orig_to_grb[i] = nr_idx;
+                    nr_idx += 1;
+                }
+            }
+        }
+
+        // Pre-size split CSR buffers. `*_cbeg` holds per-(Gurobi row) start
+        // offsets into `*_cind/*_cval`. We fill them with prefix sums of
+        // row_nnz so we can place each CSC entry directly at its row's
+        // write cursor without Vec::extend overhead.
+        let mut nr_cbeg: Vec<c_int> = Vec::with_capacity(n_non_range + 1);
+        let mut nr_sense: Vec<c_char> = Vec::with_capacity(n_non_range);
+        let mut nr_rhs: Vec<c_double> = Vec::with_capacity(n_non_range);
+        let mut nr_names: Vec<*const c_char> = Vec::with_capacity(n_non_range);
+
+        let mut rng_cbeg: Vec<c_int> = Vec::with_capacity(n_range + 1);
+        let mut rng_lower: Vec<c_double> = Vec::with_capacity(n_range);
+        let mut rng_upper: Vec<c_double> = Vec::with_capacity(n_range);
+        let mut rng_names: Vec<*const c_char> = Vec::with_capacity(n_range);
+
+        let mut nr_nnz_total: usize = 0;
+        let mut rng_nnz_total: usize = 0;
+        for i in 0..prob.n_row {
+            let lb = prob.row_lower[i];
+            let ub = prob.row_upper[i];
+            let nnz = row_nnz[i] as usize;
+            if row_is_range[i] {
+                rng_cbeg.push(rng_nnz_total as c_int);
+                rng_lower.push(lb);
+                rng_upper.push(ub);
+                rng_names.push(row_name_storage[i].as_ptr());
+                rng_nnz_total += nnz;
+            } else {
+                nr_cbeg.push(nr_nnz_total as c_int);
+                // Determine constraint sense. Guard against inf before the
                 // equality test — (inf - lb) == inf, and inf <= inf is true,
                 // which would falsely classify ">= lb" rows as equalities.
                 let (sense, rhs) = if lb.is_finite()
@@ -1016,25 +1775,45 @@ mod impl_ {
                 {
                     (GRB_EQUAL, ub)
                 } else if !ub.is_finite() || ub >= 1e29 {
-                    // One-sided lower bound (e.g. epigraph: e_g >= intercept)
                     (GRB_GREATER_EQUAL, lb)
                 } else {
-                    // One-sided upper bound (lb is -inf or very negative)
                     (GRB_LESS_EQUAL, ub)
                 };
                 nr_sense.push(sense);
                 nr_rhs.push(rhs);
-                n_non_range += 1;
+                nr_names.push(row_name_storage[i].as_ptr());
+                nr_nnz_total += nnz;
             }
         }
 
-        // Fix up orig_to_grb for range rows: they come after n_non_range.
-        let mut range_seq = 0usize;
-        for i in 0..prob.n_row {
-            if orig_to_grb[i] == prob.n_row {
-                // This is a range row (placeholder set above).
-                orig_to_grb[i] = n_non_range + range_seq;
-                range_seq += 1;
+        // Distribute CSC entries into the two split-CSR buffers in a
+        // single pass. `*_pos[i]` is the write cursor for Gurobi-row i.
+        let mut nr_cind: Vec<c_int> = vec![0; nr_nnz_total];
+        let mut nr_cval: Vec<c_double> = vec![0.0; nr_nnz_total];
+        let mut rng_cind: Vec<c_int> = vec![0; rng_nnz_total];
+        let mut rng_cval: Vec<c_double> = vec![0.0; rng_nnz_total];
+        let mut nr_pos: Vec<usize> = nr_cbeg.iter().map(|&p| p as usize).collect();
+        let mut rng_pos: Vec<usize> = rng_cbeg.iter().map(|&p| p as usize).collect();
+        for j in 0..prob.n_col {
+            for k in prob.a_start[j] as usize..prob.a_start[j + 1] as usize {
+                let ri = prob.a_index[k] as usize;
+                let v = prob.a_value[k];
+                if row_is_range[ri] {
+                    // Write cursor indexes into rng_cind/cval at row's
+                    // Gurobi index relative to the range block (so
+                    // rng_pos[gurobi_idx - n_non_range]).
+                    let gi = orig_to_grb[ri] - n_non_range;
+                    let p = rng_pos[gi];
+                    rng_cind[p] = j as c_int;
+                    rng_cval[p] = v;
+                    rng_pos[gi] = p + 1;
+                } else {
+                    let gi = orig_to_grb[ri];
+                    let p = nr_pos[gi];
+                    nr_cind[p] = j as c_int;
+                    nr_cval[p] = v;
+                    nr_pos[gi] = p + 1;
+                }
             }
         }
 
@@ -1049,7 +1828,7 @@ mod impl_ {
                 nr_cval.as_ptr(),
                 nr_sense.as_ptr(),
                 nr_rhs.as_ptr(),
-                ptr::null(),
+                nr_names.as_ptr(),
             );
             if rc != 0 {
                 return Err(format!("GRBaddconstrs failed (rc={rc})"));
@@ -1067,12 +1846,19 @@ mod impl_ {
                 rng_cval.as_ptr(),
                 rng_lower.as_ptr(),
                 rng_upper.as_ptr(),
-                ptr::null(),
+                rng_names.as_ptr(),
             );
             if rc != 0 {
                 return Err(format!("GRBaddrangeconstrs failed (rc={rc})"));
             }
         }
+
+        // MIP progress callback disabled. The schedule-driven early-
+        // termination path is dormant in this backend (see the
+        // `FALLBACK_MIP_GAP_WHEN_UNSET` comment above). `MipTrace` is
+        // still populated post-solve with model-size and node-count
+        // telemetry, just without per-event progress samples.
+        let mut callback_ctx: Option<Box<MipCallbackContext>> = None;
 
         // ── Solve ─────────────────────────────────────────────────────────────
         let solve_rc = GRBoptimize(model);
@@ -1080,18 +1866,30 @@ mod impl_ {
             return Err(format!("GRBoptimize failed (rc={solve_rc})"));
         }
 
+        // Detach the callback once the solve returns so the upcoming status
+        // resolution (which may call `GRBoptimize` again for INF_OR_UNBD
+        // retries) does not race against a context whose lifetime we're
+        // about to end.
+        if callback_ctx.is_some() {
+            let rc = (lib.GRBsetcallbackfunc)(model, None, ptr::null_mut());
+            debug_assert_eq!(rc, 0, "GRBsetcallbackfunc(None) rc={rc}");
+        }
+
         // ── Solution status ───────────────────────────────────────────────────
-        let mut stat: c_int = 0;
-        GRBgetintattr(model, cstr(ATTR_STATUS), &mut stat);
-        let status = match stat {
-            GRB_OPTIMAL | GRB_LOCALLY_OPTIMAL => LpSolveStatus::Optimal,
-            GRB_SUBOPTIMAL => LpSolveStatus::SubOptimal,
-            GRB_INFEASIBLE => LpSolveStatus::Infeasible,
-            GRB_UNBOUNDED => LpSolveStatus::Unbounded,
-            _ => LpSolveStatus::SolverError(format!("Gurobi status={stat}")),
-        };
+        let (_stat, status) = resolve_gurobi_status(lib, env, model)?;
 
         if !matches!(status, LpSolveStatus::Optimal | LpSolveStatus::SubOptimal) {
+            if matches!(status, LpSolveStatus::Infeasible) && gurobi_iis_export_requested() {
+                let export = export_gurobi_iis(lib, model, prob, &orig_to_grb)?;
+                return Err(format!(
+                    "Gurobi: {status:?} (IIS exported to {} and {}; minimal={}, rows={}, bounds={})",
+                    export.ilp_path.display(),
+                    export.summary_path.display(),
+                    export.minimal,
+                    export.n_rows,
+                    export.n_bounds
+                ));
+            }
             return Err(format!("Gurobi: {status:?}"));
         }
 
@@ -1138,6 +1936,121 @@ mod impl_ {
             (vec![0.0; prob.n_row], vec![0.0; prob.n_col])
         };
 
+        // ── MIP trace + post-solve telemetry ─────────────────────────────────
+        //
+        // Emit a `MipTrace` on every MIP solve (not just schedule-driven
+        // ones) so run-report.json always carries model-size, node-count,
+        // and final-gap stats for post-mortem analysis. The schedule's
+        // progress events are only present when the caller supplied a
+        // `mip_gap_schedule`.
+        let mip_trace = if is_mip {
+            use crate::backends::{MipProgressMonitor, MipTerminationReason, MipTrace};
+
+            // Original-model (pre-presolve) sizes.
+            let read_int = |name: &[u8]| -> Option<u64> {
+                let mut v: c_int = 0;
+                if GRBgetintattr(model, cstr(name), &mut v) == 0 && v >= 0 {
+                    Some(v as u64)
+                } else {
+                    None
+                }
+            };
+            let read_dbl = |name: &[u8]| -> Option<f64> {
+                let mut v: c_double = 0.0;
+                if GRBgetdblattr(model, cstr(name), &mut v) == 0 {
+                    Some(v)
+                } else {
+                    None
+                }
+            };
+            let n_vars = read_int(ATTR_NUMVARS);
+            let n_bin_vars = read_int(ATTR_NUMBINVARS);
+            let n_int_vars = read_int(ATTR_NUMINTVARS);
+            // Count binaries already pinned by equal bounds — tight
+            // pre-fixes done by the model builder (must-run pins,
+            // derate-forced-offs, min-up/min-down carryover, etc.).
+            // Gurobi's presolve removes them in short order; the
+            // delta against `n_bin_vars` shows how much branching
+            // freedom the solver actually gets.
+            let pre_fixed_bin_vars = prob.integrality.as_ref().map(|iv| {
+                iv.iter()
+                    .enumerate()
+                    .filter(|(_, d)| matches!(d, crate::backends::VariableDomain::Binary))
+                    .filter(|(i, _)| (prob.col_upper[*i] - prob.col_lower[*i]).abs() <= 1e-9)
+                    .count() as u64
+            });
+            let n_rows = read_int(ATTR_NUMCONSTRS);
+            let n_nonzeros = read_int(ATTR_NUMNZS);
+            let node_count = read_dbl(ATTR_NODECOUNT).map(|v| v.max(0.0).round() as u64);
+            let runtime_secs = read_dbl(ATTR_RUNTIME).unwrap_or(0.0);
+            let obj_bound = read_dbl(ATTR_OBJBOUND).filter(|v| v.is_finite());
+            let final_gap = obj_bound
+                .filter(|_| objval.is_finite())
+                .map(|bnd| MipProgressMonitor::relative_gap(objval, bnd));
+
+            let (schedule, events, terminated_by) = if let Some(ctx) = callback_ctx.take() {
+                let monitor = ctx.monitor;
+                let terminated_by = if monitor.has_terminated() {
+                    MipTerminationReason::ScheduleGap
+                } else {
+                    match status {
+                        LpSolveStatus::Optimal => MipTerminationReason::Optimal,
+                        LpSolveStatus::SubOptimal => {
+                            if matches!(_stat, ffi::GRB_TIME_LIMIT) {
+                                MipTerminationReason::TimeLimit
+                            } else {
+                                MipTerminationReason::Other
+                            }
+                        }
+                        LpSolveStatus::Infeasible => MipTerminationReason::Infeasible,
+                        _ => MipTerminationReason::Other,
+                    }
+                };
+                let trace = monitor.into_trace(
+                    opts.time_limit_secs,
+                    terminated_by,
+                    runtime_secs,
+                    final_gap,
+                );
+                (trace.schedule, trace.events, trace.terminated_by)
+            } else {
+                let terminated_by = match status {
+                    LpSolveStatus::Optimal => MipTerminationReason::Optimal,
+                    LpSolveStatus::SubOptimal => {
+                        if matches!(_stat, ffi::GRB_TIME_LIMIT) {
+                            MipTerminationReason::TimeLimit
+                        } else {
+                            MipTerminationReason::Other
+                        }
+                    }
+                    LpSolveStatus::Infeasible => MipTerminationReason::Infeasible,
+                    _ => MipTerminationReason::Other,
+                };
+                (None, Vec::new(), terminated_by)
+            };
+
+            Some(MipTrace {
+                schedule,
+                time_limit_secs: opts.time_limit_secs,
+                final_gap,
+                final_time_secs: runtime_secs,
+                terminated_by,
+                events,
+                n_vars,
+                n_bin_vars,
+                pre_fixed_bin_vars,
+                n_int_vars,
+                n_rows,
+                n_nonzeros,
+                node_count,
+                iter_count: Some(iterations as u64),
+                objective: objval.is_finite().then_some(objval),
+                objective_bound: obj_bound,
+            })
+        } else {
+            None
+        };
+
         Ok(LpResult {
             x,
             row_dual,
@@ -1145,6 +2058,7 @@ mod impl_ {
             objective: objval,
             status,
             iterations,
+            mip_trace,
         })
     }
 
@@ -1422,13 +2336,21 @@ mod impl_ {
         // ── Check status ─────────────────────────────────────────────────────
         let mut stat: c_int = 0;
         (lib.GRBgetintattr)(model, cstr(ATTR_STATUS), &mut stat);
-        let status = match stat {
-            GRB_OPTIMAL | GRB_LOCALLY_OPTIMAL => LpSolveStatus::Optimal,
-            GRB_SUBOPTIMAL => LpSolveStatus::SubOptimal,
-            GRB_INFEASIBLE => LpSolveStatus::Infeasible,
-            GRB_UNBOUNDED => LpSolveStatus::Unbounded,
-            _ => LpSolveStatus::SolverError(format!("Gurobi QCQP status={stat}")),
+        let solution_count = if stat == GRB_TIME_LIMIT {
+            let mut count: c_int = 0;
+            let rc = (lib.GRBgetintattr)(model, cstr(ATTR_SOLCOUNT), &mut count);
+            if rc != 0 {
+                return Err(gurobi_call_error(
+                    "GRBgetintattr(SolCount)",
+                    rc,
+                    gurobi_model_error_message(lib, model).as_deref(),
+                ));
+            }
+            Some(count)
+        } else {
+            None
         };
+        let status = gurobi_status_from_code(stat, solution_count);
 
         if !matches!(status, LpSolveStatus::Optimal | LpSolveStatus::SubOptimal) {
             return Err(format!("Gurobi QCQP: {status:?}"));
@@ -3268,6 +4190,8 @@ mod impl_ {
                     branch_shadow_prices,
                     shadow_price_angmin,
                     shadow_price_angmax,
+                    thermal_limit_slack_from_mva: vec![],
+                    thermal_limit_slack_to_mva: vec![],
                     flowgate_shadow_prices,
                     interface_shadow_prices,
                     shadow_price_vm_min,
@@ -3281,11 +4205,62 @@ mod impl_ {
                 par_results: vec![],
                 virtual_bid_results: vec![],
                 benders_cut_duals: vec![],
+                objective_terms: vec![],
+                audit: Default::default(),
+                bus_q_slack_pos_mvar: vec![],
+                bus_q_slack_neg_mvar: vec![],
+                bus_p_slack_pos_mw: vec![],
+                bus_p_slack_neg_mw: vec![],
+                vm_slack_high_pu: vec![],
+                vm_slack_low_pu: vec![],
+                angle_diff_slack_high_rad: vec![],
+                angle_diff_slack_low_rad: vec![],
                 solve_time_secs: 0.0, // caller fills in timing
                 iterations: Some(iterations),
                 solver_name: Some("Gurobi-NLP".to_string()),
                 solver_version: Some("13.0".to_string()),
+                ac_opf_timings: None,
             })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{build_gurobi_name_storage, gurobi_status_from_code, sanitize_gurobi_name};
+        use crate::backends::LpSolveStatus;
+
+        #[test]
+        fn sanitize_gurobi_name_normalizes_special_chars() {
+            let name = sanitize_gurobi_name("h0:startup tier/g1", "r", 12);
+            assert_eq!(name, "r_12_h0_startup_tier_g1");
+        }
+
+        #[test]
+        fn build_gurobi_name_storage_falls_back_when_names_missing() {
+            let names = build_gurobi_name_storage(None, "c", 2);
+            let rendered: Vec<String> = names
+                .iter()
+                .map(|value| value.to_string_lossy().to_string())
+                .collect();
+            assert_eq!(rendered, vec!["c_0_c_0".to_string(), "c_1_c_1".to_string()]);
+        }
+
+        #[test]
+        fn gurobi_time_limit_with_incumbent_maps_to_suboptimal() {
+            assert_eq!(
+                gurobi_status_from_code(9, Some(1)),
+                LpSolveStatus::SubOptimal
+            );
+        }
+
+        #[test]
+        fn gurobi_time_limit_without_incumbent_stays_solver_error() {
+            assert_eq!(
+                gurobi_status_from_code(9, Some(0)),
+                LpSolveStatus::SolverError(
+                    "Gurobi status=9 (time limit, no incumbent)".to_string()
+                )
+            );
         }
     }
 }

@@ -1,0 +1,101 @@
+{
+  "artifacts": {
+    "context": "go_c3_event4_73_d1_357_sw0.goc3-context.json.zst",
+    "expected_validator_summary": "expected-validator-summary.json",
+    "network": "go_c3_event4_73_d1_357_sw0.surge.json.zst",
+    "problem": "go_c3_event4_73_d1_357_sw0.goc3-problem.json.zst",
+    "request": "go_c3_event4_73_d1_357_sw0.dispatch-request.json.zst"
+  },
+  "bundle_name": "go_c3_event4_73_d1_357_sw0",
+  "definition_name": "go_c3_event4_73_d1_357_sw0",
+  "derivation": {
+    "kind": "full_horizon",
+    "source_periods": 18
+  },
+  "description": "73-bus D1 SW0 public GO C3 case. Low demand, high renewables; 18-period non-uniform horizon.",
+  "policy": {
+    "ac_dispatch_fail_closed": true,
+    "ac_nlp_solver": null,
+    "ac_opf_overrides": null,
+    "ac_reconcile_mode": "ac_dispatch",
+    "ac_target_tracking_lmp_marginal_cost_config": null,
+    "ac_target_tracking_overrides": null,
+    "ac_target_tracking_reduced_cost_config": null,
+    "allow_branch_switching": false,
+    "capture_solver_log": false,
+    "commitment_mip_rel_gap": null,
+    "commitment_mode": "optimize",
+    "commitment_seed_mode": "none",
+    "commitment_solution_path": null,
+    "commitment_time_limit_secs": null,
+    "coupling": "time_coupled",
+    "decommit_pmin_tolerance_mw": 1.0,
+    "fixed_commitment_from_initial_status": false,
+    "fixed_consumer_mode": "dispatchable",
+    "fixed_hvdc_solution_path": null,
+    "formulation": "dc",
+    "include_security_screening": false,
+    "log_level": "info",
+    "lp_solver": "gurobi",
+    "max_ac_refinement_iterations": 0,
+    "max_decommit_iterations": 2,
+    "run_pricing": false,
+    "sced_ac_benders_overrides": null,
+    "security_mode": "explicit_dc_ctg",
+    "switchable_branch_uids": null,
+    "use_sced_ac_benders": false
+  },
+  "problem_summary": {
+    "base_norm_mva": 100.0,
+    "counts": {
+      "ac_line": 105,
+      "active_zonal_reserve": 1,
+      "bus": 73,
+      "contingency": 2,
+      "dc_line": 1,
+      "reactive_zonal_reserve": 1,
+      "shunt": 73,
+      "simple_dispatchable_device": 205,
+      "two_winding_transformer": 15
+    },
+    "interval_durations": [
+      0.25,
+      0.25,
+      0.25,
+      0.25,
+      0.25,
+      0.25,
+      0.25,
+      0.25,
+      0.5,
+      0.5,
+      0.5,
+      0.5,
+      0.5,
+      0.5,
+      0.5,
+      0.5,
+      1.0,
+      1.0
+    ],
+    "periods": 18,
+    "problem_path": "target/benchmarks/go-c3/datasets/event4_73/D1/C3E4N00073D1/scenario_357.json",
+    "uniform_intervals": false
+  },
+  "request_summary": {
+    "has_runtime": true,
+    "timeline_periods": 18
+  },
+  "source": {
+    "dataset": "event4_73",
+    "division": "D1",
+    "network_model": "C3E4N00073D1",
+    "notes": "LOW demand + ren4 (2.3x gen-to-load ratio) \u2014 curtailment and export regime.",
+    "scenario_id": 357,
+    "source_problem_path": "target/benchmarks/go-c3/datasets/event4_73/D1/C3E4N00073D1/scenario_357.json",
+    "switching_mode": "SW0",
+    "tier": "core",
+    "track_examples": true
+  },
+  "variant": "full"
+}

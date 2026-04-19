@@ -64,6 +64,24 @@ pub struct DlPeriodParams {
     pub p_sched_pu: f64,
     /// Maximum real power served this period (per-unit).
     pub p_max_pu: f64,
+    /// Optional scheduled reactive power this period (per-unit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q_sched_pu: Option<f64>,
+    /// Optional minimum reactive power served this period (per-unit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q_min_pu: Option<f64>,
+    /// Optional maximum reactive power served this period (per-unit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q_max_pu: Option<f64>,
+    /// Optional per-period GO-style `q = q0 + beta * p` equality link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_linear_equality: Option<crate::network::generator::PqLinearLink>,
+    /// Optional per-period GO-style upper p-q capability line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_linear_upper: Option<crate::network::generator::PqLinearLink>,
+    /// Optional per-period GO-style lower p-q capability line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_linear_lower: Option<crate::network::generator::PqLinearLink>,
     /// Cost / benefit model for this period's objective.
     pub cost_model: LoadCostModel,
 }
@@ -436,6 +454,57 @@ pub struct DispatchableLoad {
     #[serde(default)]
     pub rebound_periods: usize,
 
+    // --- intertemporal ramp limits ---
+    /// Maximum upward ramp rate of served real power (per-unit per hour).
+    ///
+    /// `None` means the load has no ramp constraint (legacy behaviour).
+    /// When set, the SCUC/SCED LP enforces
+    /// `p_served[t] - p_served[t-1] <= ramp_up_pu_per_hr * dt`
+    /// and the initial-period constraint
+    /// `p_served[0] <= initial_p_pu + ramp_up_pu_per_hr * dt[0]`
+    /// (via the optional `initial_p_pu` below).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ramp_up_pu_per_hr: Option<f64>,
+
+    /// Maximum downward ramp rate of served real power (per-unit per hour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ramp_down_pu_per_hr: Option<f64>,
+
+    /// Prior-horizon served real power (per-unit). Used as the anchor for the
+    /// first-period ramp constraint when `ramp_up_pu_per_hr` /
+    /// `ramp_down_pu_per_hr` is set. `None` disables the first-period anchor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_p_pu: Option<f64>,
+
+    /// Linear EQUALITY linking `q = q_at_p_zero_pu + beta * p` for
+    /// consumers whose reactive output is rigidly tied to their real
+    /// power schedule. Q-reserves on these devices are forced to zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_linear_equality: Option<crate::network::generator::PqLinearLink>,
+    /// Linear UPPER bound `q + q^qrd ≤ q_at_p_zero_pu + beta * p` for
+    /// consumers that cap their reactive output relative to real power.
+    /// For consumers `q^qrd` is on the LHS of the upper bound — the
+    /// formulation is symmetric to producers but with `qrd` and `qru`
+    /// swapped on the role of "tightening the box".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_linear_upper: Option<crate::network::generator::PqLinearLink>,
+    /// Linear LOWER bound `q − q^qru ≥ q_at_p_zero_pu + beta * p` for
+    /// consumers that floor their reactive output relative to real
+    /// power.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_linear_lower: Option<crate::network::generator::PqLinearLink>,
+
+    /// Identifier for a multi-block ramp aggregate.
+    ///
+    /// When multiple `DispatchableLoad` entries share the same `ramp_group`,
+    /// the SCUC/SCED LP constrains `Σ p_served` across the group (rather
+    /// than each block individually) against the shared `ramp_up_pu_per_hr`,
+    /// `ramp_down_pu_per_hr`, and `initial_p_pu`. Use this when a single
+    /// physical consumer is split into price-block DL entries that must
+    /// still respect the consumer-level ramp rate as an aggregate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ramp_group: Option<String>,
+
     // --- market ---
     /// Energy offer for market clearing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -443,6 +512,14 @@ pub struct DispatchableLoad {
     /// Reserve offers keyed by product ID (generic reserve model).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reserve_offers: Vec<crate::market::reserve::ReserveOffer>,
+    /// Identifier for a physical reserve-capability aggregate.
+    ///
+    /// When multiple dispatchable-load blocks share this value, the reserve LP
+    /// constrains the sum of their awards by the group's capability instead of
+    /// treating each block as an independent provider. This is useful when one
+    /// physical consumer is split into multiple price blocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserve_group: Option<String>,
     /// Custom qualification flags for reserve products.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub qualifications: crate::market::reserve::QualificationMap,
@@ -497,7 +574,15 @@ impl DispatchableLoad {
             rebound_periods: 0,
             energy_offer: None,
             reserve_offers: Vec::new(),
+            reserve_group: None,
             qualifications: std::collections::HashMap::new(),
+            ramp_up_pu_per_hr: None,
+            ramp_down_pu_per_hr: None,
+            initial_p_pu: None,
+            ramp_group: None,
+            pq_linear_equality: None,
+            pq_linear_upper: None,
+            pq_linear_lower: None,
         }
     }
 
@@ -540,7 +625,15 @@ impl DispatchableLoad {
             rebound_periods: 0,
             energy_offer: None,
             reserve_offers: Vec::new(),
+            reserve_group: None,
             qualifications: std::collections::HashMap::new(),
+            ramp_up_pu_per_hr: None,
+            ramp_down_pu_per_hr: None,
+            initial_p_pu: None,
+            ramp_group: None,
+            pq_linear_equality: None,
+            pq_linear_upper: None,
+            pq_linear_lower: None,
         }
     }
 
@@ -577,7 +670,15 @@ impl DispatchableLoad {
             rebound_periods: 0,
             energy_offer: None,
             reserve_offers: Vec::new(),
+            reserve_group: None,
             qualifications: std::collections::HashMap::new(),
+            ramp_up_pu_per_hr: None,
+            ramp_down_pu_per_hr: None,
+            initial_p_pu: None,
+            ramp_group: None,
+            pq_linear_equality: None,
+            pq_linear_upper: None,
+            pq_linear_lower: None,
         }
     }
 

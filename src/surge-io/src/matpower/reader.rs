@@ -19,8 +19,8 @@ use std::path::Path;
 use surge_network::Network;
 use surge_network::market::CostCurve;
 use surge_network::network::{
-    Branch, BranchType, Bus, BusType, DcBranch, DcBus, DcConverter, DcConverterStation, Generator,
-    Load,
+    Branch, BranchType, Bus, BusType, DcBranch, DcBus, DcConverter, DcConverterStation, FuelParams,
+    GenType, Generator, GeneratorTechnology, Load,
 };
 use thiserror::Error;
 
@@ -94,6 +94,8 @@ pub fn parse_str(content: &str) -> Result<Network, MatpowerError> {
     let mut branch_rows: Vec<Vec<f64>> = Vec::new();
     let mut gencost_rows: Vec<Vec<f64>> = Vec::new();
     let mut bus_name_rows: Vec<String> = Vec::new();
+    let mut gentype_rows: Vec<String> = Vec::new();
+    let mut genfuel_rows: Vec<String> = Vec::new();
     let mut dc_bus_rows: Vec<Vec<f64>> = Vec::new();
     let mut dc_conv_rows: Vec<Vec<f64>> = Vec::new();
     let mut dc_branch_rows: Vec<Vec<f64>> = Vec::new();
@@ -106,6 +108,8 @@ pub fn parse_str(content: &str) -> Result<Network, MatpowerError> {
         Branch,
         GenCost,
         BusName,
+        GenType,
+        GenFuel,
         DcBus,
         DcConv,
         DcBranch,
@@ -130,7 +134,12 @@ pub fn parse_str(content: &str) -> Result<Network, MatpowerError> {
         }
 
         // Check for cell array section end: `};` (used by mpc.bus_name and similar)
-        if line.contains("};") && section == Section::BusName {
+        if line.contains("};")
+            && matches!(
+                section,
+                Section::BusName | Section::GenType | Section::GenFuel
+            )
+        {
             section = Section::None;
             continue;
         }
@@ -248,6 +257,14 @@ pub fn parse_str(content: &str) -> Result<Network, MatpowerError> {
             section = Section::BusName;
             continue;
         }
+        if line.contains("mpc.gentype") && line.contains('=') && line.contains('{') {
+            section = Section::GenType;
+            continue;
+        }
+        if line.contains("mpc.genfuel") && line.contains('=') && line.contains('{') {
+            section = Section::GenFuel;
+            continue;
+        }
 
         // Other mpc.xxx sections — skip their contents
         if line.contains("mpc.") && line.contains('=') {
@@ -290,7 +307,17 @@ pub fn parse_str(content: &str) -> Result<Network, MatpowerError> {
                 // Each entry looks like: `\t'Riversde  V2';`
                 // Only process lines that contain a quoted string.
                 if line.contains('\'') {
-                    bus_name_rows.push(parse_bus_name_entry(line));
+                    bus_name_rows.push(parse_cell_array_entry(line));
+                }
+            }
+            Section::GenType => {
+                if line.contains('\'') {
+                    gentype_rows.push(parse_cell_array_entry(line));
+                }
+            }
+            Section::GenFuel => {
+                if line.contains('\'') {
+                    genfuel_rows.push(parse_cell_array_entry(line));
                 }
             }
             _ => {}
@@ -462,6 +489,9 @@ pub fn parse_str(content: &str) -> Result<Network, MatpowerError> {
                     qc2min: qc2min_val,
                     qc2max: qc2max_val,
                     pq_curve,
+                    pq_linear_equality: None,
+                    pq_linear_upper: None,
+                    pq_linear_lower: None,
                 })
             } else {
                 None
@@ -589,6 +619,45 @@ pub fn parse_str(content: &str) -> Result<Network, MatpowerError> {
 
         if let Some(c) = cost {
             network.generators[gen_idx].cost = Some(c);
+        }
+    }
+
+    for (i, raw_code) in gentype_rows.iter().enumerate() {
+        let Some(gen_idx) = gen_row_to_network_idx.get(i).copied().flatten() else {
+            continue;
+        };
+        let raw_code = raw_code.trim();
+        if raw_code.is_empty() {
+            continue;
+        }
+        let generator = &mut network.generators[gen_idx];
+        generator.source_technology_code = Some(raw_code.to_string());
+        generator.technology = Some(matpower_technology_from_code(raw_code));
+        if let Some(class) = matpower_electrical_class_from_code(raw_code) {
+            generator.gen_type = class;
+        }
+    }
+
+    for (i, raw_fuel) in genfuel_rows.iter().enumerate() {
+        let Some(gen_idx) = gen_row_to_network_idx.get(i).copied().flatten() else {
+            continue;
+        };
+        let raw_fuel = raw_fuel.trim();
+        if raw_fuel.is_empty() {
+            continue;
+        }
+        let generator = &mut network.generators[gen_idx];
+        generator
+            .fuel
+            .get_or_insert_with(FuelParams::default)
+            .fuel_type = Some(raw_fuel.to_string());
+        if generator.technology.is_none() {
+            generator.technology = matpower_technology_from_fuel(raw_fuel);
+        }
+        if generator.gen_type == GenType::Unknown
+            && let Some(class) = matpower_electrical_class_from_fuel(raw_fuel)
+        {
+            generator.gen_type = class;
         }
     }
 
@@ -830,10 +899,10 @@ pub fn parse_str(content: &str) -> Result<Network, MatpowerError> {
     Ok(network)
 }
 
-/// Extract a bus name from a `mpc.bus_name` cell array line.
+/// Extract a string from a MATPOWER cell-array line.
 /// Input: `\t'Riversde  V2';` → output: `"Riversde  V2"` (trailing spaces trimmed).
 /// Returns an empty string if no quoted content is found.
-fn parse_bus_name_entry(line: &str) -> String {
+fn parse_cell_array_entry(line: &str) -> String {
     let line = line.trim();
     if let Some(start) = line.find('\'')
         && let Some(end) = line[start + 1..].find('\'')
@@ -841,6 +910,69 @@ fn parse_bus_name_entry(line: &str) -> String {
         return line[start + 1..start + 1 + end].trim_end().to_string();
     }
     String::new()
+}
+
+fn matpower_technology_from_code(code: &str) -> GeneratorTechnology {
+    match code.trim().to_ascii_uppercase().as_str() {
+        "ST" => GeneratorTechnology::SteamTurbine,
+        "GT" | "JE" => GeneratorTechnology::CombustionTurbine,
+        "CC" => GeneratorTechnology::CombinedCycle,
+        "IC" => GeneratorTechnology::InternalCombustion,
+        "HY" | "HB" | "HR" => GeneratorTechnology::Hydro,
+        "PS" => GeneratorTechnology::PumpedStorage,
+        "HK" => GeneratorTechnology::Hydrokinetic,
+        "NB" | "NU" => GeneratorTechnology::Nuclear,
+        "GE" => GeneratorTechnology::Geothermal,
+        "WT" | "WS" | "W1" | "W2" | "W3" | "W4" => GeneratorTechnology::Wind,
+        "PV" => GeneratorTechnology::SolarPv,
+        "CP" => GeneratorTechnology::SolarThermal,
+        "BA" | "ES" => GeneratorTechnology::BatteryStorage,
+        "CE" => GeneratorTechnology::CompressedAirStorage,
+        "FW" => GeneratorTechnology::FlywheelStorage,
+        "FC" => GeneratorTechnology::FuelCell,
+        "SC" => GeneratorTechnology::SynchronousCondenser,
+        "SV" => GeneratorTechnology::StaticVarCompensator,
+        "DL" => GeneratorTechnology::DispatchableLoad,
+        "DC" => GeneratorTechnology::DcTie,
+        "OT" => GeneratorTechnology::Other,
+        _ => GeneratorTechnology::Other,
+    }
+}
+
+fn matpower_electrical_class_from_code(code: &str) -> Option<GenType> {
+    match code.trim().to_ascii_uppercase().as_str() {
+        "ST" | "GT" | "JE" | "CC" | "IC" | "HY" | "HB" | "HR" | "PS" | "NB" | "NU" | "GE"
+        | "SC" => Some(GenType::Synchronous),
+        "W1" | "W2" => Some(GenType::Asynchronous),
+        "PV" | "W3" | "W4" | "BA" | "ES" | "FW" | "FC" | "SV" => Some(GenType::InverterBased),
+        "DL" => Some(GenType::Hybrid),
+        "WT" | "WS" | "CP" | "CE" | "DC" | "OT" => Some(GenType::Unknown),
+        _ => None,
+    }
+}
+
+fn matpower_technology_from_fuel(fuel: &str) -> Option<GeneratorTechnology> {
+    match fuel.trim().to_ascii_lowercase().as_str() {
+        "wind" => Some(GeneratorTechnology::Wind),
+        "solar" => Some(GeneratorTechnology::SolarPv),
+        "hydro" => Some(GeneratorTechnology::Hydro),
+        "hydrops" => Some(GeneratorTechnology::PumpedStorage),
+        "nuclear" => Some(GeneratorTechnology::Nuclear),
+        "geothermal" => Some(GeneratorTechnology::Geothermal),
+        "battery" | "ess" => Some(GeneratorTechnology::BatteryStorage),
+        "dl" => Some(GeneratorTechnology::DispatchableLoad),
+        _ => None,
+    }
+}
+
+fn matpower_electrical_class_from_fuel(fuel: &str) -> Option<GenType> {
+    match fuel.trim().to_ascii_lowercase().as_str() {
+        "solar" | "battery" | "ess" => Some(GenType::InverterBased),
+        "hydro" | "hydrops" | "nuclear" | "coal" | "oil" | "gas" | "ng" => {
+            Some(GenType::Synchronous)
+        }
+        _ => None,
+    }
 }
 
 /// Check if a line starts a MATPOWER section like `mpc.bus = [`.
@@ -1109,6 +1241,7 @@ fn eval_expr_depth(s: &str, depth: usize) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use surge_network::network::{GenType, GeneratorTechnology};
 
     #[allow(dead_code)]
     fn data_available() -> bool {
@@ -1343,6 +1476,61 @@ mpc.branch = [
         assert_eq!(net.n_branches(), 1);
         let bus_pd = net.bus_load_p_mw();
         assert!((bus_pd[1] - 50.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_parse_generator_classification_sections() {
+        let case = r#"
+function mpc = testcase
+mpc.version = '2';
+mpc.baseMVA = 100;
+mpc.bus = [
+    1   3   0   0   0   0   1   1.0   0   345   1   1.1   0.9;
+    2   2   0   0   0   0   1   1.0   0   345   1   1.1   0.9;
+];
+mpc.gen = [
+    1   100  0   300  -300  1.0  100  1  250  10;
+    2   40   0   100  -50   1.0  100  1  80   0;
+];
+mpc.branch = [
+    1   2   0.01  0.1  0.02  100  100  100  0  0  1  -360  360;
+];
+mpc.gentype = {
+    'W2';
+    'PV';
+};
+mpc.genfuel = {
+    'wind';
+    'solar';
+};
+"#;
+        let net = parse_str(case).expect("failed to parse classification case");
+        assert_eq!(net.generators.len(), 2);
+        assert_eq!(
+            net.generators[0].source_technology_code.as_deref(),
+            Some("W2")
+        );
+        assert_eq!(
+            net.generators[0].technology,
+            Some(GeneratorTechnology::Wind)
+        );
+        assert_eq!(net.generators[0].gen_type, GenType::Asynchronous);
+        assert_eq!(
+            net.generators[0]
+                .fuel
+                .as_ref()
+                .and_then(|fuel| fuel.fuel_type.as_deref()),
+            Some("wind")
+        );
+        assert_eq!(
+            net.generators[1].source_technology_code.as_deref(),
+            Some("PV")
+        );
+        assert_eq!(
+            net.generators[1].technology,
+            Some(GeneratorTechnology::SolarPv)
+        );
+        assert_eq!(net.generators[1].gen_type, GenType::InverterBased);
     }
 
     #[test]

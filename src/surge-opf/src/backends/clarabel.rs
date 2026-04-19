@@ -407,6 +407,7 @@ impl LpSolver for ClarabelLpSolver {
             objective: sol.obj_val,
             status,
             iterations: sol.iterations,
+            mip_trace: None,
         })
     }
 }
@@ -531,13 +532,19 @@ mod tests {
             q_start: None,
             q_index: None,
             q_value: None,
+            col_names: None,
+            row_names: None,
             integrality: None,
         };
 
         let opts = LpOptions {
             tolerance: 1e-8,
             time_limit_secs: None,
+            algorithm: crate::backends::LpAlgorithm::Auto,
             print_level: 0,
+            primal_start: None,
+            mip_rel_gap: None,
+            mip_gap_schedule: None,
         };
 
         let result = solver
@@ -591,6 +598,8 @@ mod tests {
             q_start: Some(vec![0, 1, 2]),
             q_index: Some(vec![0, 1]),
             q_value: Some(vec![2.0, 2.0]),
+            col_names: None,
+            row_names: None,
             integrality: None,
         };
 

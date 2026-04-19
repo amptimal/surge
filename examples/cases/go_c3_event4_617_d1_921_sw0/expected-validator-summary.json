@@ -1,0 +1,47 @@
+{
+  "error_diagnostics": "",
+  "feas": 0,
+  "infeas": 1,
+  "infeas_diagnostics": {
+    "viol_cs_t_p_off_max": {
+      "idx": {
+        "0": "sd_285",
+        "1": 0
+      },
+      "val": 1.589682223315268
+    },
+    "viol_pr_t_p_on_min": {
+      "idx": {
+        "0": "sd_087",
+        "1": 11
+      },
+      "val": 2.9987998008999996
+    },
+    "viol_sd_t_p_ramp_dn_max": {
+      "idx": {
+        "0": "sd_087",
+        "1": 11
+      },
+      "val": 0.731174020224886
+    },
+    "viol_sd_t_p_rrd_off_max": {
+      "idx": {
+        "0": "sd_285",
+        "1": 0
+      },
+      "val": 1.589682223315268
+    }
+  },
+  "obj": 3380339.277760369,
+  "pass": 1,
+  "phys_feas": 0,
+  "problem_pass": 1,
+  "problem_surplus_total": 46196718.61406804,
+  "z": 3380339.277760369,
+  "z_base": 3406246.314867839,
+  "z_cost": 1938829.6467162047,
+  "z_k_average_case": -4596.668019174866,
+  "z_k_worst_case": -21310.36908829531,
+  "z_penalty": 41525140.909632966,
+  "z_value": 46870216.871217
+}

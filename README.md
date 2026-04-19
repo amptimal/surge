@@ -34,6 +34,8 @@ requires a separate license from Amptimal. See [LICENSE](LICENSE),
 | `surge-contingency` | N-1, N-2, screening, and follow-on contingency workflows |
 | `surge-opf` | DC-OPF, AC-OPF, and SCOPF |
 | `surge-transfer` | ATC/AFC and reusable transfer capability studies |
+| `surge-dispatch` | Unified SCED/SCUC kernel — DC/AC, period-by-period or time-coupled, with reserves, security screening, and SCED-AC Benders |
+| `surge-market` | Canonical market-formulation layer — reserve catalogues, multi-stage workflows, AC SCED setup, retry/refinement runtime, GO C3 adapter |
 | `surge-bindings` | `surge-solve` CLI |
 | `surge-py` | Python bindings and typed package layer |
 
@@ -45,6 +47,8 @@ requires a separate license from Amptimal. See [LICENSE](LICENSE),
 - Branch and generator contingency analysis with screening options
 - DC-OPF, AC-OPF, and SCOPF
 - Transfer capability workflows including NERC-style ATC
+- SCED and SCUC dispatch with reserve products, N-1 screening, and AC redispatch
+- Multi-stage market workflows (canonical DC SCUC → AC SCED) with GO C3 adapter
 - Node-breaker topology rebuild and mapping
 - Rust, CLI, and Python access to the same core analysis stack
 
@@ -110,6 +114,27 @@ maturin develop --release
 cd ../..
 python -c "import surge; print(surge.version())"
 ```
+
+For repository scripts and ad hoc debugging, prefer the repo launcher:
+
+```bash
+./py -c "import surge; print(surge.version())"
+./py markets/go_c3.py --help
+```
+
+`./py` always uses the repository `.venv` and fails loudly if `surge` has not
+been built into that environment yet.
+
+For rebuilding the Python extension, prefer the repo build launcher:
+
+```bash
+./py-build
+./py-build check
+```
+
+`./py-build` always uses the repository `.venv` `maturin` and, when
+`COPT_HOME` is configured, requires the packaged COPT NLP shim so the build
+fails fast instead of silently producing the wrong Python extension.
 
 If `COPT_HOME` points to a COPT 8.x install when the package is built, the
 Python package bundles the Surge COPT NLP shim into the wheel and configures it

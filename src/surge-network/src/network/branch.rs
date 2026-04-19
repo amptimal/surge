@@ -503,6 +503,38 @@ pub struct Branch {
     /// transformers without explicit magnetizing data.
     #[serde(default)]
     pub b_mag: f64,
+    /// From-terminal shunt conductance in per-unit.
+    ///
+    /// Optional asymmetric per-side shunt-to-ground component, added on top
+    /// of the symmetric `g_pi/2` split. Corresponds to GO Competition
+    /// Challenge 3 §4.8 `g^fr_j` (eqs 148, 150) when the branch has
+    /// `additional_shunt = 1`. Zero for lines without per-side data.
+    #[serde(default)]
+    pub g_shunt_from: f64,
+    /// From-terminal shunt susceptance in per-unit.
+    ///
+    /// Optional asymmetric per-side shunt-to-ground component, added on top
+    /// of the symmetric `b/2` charging split. Corresponds to GO Competition
+    /// Challenge 3 §4.8 `b^fr_j` (eq 149) when the branch has
+    /// `additional_shunt = 1`. Zero for lines without per-side data.
+    #[serde(default)]
+    pub b_shunt_from: f64,
+    /// To-terminal shunt conductance in per-unit.
+    ///
+    /// Optional asymmetric per-side shunt-to-ground component, added on top
+    /// of the symmetric `g_pi/2` split. Corresponds to GO Competition
+    /// Challenge 3 §4.8 `g^to_j` (eqs 148, 150) when the branch has
+    /// `additional_shunt = 1`. Zero for lines without per-side data.
+    #[serde(default)]
+    pub g_shunt_to: f64,
+    /// To-terminal shunt susceptance in per-unit.
+    ///
+    /// Optional asymmetric per-side shunt-to-ground component, added on top
+    /// of the symmetric `b/2` charging split. Corresponds to GO Competition
+    /// Challenge 3 §4.8 `b^to_j` (eq 151) when the branch has
+    /// `additional_shunt = 1`. Zero for lines without per-side data.
+    #[serde(default)]
+    pub b_shunt_to: f64,
     /// Long-term rating (MVA).
     pub rating_a_mva: f64,
     /// Short-term rating (MVA).
@@ -511,6 +543,29 @@ pub struct Branch {
     pub rating_c_mva: f64,
     /// Branch status (true = in service).
     pub in_service: bool,
+    /// Fixed cost ($) charged when the branch transitions from open to
+    /// closed (i.e. `u^on_jt = 1` after `u^on_j,t-1 = 0`).
+    ///
+    /// GO Competition Challenge 3 §4.4.6 eq (62) prices the startup variable
+    /// `u^su_jt` at `c^su_j` for all `j ∈ J^pr,cs,ac`, which includes AC
+    /// branch devices. Populated by the GO C3 adapter from the JSON
+    /// `connection_cost` field on `ac_line` and `two_winding_transformer`
+    /// records. Zero for non-GO datasets or branches without a declared
+    /// cost. Only consulted by SCUC when `allow_branch_switching = true`;
+    /// the default `AllowSwitching = 0` path pins the branch on/off columns.
+    #[serde(default)]
+    pub cost_startup: f64,
+    /// Fixed cost ($) charged when the branch transitions from closed to
+    /// open (i.e. `u^on_jt = 0` after `u^on_j,t-1 = 1`).
+    ///
+    /// GO Competition Challenge 3 §4.4.6 eq (63) prices the shutdown
+    /// variable `u^sd_jt` at `c^sd_j` for all `j ∈ J^pr,cs,ac`. Populated
+    /// by the GO C3 adapter from the JSON `disconnection_cost` field on
+    /// `ac_line` and `two_winding_transformer` records. Zero for non-GO
+    /// datasets or branches without a declared cost. Only consulted by
+    /// SCUC when `allow_branch_switching = true`.
+    #[serde(default)]
+    pub cost_shutdown: f64,
     /// Minimum phase angle difference across branch (from - to) in **radians**.
     ///
     /// Convention: all internal angle quantities are in radians.  IO parsers
@@ -577,10 +632,16 @@ impl Default for Branch {
             phase_shift_rad: 0.0,
             g_mag: 0.0,
             b_mag: 0.0,
+            g_shunt_from: 0.0,
+            b_shunt_from: 0.0,
+            g_shunt_to: 0.0,
+            b_shunt_to: 0.0,
             rating_a_mva: 0.0,
             rating_b_mva: 0.0,
             rating_c_mva: 0.0,
             in_service: true,
+            cost_startup: 0.0,
+            cost_shutdown: 0.0,
             angle_diff_min_rad: None,
             angle_diff_max_rad: None,
             branch_type: BranchType::Line,
@@ -636,6 +697,27 @@ impl BranchPowerFlowsPu {
     }
 }
 
+/// Operating regime under which a branch flow rating is being applied.
+///
+/// Different ratings apply in different conditions:
+/// - `Base`: long-term thermal rating (PSS/E `RATE_A`, MATPOWER column 6).
+///   Applied to base-case dispatch decisions.
+/// - `Contingency`: short-term rating (PSS/E `RATE_B`, MATPOWER column 7).
+///   Intermediate tier used by some pipelines when a distinct short-term
+///   rating is populated; falls back to `rating_a` otherwise.
+/// - `Emergency`: emergency / cascading-event rating (PSS/E `RATE_C`,
+///   MATPOWER column 8). GO Competition Challenge 3 §6 eq (271) maps
+///   `s^max,ctg_j → mva_ub_em → rating_c_mva`, so N-1 post-contingency
+///   screening and LODF cut limits should use `Emergency`. The fallback
+///   chain is `rating_c → rating_b → rating_a`, which keeps non-GO
+///   datasets that only populate a subset of the tiers working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BranchRatingCondition {
+    Base,
+    Contingency,
+    Emergency,
+}
+
 impl Branch {
     /// Effective tap ratio, normalizing MATPOWER's tap=0 convention to 1.0.
     ///
@@ -649,6 +731,39 @@ impl Branch {
         } else {
             self.tap
         }
+    }
+
+    /// Apparent-power rating (MVA) for the requested operating regime.
+    ///
+    /// Falls back through `Emergency → Contingency → Base` so that branches
+    /// which only carry a long-term `RATE_A` value still get a sensible
+    /// rating in contingency analysis. Datasets that explicitly populate
+    /// `RATE_B` / `RATE_C` get the tighter / looser limit they specify.
+    /// A return value of `0.0` means "no rating provided" — the caller is
+    /// responsible for treating that case as unconstrained or rejecting the
+    /// branch from screening.
+    #[inline]
+    pub fn rating_for(&self, condition: BranchRatingCondition) -> f64 {
+        let nonzero = |value: f64| (value > 0.0).then_some(value);
+        match condition {
+            BranchRatingCondition::Base => self.rating_a_mva,
+            BranchRatingCondition::Contingency => {
+                nonzero(self.rating_b_mva).unwrap_or(self.rating_a_mva)
+            }
+            BranchRatingCondition::Emergency => nonzero(self.rating_c_mva)
+                .or_else(|| nonzero(self.rating_b_mva))
+                .unwrap_or(self.rating_a_mva),
+        }
+    }
+
+    /// True if this branch carries non-zero switching transition costs,
+    /// indicating it is a candidate for on/off optimization when the
+    /// global `allow_branch_switching` flag is set. Branches without
+    /// transition costs are pinned to their static `in_service` state
+    /// even when the flag is `true`.
+    #[inline]
+    pub fn is_switchable(&self) -> bool {
+        self.cost_startup != 0.0 || self.cost_shutdown != 0.0
     }
 
     /// True if this branch is a transformer (non-unity tap or non-zero phase shift).
@@ -666,9 +781,23 @@ impl Branch {
     /// is below this value, the branch is treated as a low-impedance tie (gs = 1e6, bs = 0).
     /// Each call site passes its existing threshold to preserve exact current behavior.
     ///
-    /// The from-side self-admittance includes `g_pi/2` and `g_mag`/`b_mag` (transformer
-    /// magnetizing branch at winding-1). The to-side self-admittance includes `g_pi/2`
+    /// The from-side self-admittance includes `g_pi/2`, the asymmetric
+    /// `g_shunt_from`/`b_shunt_from` additions, and `g_mag`/`b_mag`
+    /// (transformer magnetizing branch at winding-1). The to-side
+    /// self-admittance includes `g_pi/2` and `g_shunt_to`/`b_shunt_to`
     /// but not the magnetizing terms.
+    ///
+    /// The asymmetric per-side shunts implement GO Competition Challenge 3
+    /// §4.8 eqs (148)-(151), where the from-terminal admittance-to-ground
+    /// is `(g^sr + g^fr_j) − j(b^sr + b^fr_j + b^ch_j/2)` and the
+    /// to-terminal admittance-to-ground is `(g^sr + g^to_j) − j(b^sr + b^to_j + b^ch_j/2)`.
+    /// The surge pi-model expresses this as `g_pi/2 + g_shunt_from` at
+    /// from and `g_pi/2 + g_shunt_to` at to (with analogous susceptance
+    /// splits); GO C3 branches store their symmetric `b^ch` in `b` and
+    /// the per-side deltas in `{g,b}_shunt_{from,to}`. Branches without
+    /// an `additional_shunt` field see the four per-side fields default
+    /// to zero and the admittance collapses to the classic symmetric
+    /// pi-model.
     #[inline]
     pub fn pi_model_admittances(&self, z_sq_tol: f64) -> (f64, f64, f64, f64, f64, f64, f64, f64) {
         let z_sq = self.r * self.r + self.x * self.x;
@@ -682,14 +811,14 @@ impl Branch {
         let tap_sq = tap * tap;
         let (cos_s, sin_s) = (self.phase_shift_rad.cos(), self.phase_shift_rad.sin());
 
-        let g_ff = (gs + self.g_pi / 2.0) / tap_sq + self.g_mag;
-        let b_ff = (bs + self.b / 2.0) / tap_sq + self.b_mag;
+        let g_ff = (gs + self.g_pi / 2.0 + self.g_shunt_from) / tap_sq + self.g_mag;
+        let b_ff = (bs + self.b / 2.0 + self.b_shunt_from) / tap_sq + self.b_mag;
         let g_ft = -(gs * cos_s - bs * sin_s) / tap;
         let b_ft = -(gs * sin_s + bs * cos_s) / tap;
         let g_tf = -(gs * cos_s + bs * sin_s) / tap;
         let b_tf = (gs * sin_s - bs * cos_s) / tap;
-        let g_tt = gs + self.g_pi / 2.0;
-        let b_tt = bs + self.b / 2.0;
+        let g_tt = gs + self.g_pi / 2.0 + self.g_shunt_to;
+        let b_tt = bs + self.b / 2.0 + self.b_shunt_to;
 
         (g_ff, b_ff, g_ft, b_ft, g_tf, b_tf, g_tt, b_tt)
     }

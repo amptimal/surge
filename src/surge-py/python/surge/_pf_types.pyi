@@ -22,7 +22,7 @@ class AcPfOptions:
     oltc: bool = True
     switched_shunts: bool = True
     oltc_max_iter: int = 20
-    distributed_slack: bool = False
+    distributed_slack: bool = True
     slack_participation: dict[int, float] | None = None
     enforce_interchange: bool = False
     interchange_max_iter: int = 10
@@ -30,7 +30,7 @@ class AcPfOptions:
     enforce_gen_p_limits: bool = True
     merge_zero_impedance: bool = False
     dc_warm_start: bool = True
-    startup_policy: str = "single"
+    startup_policy: str = "adaptive"
     q_sharing: str = "capability"
     warm_start: Any | None = None
     line_search: bool = True

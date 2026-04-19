@@ -49,6 +49,12 @@ jobs:
         env:
           RUST_LOG: warn
 
+      # The Python TypedDict mirror of DispatchRequest is auto-generated
+      # from the Rust schema. Fail CI if a Rust-side change wasn't paired
+      # with `make regen-schema`.
+      - name: Check DispatchRequest schema codegen is up-to-date
+        run: make check-schema
+
   # ---------------------------------------------------------------------------
   # Dependency audit
   # ---------------------------------------------------------------------------

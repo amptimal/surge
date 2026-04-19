@@ -589,6 +589,8 @@ fn decode_dc_opf_result(
             branch_shadow_prices,
             shadow_price_angmin,
             shadow_price_angmax,
+            thermal_limit_slack_from_mva: vec![],
+            thermal_limit_slack_to_mva: vec![],
             flowgate_shadow_prices,
             interface_shadow_prices,
             shadow_price_vm_min: vec![],
@@ -601,6 +603,20 @@ fn decode_dc_opf_result(
             svc_dispatch: vec![],
             tcsc_dispatch: vec![],
             storage_net_mw: vec![],
+            dispatchable_load_served_mw: vec![],
+            dispatchable_load_served_q_mvar: vec![],
+            // DC-OPF does not clear reactive reserves (no Q variables
+            // and no q-reserve rows); the AC reconcile path carries
+            // them.
+            producer_q_reserve_up_mvar: vec![],
+            producer_q_reserve_down_mvar: vec![],
+            consumer_q_reserve_up_mvar: vec![],
+            consumer_q_reserve_down_mvar: vec![],
+            zone_q_reserve_up_shortfall_mvar: vec![],
+            zone_q_reserve_down_shortfall_mvar: vec![],
+            // HVDC P2P as an NLP variable is AC-OPF-only; DC-OPF carries
+            // HVDC via `hvdc_dispatch_mw` on the top-level result.
+            hvdc_p2p_dispatch_mw: vec![],
             discrete_feasible: None,
             discrete_violations: vec![],
         },
@@ -611,10 +627,21 @@ fn decode_dc_opf_result(
         par_results,
         virtual_bid_results,
         benders_cut_duals: vec![],
+        objective_terms: vec![],
+        audit: Default::default(),
         solve_time_secs: solve_time,
         iterations: Some(sol.iterations),
         solver_name: Some(solver_name),
         solver_version: Some(solver_version),
+        ac_opf_timings: None,
+        bus_q_slack_pos_mvar: vec![],
+        bus_q_slack_neg_mvar: vec![],
+        bus_p_slack_pos_mw: vec![],
+        bus_p_slack_neg_mw: vec![],
+        vm_slack_high_pu: vec![],
+        vm_slack_low_pu: vec![],
+        angle_diff_slack_high_rad: vec![],
+        angle_diff_slack_low_rad: vec![],
     };
 
     DcOpfResult {
@@ -1490,6 +1517,8 @@ pub fn solve_dc_opf_lp_with_runtime(
             q_start: hessian.as_ref().map(|(q_start, _, _)| q_start.clone()),
             q_index: hessian.as_ref().map(|(_, q_index, _)| q_index.clone()),
             q_value: hessian.as_ref().map(|(_, _, q_value)| q_value.clone()),
+            col_names: None,
+            row_names: None,
             integrality: None,
         },
         n_var,
@@ -1575,6 +1604,7 @@ mod tests {
                 objective: 0.0,
                 status,
                 iterations: call as u32,
+                mip_trace: None,
             })
         }
 
@@ -2379,6 +2409,8 @@ mod tests {
             limit_mw_schedule: Vec::new(),
             limit_reverse_mw_schedule: Vec::new(),
             hvdc_coefficients: vec![],
+            hvdc_band_coefficients: vec![],
+            limit_mw_active_period: None,
         });
         // Slack flowgate with very high limit
         net.flowgates.push(Flowgate {
@@ -2393,6 +2425,8 @@ mod tests {
             limit_mw_schedule: Vec::new(),
             limit_reverse_mw_schedule: Vec::new(),
             hvdc_coefficients: vec![],
+            hvdc_band_coefficients: vec![],
+            limit_mw_active_period: None,
         });
         // Test 1: flowgate-only (no interfaces) — avoid redundant / infeasible constraints
         {

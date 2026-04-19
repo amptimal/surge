@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RTO · Surge Dashboard</title>
+<link rel="icon" type="image/svg+xml" href="static/favicon.svg?v=20260418">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="static/dashboard.css">
+</head>
+<body>
+
+<nav class="top-nav">
+  <a class="nav-logo" href="/">
+    <svg width="22" height="22" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <circle cx="256" cy="256" r="180" fill="none" stroke="#a78bfa" stroke-width="32"/>
+      <path d="M 60 380 Q 140 380, 200 200 Q 256 80, 312 200 Q 372 380, 452 380" fill="none" stroke="#a78bfa" stroke-width="32" stroke-linecap="round"/>
+    </svg>
+    <span class="nav-logo-name">AMPTIMAL</span>
+  </a>
+  <div class="nav-section-label">🌐 RTO Day-Ahead Market</div>
+  <div class="nav-right">
+    <a class="nav-link" href="/">← All dashboards</a>
+  </div>
+</nav>
+
+<div class="solve-bar">
+  <div class="mode-group">
+    <label>Case</label>
+    <select id="sel-case">
+      <option value="">— loading —</option>
+    </select>
+  </div>
+  <div class="network-summary" id="network-summary">—</div>
+  <div class="solve-bar-right">
+    <div id="solve-status" class="solve-status">ready</div>
+    <div class="scenario-actions">
+      <button id="btn-save-scenario" class="ghost-btn-sm" type="button" title="Export scenario JSON">save</button>
+      <input type="file" id="inp-load-scenario" accept=".json,application/json" hidden>
+      <button id="btn-load-scenario" class="ghost-btn-sm" type="button" title="Load a saved scenario">load</button>
+    </div>
+    <div class="prod-cost-wrap">
+      <div class="prod-cost-label">Production cost</div>
+      <div id="prod-cost" class="prod-cost">—</div>
+      <div class="prod-cost-sub" id="prod-cost-sub"></div>
+    </div>
+    <button id="btn-solve" class="solve-btn">▶ Solve</button>
+  </div>
+</div>
+
+<div id="error-banner" class="error-banner" role="alert" aria-live="polite">
+  <span class="error-banner-icon">⚠</span>
+  <span id="error-banner-text"></span>
+  <button id="error-banner-close" class="error-banner-close" aria-label="Dismiss">×</button>
+</div>
+
+<main class="shell">
+
+  <aside id="sidebar" class="sidebar">
+    <button class="sidebar-toggle" id="sidebar-toggle" title="Collapse sidebar" aria-label="Toggle configuration sidebar">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="15 18 9 12 15 6"></polyline>
+      </svg>
+    </button>
+    <div class="sidebar-collapsed-label">CONFIG</div>
+    <div class="sidebar-content">
+      <div class="sidebar-head">
+        <h2>Market setup</h2>
+        <div class="panel-note" id="case-note">—</div>
+      </div>
+      <div class="sidebar-body">
+
+        <!-- TIMELINE ──────────────────────────────────────────────── -->
+        <div class="config-section">
+          <div class="section-label">Timeline</div>
+          <div class="field-stack">
+            <label class="field-row"><span class="field-label">Start</span><input type="datetime-local" id="inp-start" step="60"></label>
+            <label class="field-row"><span class="field-label">Periods</span><input type="number" id="inp-periods" min="1" max="168" step="1"></label>
+            <label class="field-row"><span class="field-label">Resolution <em>min</em></span>
+              <select id="sel-resolution">
+                <option value="5">5</option>
+                <option value="15">15</option>
+                <option value="30">30</option>
+                <option value="60">60</option>
+              </select>
+            </label>
+          </div>
+        </div>
+
+        <!-- LOAD ─────────────────────────────────────────────────── -->
+        <div class="config-section">
+          <div class="section-label">Load</div>
+          <div class="field-stack">
+            <label class="field-row"><span class="field-label">Handling</span>
+              <select id="sel-load-handling">
+                <option value="fixed">Fixed</option>
+                <option value="dispatchable">Dispatchable</option>
+              </select>
+            </label>
+            <label class="field-row"><span class="field-label">Profile</span>
+              <select id="sel-load-profile">
+                <option value="flat">Flat</option>
+                <option value="duck">Duck</option>
+                <option value="peak">Evening peak</option>
+              </select>
+            </label>
+            <label class="field-row voll-row" id="voll-row"><span class="field-label">VOLL <em>$/MWh</em></span><input type="number" id="inp-voll" min="0" step="100"></label>
+          </div>
+          <div class="load-upload">
+            <input type="file" id="inp-load-csv" accept=".csv,text/csv" hidden>
+            <button type="button" class="ghost-btn-sm load-csv-btn" id="btn-load-csv">Upload load CSV</button>
+            <button type="button" class="ghost-btn-sm load-csv-clear" id="btn-load-csv-clear" hidden title="Clear custom profile">↺</button>
+          </div>
+          <div class="tiny-hint">
+            CSV header: <code>bus</code>, then one column per period <em>or</em> <code>bus</code>/<code>period</code>/<code>value_mw</code>.
+          </div>
+          <div class="csv-status" id="load-csv-status"></div>
+        </div>
+
+        <!-- OFFERS ───────────────────────────────────────────────── -->
+        <div class="config-section">
+          <div class="section-label">Generator offers</div>
+          <div class="field-stack">
+            <label class="field-row"><span class="field-label">Synthesis</span>
+              <select id="sel-offers-synthesis">
+                <option value="from_cost_coeffs">From cost coeffs (c1, c2)</option>
+                <option value="flat_tiered">Flat 3-tier</option>
+              </select>
+            </label>
+          </div>
+          <div class="offers-hint" id="offers-hint">—</div>
+          <div class="load-upload">
+            <input type="file" id="inp-offers-csv" accept=".csv,text/csv" hidden>
+            <button type="button" class="ghost-btn-sm load-csv-btn" id="btn-offers-csv">Upload offers CSV</button>
+            <button type="button" class="ghost-btn-sm load-csv-clear" id="btn-offers-csv-clear" hidden title="Clear uploaded offers">↺</button>
+          </div>
+          <div class="tiny-hint">
+            CSV header: <code>resource_id</code>, <code>mw_1</code>, <code>price_1</code>, <code>mw_2</code>, <code>price_2</code>, …
+          </div>
+          <div class="csv-status" id="offers-csv-status"></div>
+        </div>
+
+        <!-- RENEWABLES (only shown when case has renewable gens) ──── -->
+        <div class="config-section" id="renewables-section" hidden>
+          <div class="section-label">Renewables</div>
+          <div class="field-stack">
+            <label class="field-row"><span class="field-label">Profile</span>
+              <select id="sel-renewables-profile">
+                <option value="flat">Flat (Pmax)</option>
+                <option value="solar">Solar</option>
+                <option value="wind">Wind</option>
+              </select>
+            </label>
+          </div>
+          <div class="tiny-hint" id="renewables-hint">—</div>
+        </div>
+
+        <!-- RESERVES ──────────────────────────────────────────────── -->
+        <div class="config-section">
+          <div class="section-label">Reserves</div>
+          <div class="field-stack" id="reserves-stack">
+            <!-- four rows injected by JS -->
+          </div>
+          <div class="tiny-hint">Percent of system peak load. Override with absolute MW by editing the value field.</div>
+        </div>
+
+        <!-- POLICY (collapsible) ─────────────────────────────────── -->
+        <div class="config-section">
+          <div class="section-label">Policy</div>
+          <div class="field-stack">
+            <label class="field-row"><span class="field-label">Commitment</span>
+              <select id="sel-commitment">
+                <option value="optimize">Optimize (MIP)</option>
+                <option value="all_committed">All committed</option>
+                <option value="fixed_initial">Fixed initial</option>
+              </select>
+            </label>
+            <label class="field-row"><span class="field-label">LP solver</span>
+              <select id="sel-lp-solver">
+                <option value="highs">HiGHS</option>
+                <option value="gurobi">Gurobi</option>
+              </select>
+            </label>
+            <label class="field-row"><span class="field-label">MIP gap</span><input type="number" id="inp-mip-gap" min="0" step="0.0005"></label>
+            <label class="field-row"><span class="field-label">Run pricing</span>
+              <select id="sel-run-pricing">
+                <option value="true">On</option>
+                <option value="false">Off</option>
+              </select>
+            </label>
+          </div>
+          <details class="policy-advanced">
+            <summary>Advanced penalties</summary>
+            <div class="field-stack">
+              <label class="field-row"><span class="field-label">VOLL <em>$/MWh</em></span><input type="number" id="inp-voll-penalty" min="0" step="100"></label>
+              <label class="field-row"><span class="field-label">Thermal overload <em>$/MWh</em></span><input type="number" id="inp-thermal" min="0" step="100"></label>
+              <label class="field-row"><span class="field-label">Reserve shortfall <em>$/MWh</em></span><input type="number" id="inp-reserve-short" min="0" step="100"></label>
+              <label class="field-row"><span class="field-label">Time limit <em>s</em></span><input type="number" id="inp-time-limit" min="0" step="1" placeholder="unlimited"></label>
+            </div>
+          </details>
+        </div>
+
+      </div>
+    </div>
+  </aside>
+
+  <div class="main-area">
+
+    <!-- TAB BAR ────────────────────────────────────────────────── -->
+    <div class="results-tabs">
+      <button class="results-tab active" data-tab="summary">Summary</button>
+      <button class="results-tab" data-tab="grid">Grid</button>
+      <button class="results-tab" data-tab="lmps">LMPs</button>
+      <button class="results-tab" data-tab="generators">Generators</button>
+      <button class="results-tab" data-tab="loads">Loads</button>
+      <button class="results-tab" data-tab="reserves">Reserves</button>
+      <button class="results-tab" data-tab="violations">Violations</button>
+      <button class="results-tab" data-tab="log">Log</button>
+    </div>
+
+    <!-- PANELS ─────────────────────────────────────────────────── -->
+    <section class="results-pane" data-pane="summary">
+      <div class="summary-grid">
+        <div class="metric-card">
+          <div class="metric-label">Production cost</div>
+          <div class="metric-value" id="metric-production-cost">—</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Energy payment</div>
+          <div class="metric-value" id="metric-energy-payment">—</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Load payment</div>
+          <div class="metric-value" id="metric-load-payment">—</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Congestion rent</div>
+          <div class="metric-value" id="metric-congestion">—</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">AS payment</div>
+          <div class="metric-value" id="metric-as-payment">—</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Shortfall penalty</div>
+          <div class="metric-value" id="metric-shortfall">—</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Mean system LMP</div>
+          <div class="metric-value" id="metric-mean-lmp">—</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Peak system LMP</div>
+          <div class="metric-value" id="metric-peak-lmp">—</div>
+        </div>
+      </div>
+      <div class="summary-chart-wrap">
+        <div class="panel-head"><h2>System LMP aggregate <span class="panel-sub">min / mean / peak per period</span></h2></div>
+        <div id="summary-lmp-chart" class="chart-readonly"></div>
+      </div>
+    </section>
+
+    <section class="results-pane" data-pane="grid" hidden>
+      <div class="panel-head">
+        <h2>Network grid <span class="panel-sub">bus LMPs · selected period</span></h2>
+        <div class="grid-controls">
+          <label>Period
+            <input type="range" id="grid-period" min="0" max="0" step="1" value="0">
+            <span id="grid-period-label">—</span>
+          </label>
+          <label>
+            <input type="checkbox" id="grid-show-branches" checked>
+            edges
+          </label>
+          <label>
+            <input type="checkbox" id="grid-show-gens">
+            generators
+          </label>
+        </div>
+      </div>
+      <div id="grid-canvas" class="grid-canvas"></div>
+      <div id="grid-legend" class="grid-legend"></div>
+    </section>
+
+    <section class="results-pane" data-pane="lmps" hidden>
+      <div class="panel-head">
+        <h2>LMP heatmap <span class="panel-sub">buses × periods · $/MWh</span></h2>
+        <div class="lmp-controls">
+          <label>Filter bus
+            <input type="text" id="inp-lmp-filter" placeholder="e.g. 4 or 1,3,5">
+          </label>
+        </div>
+      </div>
+      <div id="lmp-heatmap" class="lmp-heatmap"></div>
+      <div id="lmp-lines" class="lmp-lines"></div>
+    </section>
+
+    <section class="results-pane" data-pane="generators" hidden>
+      <div class="panel-head">
+        <h2>Generator dispatch <span class="panel-sub">stacked MW · fuel mix by period</span></h2>
+        <div class="gen-controls">
+          <label>Sort by
+            <select id="sel-gen-sort">
+              <option value="revenue">Revenue</option>
+              <option value="mw">Dispatched MWh</option>
+              <option value="bus">Bus</option>
+              <option value="id">Resource ID</option>
+            </select>
+          </label>
+        </div>
+      </div>
+      <div id="gen-stack" class="gen-stack"></div>
+      <div id="gen-table" class="gen-table"></div>
+    </section>
+
+    <section class="results-pane" data-pane="loads" hidden>
+      <div class="panel-head">
+        <h2>Load profile <span class="panel-sub">bus × period MW</span></h2>
+      </div>
+      <div id="load-chart" class="chart-readonly"></div>
+      <div id="load-table" class="load-table"></div>
+    </section>
+
+    <section class="results-pane" data-pane="reserves" hidden>
+      <div class="panel-head">
+        <h2>Reserve awards <span class="panel-sub">MW × clearing price by product</span></h2>
+      </div>
+      <div id="reserves-grid" class="reserves-grid"></div>
+    </section>
+
+    <section class="results-pane" data-pane="violations" hidden>
+      <div class="panel-head">
+        <h2>Violations <span class="panel-sub">thermal overloads · load shed · over-generation</span></h2>
+      </div>
+      <div id="violations-body" class="violations-body"></div>
+    </section>
+
+    <section class="results-pane" data-pane="log" hidden>
+      <div class="panel-head">
+        <h2>Run log <span class="panel-sub">Python-side messages emitted during the solve</span></h2>
+        <div class="log-controls">
+          <button type="button" class="ghost-btn-sm" id="btn-log-copy">copy</button>
+        </div>
+      </div>
+      <pre id="run-log" class="run-log">—</pre>
+    </section>
+
+  </div>
+
+</main>
+
+<script src="static/dashboard.js"></script>
+</body>
+</html>

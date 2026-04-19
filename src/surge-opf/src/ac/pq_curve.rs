@@ -19,26 +19,95 @@
 //! These are added as rows appended after the existing NLP constraints.  The
 //! Jacobian entries are constants (slopes) and therefore trivial to assemble.
 
+use surge_network::market::DispatchableLoad;
 use surge_network::network::Generator;
 use tracing::debug;
 
-/// A single linearized D-curve constraint segment.
+/// Which device family a [`PqConstraint`] row applies to.
 ///
-/// Represents one inequality from the piecewise-linear D-curve:
-/// `lhs_lb ≤ qg - slope * pg ≤ lhs_ub`
+/// Producer rows read `(Pg, Qg)` at `gen_local`; consumer rows read
+/// `(dl_var, dl_q_var)` at `device_local`. The sparsity pattern and
+/// residual formula are otherwise identical, so both families share the
+/// same row builder in [`super::problem::AcOpfProblem`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PqDeviceKind {
+    /// Producer device — maps into the `gen_indices` table. Uses
+    /// `pg_var(j)` / `qg_var(j)` accessors.
+    Producer,
+    /// Consumer device — maps into the dispatchable-load table. Uses
+    /// `dl_var(k)` / `dl_q_var(k)` accessors.
+    Consumer,
+}
+
+/// A single linearized D-curve or linear-link constraint row.
 ///
-/// where `lhs_lb` and `lhs_ub` may be `f64::NEG_INFINITY` or `f64::INFINITY`
-/// for one-sided constraints.
+/// Represents one inequality of the shape
+///
+/// ```text
+/// lhs_lb ≤ q_device − slope · p_device + reserve_sign · q_reserve ≤ lhs_ub
+/// ```
+///
+/// where
+///   * `(p_device, q_device)` are `(Pg, Qg)` for producers and
+///     `(dl_var, dl_q_var)` for consumers (see [`PqDeviceKind`]),
+///   * `lhs_lb`/`lhs_ub` may be `f64::NEG_INFINITY` or `f64::INFINITY`
+///     for one-sided constraints, and
+///   * the optional q-reserve term couples reactive reserves into
+///     the p-q row; it is absent (`q_reserve_var = None`,
+///     `q_reserve_sign = 0.0`) for the pure D-curve / linear-link
+///     rows that do not carry a reactive-reserve headroom constraint.
 #[derive(Debug, Clone)]
 pub struct PqConstraint {
-    /// Local (OPF-internal) generator index.
-    pub gen_local: usize,
-    /// Slope: dQmax/dP or dQmin/dP for the segment (in per-unit).
+    /// Device family this row applies to.
+    pub kind: PqDeviceKind,
+    /// Local device index into the appropriate mapping table:
+    /// `gen_indices` for [`PqDeviceKind::Producer`] or the
+    /// dispatchable-load slice for [`PqDeviceKind::Consumer`].
+    pub device_local: usize,
+    /// Slope: `dQ/dP` for the constraint (in per-unit). `0.0` for the
+    /// flat headroom rows (eqs 112-113, 122-123).
     pub slope: f64,
-    /// Lower bound on `Qg - slope * Pg` (NEG_INFINITY if upper-only).
+    /// Lower bound on the LHS (`NEG_INFINITY` if upper-only).
     pub lhs_lb: f64,
-    /// Upper bound on `Qg - slope * Pg` (INFINITY if lower-only).
+    /// Upper bound on the LHS (`INFINITY` if lower-only).
     pub lhs_ub: f64,
+    /// Optional q-reserve column index coupling into this row via
+    /// `reserve_sign · q_reserve`. `None` for pure D-curve or linear-link
+    /// rows with no reactive-reserve headroom coupling.
+    pub q_reserve_var: Option<usize>,
+    /// Sign applied to the q-reserve term: `+1.0` for upper-bound rows
+    /// (the reserve variable eats into headroom to `qmax`), `-1.0` for
+    /// lower-bound rows (reserve eats into footroom to `qmin`), `0.0`
+    /// when `q_reserve_var` is `None`.
+    pub q_reserve_sign: f64,
+}
+
+impl PqConstraint {
+    /// Shorthand constructor for a producer row with no q-reserve coupling.
+    pub fn producer(gen_local: usize, slope: f64, lhs_lb: f64, lhs_ub: f64) -> Self {
+        Self {
+            kind: PqDeviceKind::Producer,
+            device_local: gen_local,
+            slope,
+            lhs_lb,
+            lhs_ub,
+            q_reserve_var: None,
+            q_reserve_sign: 0.0,
+        }
+    }
+
+    /// Shorthand constructor for a consumer row with no q-reserve coupling.
+    pub fn consumer(dl_local: usize, slope: f64, lhs_lb: f64, lhs_ub: f64) -> Self {
+        Self {
+            kind: PqDeviceKind::Consumer,
+            device_local: dl_local,
+            slope,
+            lhs_lb,
+            lhs_ub,
+            q_reserve_var: None,
+            q_reserve_sign: 0.0,
+        }
+    }
 }
 
 /// Build all linearized D-curve constraints for the generators with non-empty
@@ -106,23 +175,163 @@ pub fn build_pq_constraints(
             // pq_curve values are already in per-unit; no base_mva conversion needed.
             let slope_max = (qmax2 - qmax1) / dp;
             let rhs_max = qmax1 - slope_max * p1;
-            constraints.push(PqConstraint {
-                gen_local: local_idx,
-                slope: slope_max,
-                lhs_lb: f64::NEG_INFINITY,
-                lhs_ub: rhs_max,
-            });
+            constraints.push(PqConstraint::producer(
+                local_idx,
+                slope_max,
+                f64::NEG_INFINITY,
+                rhs_max,
+            ));
 
             // Lower D-curve: Qg ≥ qmin1 + slope_min*(Pg - p1)
             // → qmin1 - slope_min*p1 ≤ Qg - slope_min*Pg
             let slope_min = (qmin2 - qmin1) / dp;
             let rhs_min = qmin1 - slope_min * p1;
-            constraints.push(PqConstraint {
-                gen_local: local_idx,
-                slope: slope_min,
-                lhs_lb: rhs_min,
-                lhs_ub: f64::INFINITY,
-            });
+            constraints.push(PqConstraint::producer(
+                local_idx,
+                slope_min,
+                rhs_min,
+                f64::INFINITY,
+            ));
+        }
+    }
+
+    constraints
+}
+
+/// Build linear p-q linking constraints for producers.
+///
+/// These are CONCEPTUALLY distinct from the piecewise-linear D-curve
+/// in [`build_pq_constraints`] (which models a sampled `(p, qmax,
+/// qmin)` envelope) but PHYSICALLY they share the same row form
+/// `Qg − slope·Pg ∈ [lhs_lb, lhs_ub]`. We reuse [`PqConstraint`] so
+/// the downstream NLP residual / Jacobian / sparsity machinery does
+/// not need to know there are two distinct sources of these rows.
+///
+/// For each generator with `pq_linear_*` set:
+///   * `pq_linear_equality { q0, β }` produces ONE row with
+///     `lhs_lb = lhs_ub = q0`.
+///   * `pq_linear_upper { q0_ub, β_ub }` produces ONE row with
+///     `lhs_lb = -∞`, `lhs_ub = q0_ub` (the q-reserve coupling lands
+///     separately when reactive reserves are active).
+///   * `pq_linear_lower { q0_lb, β_lb }` produces ONE row with
+///     `lhs_lb = q0_lb`, `lhs_ub = +∞`.
+///
+/// All values are interpreted in the device's per-unit basis.
+pub fn build_pq_linear_constraints(
+    gen_indices: &[usize],
+    generators: &[Generator],
+) -> Vec<PqConstraint> {
+    let mut constraints = Vec::new();
+    let n_with_link = gen_indices
+        .iter()
+        .filter(|&&gi| {
+            generators[gi]
+                .reactive_capability
+                .as_ref()
+                .is_some_and(|r| {
+                    r.pq_linear_equality.is_some()
+                        || r.pq_linear_upper.is_some()
+                        || r.pq_linear_lower.is_some()
+                })
+        })
+        .count();
+    debug!(
+        generators = gen_indices.len(),
+        with_pq_linear = n_with_link,
+        "Building linear p-q linking constraints"
+    );
+
+    for (local_idx, &gi) in gen_indices.iter().enumerate() {
+        let g = &generators[gi];
+        let Some(rc) = g.reactive_capability.as_ref() else {
+            continue;
+        };
+
+        if let Some(eq) = rc.pq_linear_equality.as_ref() {
+            // Eq 116: q = q0 + β·p ⇒ Qg − β·Pg = q0
+            constraints.push(PqConstraint::producer(
+                local_idx,
+                eq.beta,
+                eq.q_at_p_zero_pu,
+                eq.q_at_p_zero_pu,
+            ));
+        }
+        if let Some(up) = rc.pq_linear_upper.as_ref() {
+            // Eq 114: q ≤ q0 + β·p ⇒ Qg − β·Pg ≤ q0
+            constraints.push(PqConstraint::producer(
+                local_idx,
+                up.beta,
+                f64::NEG_INFINITY,
+                up.q_at_p_zero_pu,
+            ));
+        }
+        if let Some(lo) = rc.pq_linear_lower.as_ref() {
+            // Eq 115: q ≥ q0 + β·p ⇒ Qg − β·Pg ≥ q0
+            constraints.push(PqConstraint::producer(
+                local_idx,
+                lo.beta,
+                lo.q_at_p_zero_pu,
+                f64::INFINITY,
+            ));
+        }
+    }
+
+    constraints
+}
+
+/// Build the linear p-q linking constraints for dispatchable-load
+/// (consumer) devices — the consumer analogue of
+/// [`build_pq_linear_constraints`].
+///
+/// The row form is identical to the producer case
+/// (`q − slope·p ∈ [lhs_lb, lhs_ub]`) but the device-local index maps into
+/// the dispatchable-load slice supplied by the caller. The rows share the
+/// same downstream NLP residual / Jacobian / sparsity machinery as the
+/// producer D-curve rows because [`PqConstraint`] carries the device
+/// family on its [`PqDeviceKind`] field.
+pub fn build_pq_linear_constraints_consumers(loads: &[&DispatchableLoad]) -> Vec<PqConstraint> {
+    let mut constraints = Vec::new();
+    let n_with_link = loads
+        .iter()
+        .filter(|dl| {
+            dl.pq_linear_equality.is_some()
+                || dl.pq_linear_upper.is_some()
+                || dl.pq_linear_lower.is_some()
+        })
+        .count();
+    debug!(
+        consumers = loads.len(),
+        with_pq_linear = n_with_link,
+        "Building consumer linear p-q linking constraints"
+    );
+
+    for (local_idx, dl) in loads.iter().enumerate() {
+        if let Some(eq) = dl.pq_linear_equality.as_ref() {
+            // Eq 126: q = q0 + β·p ⇒ q − β·p = q0
+            constraints.push(PqConstraint::consumer(
+                local_idx,
+                eq.beta,
+                eq.q_at_p_zero_pu,
+                eq.q_at_p_zero_pu,
+            ));
+        }
+        if let Some(up) = dl.pq_linear_upper.as_ref() {
+            // Eq 124: q ≤ q0 + β·p ⇒ q − β·p ≤ q0
+            constraints.push(PqConstraint::consumer(
+                local_idx,
+                up.beta,
+                f64::NEG_INFINITY,
+                up.q_at_p_zero_pu,
+            ));
+        }
+        if let Some(lo) = dl.pq_linear_lower.as_ref() {
+            // Eq 125: q ≥ q0 + β·p ⇒ q − β·p ≥ q0
+            constraints.push(PqConstraint::consumer(
+                local_idx,
+                lo.beta,
+                lo.q_at_p_zero_pu,
+                f64::INFINITY,
+            ));
         }
     }
 
@@ -148,8 +357,9 @@ pub fn eval_pq_constraints(
     g: &mut [f64],
     offset: usize,
 ) {
+    // Test helper only — producer-side rows without q-reserve coupling.
     for (ci, c) in pq_constraints.iter().enumerate() {
-        let j = c.gen_local;
+        let j = c.device_local;
         g[offset + ci] = qg[j] - c.slope * pg[j];
     }
 }

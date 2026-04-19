@@ -92,6 +92,10 @@ impl Default for LccConverterTerminal {
 /// computed from `setvl`/`vschd` and injected as constant PQ at the
 /// converter buses. With `SequentialAcDc`, the AC/DC operating point is
 /// iterated to convergence.
+///
+/// When `p_dc_min_mw < p_dc_max_mw` the link exposes an optimization
+/// variable rather than a fixed setpoint — used by the joint AC-DC OPF
+/// path (`build_hvdc_p2p_nlp_data`) to put HVDC P into the NLP.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LccHvdcLink {
     /// Name / identifier of the DC link.
@@ -122,6 +126,22 @@ pub struct LccHvdcLink {
     pub rectifier: LccConverterTerminal,
     /// Inverter terminal (DC → AC bus).
     pub inverter: LccConverterTerminal,
+    /// Minimum DC power setpoint in MW for joint AC-DC OPF.
+    ///
+    /// When `p_dc_min_mw < p_dc_max_mw`, the joint AC-DC OPF will treat
+    /// this link's DC power as a decision variable bounded in
+    /// `[p_dc_min_mw, p_dc_max_mw]` rather than using the fixed
+    /// `scheduled_setpoint`. Default `0.0` (no variable range → fall back
+    /// to the sequential-iteration path with a fixed setpoint).
+    #[serde(default)]
+    pub p_dc_min_mw: f64,
+    /// Maximum DC power setpoint in MW for joint AC-DC OPF.
+    ///
+    /// When `p_dc_min_mw < p_dc_max_mw`, the joint AC-DC OPF will treat
+    /// this link's DC power as a decision variable bounded in
+    /// `[p_dc_min_mw, p_dc_max_mw]`. Default `0.0`.
+    #[serde(default)]
+    pub p_dc_max_mw: f64,
 }
 
 impl Default for LccHvdcLink {
@@ -141,6 +161,17 @@ impl Default for LccHvdcLink {
             ac_dc_iteration_acceleration: 1.0,
             rectifier: LccConverterTerminal::default(),
             inverter: LccConverterTerminal::default(),
+            p_dc_min_mw: 0.0,
+            p_dc_max_mw: 0.0,
         }
+    }
+}
+
+impl LccHvdcLink {
+    /// Returns `true` when the joint AC-DC OPF should treat this link's
+    /// DC power as an NLP decision variable (i.e. `[p_dc_min_mw,
+    /// p_dc_max_mw]` is a non-degenerate interval).
+    pub fn has_variable_p_dc(&self) -> bool {
+        self.p_dc_min_mw < self.p_dc_max_mw
     }
 }

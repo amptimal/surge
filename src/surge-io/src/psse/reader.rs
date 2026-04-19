@@ -2417,6 +2417,11 @@ fn parse_dc_line_section(
             ac_dc_iteration_acceleration: cccacc,
             rectifier,
             inverter,
+            // PSS/E raw data doesn't carry a variable-P range; leave at 0/0
+            // so the link is treated as fixed at `scheduled_setpoint` by the
+            // joint AC-DC OPF (caller can set a range later if wanted).
+            p_dc_min_mw: 0.0,
+            p_dc_max_mw: 0.0,
         });
     }
 

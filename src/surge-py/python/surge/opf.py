@@ -24,6 +24,10 @@ from ._opf_types import (
     ThermalRating,
 )
 
+# Native Benders subproblem result class re-exported from this facade so
+# downstream importers can reach it via `from surge.opf import ...`.
+AcOpfBendersSubproblemResult = _native.AcOpfBendersSubproblemResult
+
 
 def _require_instance(name: str, value: object | None, expected_type: type[object]) -> object:
     if value is None:
@@ -218,6 +222,71 @@ def solve_ac_opf(
     return AcOpfResult(_native.solve_ac_opf(network, **kwargs))
 
 
+def solve_ac_opf_subproblem(
+    network,
+    fixed_p_mw: dict[str, float],
+    *,
+    tolerance: float = 1e-8,
+    max_iterations: int = 0,
+    exact_hessian: bool = True,
+    nlp_solver: str | None = None,
+    print_level: int = 0,
+    enforce_thermal_limits: bool = True,
+    thermal_limit_slack_penalty_per_mva: float = 1.0e4,
+    bus_active_power_balance_slack_penalty_per_mw: float = 1.0e4,
+    bus_reactive_power_balance_slack_penalty_per_mvar: float = 1.0e4,
+    min_rate_a: float = 1.0,
+    enforce_angle_limits: bool = False,
+    enforce_capability_curves: bool = True,
+    include_hvdc: bool | None = None,
+    dt_hours: float = 1.0,
+):
+    """Solve an AC OPF with selected generators pinned to caller-supplied MW targets.
+
+    The subproblem returns a ``AcOpfBendersSubproblemResult`` with:
+
+    - ``opf``: full AC-OPF solution (with Vm/Va/Qg) at the fixed operating
+      point.
+    - ``slack_cost_dollars_per_hour``: aggregate cost of any soft-penalty
+      violations (thermal slack, bus balance slack, ...) incurred to keep
+      the dispatch feasible against AC physics.
+    - ``slack_marginal_by_id``: per-resource-id marginal of that slack cost
+      with respect to the fixed ``Pg`` target, in ``$/MW-hr``. These are the
+      Benders cut coefficients for the SCED master:
+
+          η[t] ≥ slack_cost + Σ_g λ_g · (Pg[g,t] − P̃g_g)
+
+    ``fixed_p_mw`` is keyed by stable generator id (string) so callers can
+    track resources across network re-builds; out-of-service or unknown ids
+    are handled gracefully.
+
+    The subproblem defaults to **finite** bus-balance and thermal slack
+    penalties (``1e4 $/MW`` and ``1e4 $/MVAr``) so it is *always feasible*:
+    infeasibility manifests as a large ``slack_cost``, which is exactly the
+    quantity the master Benders cut needs to bound ``η[t]`` from below.
+    Callers who want hard constraints can pass zero slack penalties
+    explicitly.
+    """
+    return _native.solve_ac_opf_subproblem(
+        network,
+        fixed_p_mw,
+        tolerance=tolerance,
+        max_iterations=max_iterations,
+        exact_hessian=exact_hessian,
+        nlp_solver=nlp_solver,
+        print_level=print_level,
+        enforce_thermal_limits=enforce_thermal_limits,
+        thermal_limit_slack_penalty_per_mva=thermal_limit_slack_penalty_per_mva,
+        bus_active_power_balance_slack_penalty_per_mw=bus_active_power_balance_slack_penalty_per_mw,
+        bus_reactive_power_balance_slack_penalty_per_mvar=bus_reactive_power_balance_slack_penalty_per_mvar,
+        min_rate_a=min_rate_a,
+        enforce_angle_limits=enforce_angle_limits,
+        enforce_capability_curves=enforce_capability_curves,
+        include_hvdc=include_hvdc,
+        dt_hours=dt_hours,
+    )
+
+
 def solve_scopf(
     network,
     options: ScopfOptions | None = None,
@@ -252,7 +321,9 @@ __all__ = [
     "ScopfScreeningPolicy",
     "ScopfOptions",
     "ThermalRating",
+    "AcOpfBendersSubproblemResult",
     "solve_ac_opf",
+    "solve_ac_opf_subproblem",
     "solve_dc_opf",
     "solve_scopf",
 ]

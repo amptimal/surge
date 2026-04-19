@@ -111,6 +111,7 @@ pub(crate) fn solve_ac_preventive_with_context(
                 nlp_solver: context.runtime.nlp_solver.clone(),
                 warm_start: last_opf.as_ref().map(WarmStart::from_opf),
                 use_dc_opf_warm_start: None,
+                ..Default::default()
             },
             benders_cuts: accumulated_cuts.clone(),
         };

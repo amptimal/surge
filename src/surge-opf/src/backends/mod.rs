@@ -41,6 +41,8 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
+use serde::{Deserialize, Serialize};
+
 pub use crate::nlp::{NlpOptions, NlpProblem, NlpSolution};
 
 // Submodule declarations — each implements one solver backend.
@@ -57,6 +59,7 @@ pub mod gurobi;
 pub mod highs;
 /// Ipopt open-source NLP backend (default for AC-OPF).
 pub mod ipopt;
+pub mod reduce;
 
 // ---------------------------------------------------------------------------
 // LP/QP/MIP types
@@ -105,6 +108,10 @@ pub struct SparseProblem {
     pub q_start: Option<Vec<i32>>,
     pub q_index: Option<Vec<i32>>,
     pub q_value: Option<Vec<f64>>,
+    /// Optional human-readable variable names aligned with columns.
+    pub col_names: Option<Vec<String>>,
+    /// Optional human-readable constraint names aligned with rows.
+    pub row_names: Option<Vec<String>>,
     /// Variable domains (None = pure LP/QP with all-continuous variables).
     pub integrality: Option<Vec<VariableDomain>>,
 }
@@ -149,6 +156,415 @@ pub struct LpResult {
     pub status: LpSolveStatus,
     /// Number of solver iterations.
     pub iterations: u32,
+    /// MIP progress trace. Populated when the solve was a MIP, the caller
+    /// passed `LpOptions::mip_gap_schedule = Some(..)`, and the backend
+    /// supports progress callbacks. `None` otherwise — including for LP
+    /// solves, backends without callback support, and MIP solves where no
+    /// schedule was supplied.
+    pub mip_trace: Option<MipTrace>,
+}
+
+/// Time-varying MIP gap target: piecewise-constant "by time `t_secs` from solve
+/// start, the caller will accept an optimality gap of `gap`".
+///
+/// The schedule is evaluated as a step function over entries sorted by
+/// `t_secs`. At solve time `t`, the target gap is the `gap` of the latest
+/// entry whose `t_secs <= t`. Before the first entry the schedule provides
+/// no target (i.e. the solver keeps going). Once the solver finds an
+/// incumbent whose gap is within the current target, solver-specific
+/// callback machinery (see [`MipProgressMonitor`]) terminates the solve.
+///
+/// The schedule is solver-agnostic: each backend that supports MIP progress
+/// callbacks (Gurobi first, HiGHS to follow) hooks its callback into the
+/// shared [`MipProgressMonitor`].
+///
+/// Typical use: front-load a tight gap for the first few seconds, loosen
+/// it as time runs out. Example:
+/// ```ignore
+/// MipGapSchedule::new(vec![
+///     (0.0,  1e-5),  // first 10s: prove near-optimal
+///     (10.0, 1e-4),  //  10-20s: 0.01% gap
+///     (20.0, 1e-3),  //  20-30s: 0.1% gap
+///     (30.0, 1e-2),  //  30-45s: 1% gap
+///     (45.0, 1e-1),  //  45s+:   accept 10% gap as safety net
+/// ])
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MipGapSchedule {
+    /// Breakpoints `(t_secs, gap)` sorted by `t_secs` ascending.
+    /// All `t_secs >= 0` and all `gap >= 0`; constructed via `new` which
+    /// sorts and validates.
+    pub breakpoints: Vec<(f64, f64)>,
+}
+
+impl MipGapSchedule {
+    /// Construct and validate. Entries are sorted by `t_secs` ascending.
+    /// Returns `Err` when the list is empty or contains a non-finite /
+    /// negative entry. Duplicate `t_secs` values are allowed (last one wins
+    /// in ties).
+    pub fn new(mut breakpoints: Vec<(f64, f64)>) -> Result<Self, String> {
+        if breakpoints.is_empty() {
+            return Err("MipGapSchedule requires at least one breakpoint".to_string());
+        }
+        for (t, g) in &breakpoints {
+            if !t.is_finite() || *t < 0.0 {
+                return Err(format!("MipGapSchedule: invalid time_secs={t}"));
+            }
+            if !g.is_finite() || *g < 0.0 {
+                return Err(format!("MipGapSchedule: invalid gap={g}"));
+            }
+        }
+        breakpoints.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("finite t_secs"));
+        Ok(Self { breakpoints })
+    }
+
+    /// Target gap at wall time `t_secs`. Returns `None` before the first
+    /// entry's `t_secs` (caller keeps solving).
+    pub fn target_at(&self, t_secs: f64) -> Option<f64> {
+        let mut target = None;
+        for (bt, bg) in &self.breakpoints {
+            if *bt <= t_secs {
+                target = Some(*bg);
+            } else {
+                break;
+            }
+        }
+        target
+    }
+
+    /// Largest gap any step of the schedule ever accepts.
+    ///
+    /// Not safe to pass as the solver's static `MIPGap` — doing so would
+    /// let the solver auto-terminate at the *loosest* gap the schedule
+    /// contemplates, which almost always fires long before the
+    /// callback's tighter early targets can. Use [`Self::min_gap`] for
+    /// the static safety net.
+    pub fn max_gap(&self) -> f64 {
+        self.breakpoints
+            .iter()
+            .map(|(_, g)| *g)
+            .fold(0.0_f64, f64::max)
+    }
+
+    /// Tightest gap any step of the schedule ever requires — the correct
+    /// floor for the solver's static `MIPGap` parameter.
+    ///
+    /// Rationale: the progress callback enforces the schedule (tight
+    /// early, looser later) by calling `GRBterminate` when the current
+    /// gap is within the target at wall time `t`. The solver's own
+    /// `MIPGap` check runs on every node / incumbent update and races
+    /// the callback. Setting `MIPGap = max_gap` would let the solver
+    /// auto-exit at the loosest target the schedule will ever accept
+    /// (e.g., 10 %) well before the callback's tight early target
+    /// (e.g., 1e-5 at t=0) can fire. Setting `MIPGap = min_gap`
+    /// restricts the solver's auto-termination to gaps the callback
+    /// would also approve at the very start of the schedule — a true
+    /// fallback rather than a short-circuit. `TimeLimit` remains the
+    /// absolute wall.
+    pub fn min_gap(&self) -> f64 {
+        self.breakpoints
+            .iter()
+            .map(|(_, g)| *g)
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// Time (seconds) of the latest breakpoint.
+    pub fn final_deadline_secs(&self) -> f64 {
+        self.breakpoints.last().map(|(t, _)| *t).unwrap_or_default()
+    }
+}
+
+/// Kind of a recorded [`MipEvent`]. Used for downstream reporting; not
+/// consumed by the solver itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MipEventKind {
+    /// Callback observed a strictly better incumbent than the last tick.
+    NewIncumbent,
+    /// Callback observed a strictly tighter best bound than the last tick.
+    BoundImproved,
+    /// Wall time crossed a schedule breakpoint (target gap loosened).
+    BreakpointCrossed,
+    /// Caller requested solver termination because the current gap met
+    /// the scheduled target. This is always the last event in a successful
+    /// trace.
+    ScheduleTerminate,
+}
+
+/// One observation from the MIP progress callback. See [`MipTrace`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MipEvent {
+    /// Seconds from solve start.
+    pub t_secs: f64,
+    /// Best known primal objective at the callback.
+    pub incumbent_obj: f64,
+    /// Best known dual bound at the callback.
+    pub best_bound: f64,
+    /// Computed relative gap = `|incumbent - bound| / (|incumbent| + 1e-10)`.
+    pub gap: f64,
+    /// Target gap from the schedule at this wall time. `NaN` when the
+    /// schedule has not yet started (no entry with `t_secs <= event.t`).
+    pub target_gap: f64,
+    /// What triggered the event.
+    pub kind: MipEventKind,
+}
+
+/// How the MIP solve terminated, captured for downstream reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MipTerminationReason {
+    /// Solver proved optimality (or equivalent native-status optimal).
+    Optimal,
+    /// Our callback tripped `GRBterminate` / equivalent because the
+    /// current gap met the scheduled target.
+    ScheduleGap,
+    /// Solver hit its own wall-clock time limit.
+    TimeLimit,
+    /// Solver reported infeasibility.
+    Infeasible,
+    /// Anything else (including sub-optimal without schedule, solver
+    /// errors). Callers inspect `LpResult::status` for the precise code.
+    Other,
+}
+
+/// Trace + post-solve telemetry for a MIP solve.
+///
+/// Populated by MIP-capable backends on every MIP solve. The progress-
+/// event stream (`events`) and the echoed `schedule` are only filled in
+/// when the caller supplied a [`MipGapSchedule`] and the backend supports
+/// progress callbacks (Gurobi today). Size/node/gap stats are filled in
+/// unconditionally when the backend has them available; LP-only solves
+/// and backends that can't report stats leave `LpResult::mip_trace =
+/// None`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MipTrace {
+    /// The schedule the caller supplied; echoed so the trace is
+    /// self-describing in reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<MipGapSchedule>,
+    /// Hard wall-clock time limit the solver was given, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_limit_secs: Option<f64>,
+    /// Final relative gap at termination; `None` when no incumbent was
+    /// found before termination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_gap: Option<f64>,
+    /// Seconds from solve start to termination.
+    pub final_time_secs: f64,
+    /// How the solve ended.
+    pub terminated_by: MipTerminationReason,
+    /// All recorded callback events in order. Empty when no schedule
+    /// was supplied or the backend does not support progress callbacks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<MipEvent>,
+    /// Original-model (pre-presolve) variable count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_vars: Option<u64>,
+    /// Original-model binary variable count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_bin_vars: Option<u64>,
+    /// Binary variables already pinned by tight bounds before the
+    /// solve starts (col_lower == col_upper on a Binary column).
+    /// These contribute to `n_bin_vars` but Gurobi's presolve
+    /// removes them — the "free" binary count Gurobi actually
+    /// branches on is `n_bin_vars - pre_fixed_bin_vars`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_fixed_bin_vars: Option<u64>,
+    /// Original-model integer (incl. binary) variable count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_int_vars: Option<u64>,
+    /// Original-model constraint count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_rows: Option<u64>,
+    /// Original-model A-matrix nonzero count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_nonzeros: Option<u64>,
+    /// Branch-and-bound nodes explored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_count: Option<u64>,
+    /// Simplex (or barrier) iterations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iter_count: Option<u64>,
+    /// Final incumbent objective.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective: Option<f64>,
+    /// Final best bound (dual bound).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective_bound: Option<f64>,
+}
+
+/// Solver-agnostic progress monitor.
+///
+/// Each supporting backend wraps its native progress callback around
+/// [`Self::tick`], which records events and decides whether the solve
+/// should be terminated early. The monitor is consumed at solve end via
+/// [`Self::into_trace`] to produce the reportable [`MipTrace`].
+///
+/// Not `Send`/`Sync` by design: the pointer to a `MipProgressMonitor` is
+/// handed to the solver library through an `extern "C"` callback and must
+/// remain pinned on the owning thread's stack while the solver runs.
+#[derive(Debug)]
+pub struct MipProgressMonitor {
+    schedule: MipGapSchedule,
+    events: Vec<MipEvent>,
+    last_obj: Option<f64>,
+    last_bnd: Option<f64>,
+    crossed_breakpoints: Vec<bool>,
+    should_terminate: bool,
+}
+
+impl MipProgressMonitor {
+    /// Build a fresh monitor for one solve.
+    pub fn new(schedule: MipGapSchedule) -> Self {
+        let n = schedule.breakpoints.len();
+        Self {
+            schedule,
+            events: Vec::new(),
+            last_obj: None,
+            last_bnd: None,
+            crossed_breakpoints: vec![false; n],
+            should_terminate: false,
+        }
+    }
+
+    /// Immutable access for inspection (e.g., after solve end).
+    pub fn schedule(&self) -> &MipGapSchedule {
+        &self.schedule
+    }
+
+    /// Relative gap used both by this monitor and by its [`MipEvent`]s.
+    /// Symmetric safeguard: `|incumbent - bound| / (|incumbent| + 1e-10)`.
+    pub fn relative_gap(incumbent_obj: f64, best_bound: f64) -> f64 {
+        let denom = incumbent_obj.abs() + 1e-10;
+        (incumbent_obj - best_bound).abs() / denom
+    }
+
+    /// Called from the solver backend's callback on each progress tick.
+    ///
+    /// `t_secs` is the solver's reported wall-clock time since solve
+    /// start. `incumbent_obj` and `best_bound` are the solver's current
+    /// best primal and best dual. Returns `true` when the caller should
+    /// request solver termination (e.g., `GRBterminate`).
+    ///
+    /// Records an event when any of the following changed since last
+    /// tick: incumbent improved, bound tightened, schedule breakpoint
+    /// crossed, or the termination condition fired.
+    pub fn tick(&mut self, t_secs: f64, incumbent_obj: f64, best_bound: f64) -> bool {
+        if self.should_terminate {
+            return true;
+        }
+        if !t_secs.is_finite() || !incumbent_obj.is_finite() || !best_bound.is_finite() {
+            return false;
+        }
+
+        let gap = Self::relative_gap(incumbent_obj, best_bound);
+        let target = self.schedule.target_at(t_secs);
+        let target_for_event = target.unwrap_or(f64::NAN);
+
+        // Record breakpoint-crossing events (only once per breakpoint).
+        for (idx, (bt, _bg)) in self.schedule.breakpoints.iter().enumerate() {
+            if !self.crossed_breakpoints[idx] && t_secs >= *bt {
+                self.crossed_breakpoints[idx] = true;
+                self.events.push(MipEvent {
+                    t_secs,
+                    incumbent_obj,
+                    best_bound,
+                    gap,
+                    target_gap: target_for_event,
+                    kind: MipEventKind::BreakpointCrossed,
+                });
+            }
+        }
+
+        // Record strictly-better primal/dual observations.
+        let new_incumbent = match self.last_obj {
+            None => true,
+            Some(prev) => incumbent_obj < prev - 1e-12 * prev.abs().max(1.0),
+        };
+        if new_incumbent {
+            self.events.push(MipEvent {
+                t_secs,
+                incumbent_obj,
+                best_bound,
+                gap,
+                target_gap: target_for_event,
+                kind: MipEventKind::NewIncumbent,
+            });
+            self.last_obj = Some(incumbent_obj);
+        }
+
+        let bound_improved = match self.last_bnd {
+            None => true,
+            Some(prev) => best_bound > prev + 1e-12 * prev.abs().max(1.0),
+        };
+        if bound_improved && !new_incumbent {
+            // Skip when we just recorded a NewIncumbent at this same tick
+            // to avoid double-counting the same instant.
+            self.events.push(MipEvent {
+                t_secs,
+                incumbent_obj,
+                best_bound,
+                gap,
+                target_gap: target_for_event,
+                kind: MipEventKind::BoundImproved,
+            });
+        }
+        if bound_improved {
+            self.last_bnd = Some(best_bound);
+        }
+
+        // Termination decision: fire only when we have an incumbent and
+        // the schedule has reached an applicable target.
+        if let Some(t) = target
+            && self.last_obj.is_some()
+            && gap <= t
+        {
+            self.events.push(MipEvent {
+                t_secs,
+                incumbent_obj,
+                best_bound,
+                gap,
+                target_gap: t,
+                kind: MipEventKind::ScheduleTerminate,
+            });
+            self.should_terminate = true;
+            return true;
+        }
+        false
+    }
+
+    /// Whether [`Self::tick`] has requested termination on a previous tick.
+    pub fn has_terminated(&self) -> bool {
+        self.should_terminate
+    }
+
+    /// Consume the monitor into a reportable [`MipTrace`].
+    pub fn into_trace(
+        self,
+        time_limit_secs: Option<f64>,
+        terminated_by: MipTerminationReason,
+        final_time_secs: f64,
+        final_gap: Option<f64>,
+    ) -> MipTrace {
+        MipTrace {
+            schedule: Some(self.schedule),
+            time_limit_secs,
+            final_gap,
+            final_time_secs,
+            terminated_by,
+            events: self.events,
+            n_vars: None,
+            n_bin_vars: None,
+            pre_fixed_bin_vars: None,
+            n_int_vars: None,
+            n_rows: None,
+            n_nonzeros: None,
+            node_count: None,
+            iter_count: None,
+            objective: None,
+            objective_bound: None,
+        }
+    }
 }
 
 /// Options for `LpSolver`.
@@ -158,8 +574,43 @@ pub struct LpOptions {
     pub tolerance: f64,
     /// Optional wall-clock time limit.
     pub time_limit_secs: Option<f64>,
+    /// Optional relative MIP optimality gap (e.g. 0.01 = 1%).
+    pub mip_rel_gap: Option<f64>,
+    /// Optional time-varying MIP gap schedule. When `Some` and the backend
+    /// supports progress callbacks, the backend tightens `mip_rel_gap`
+    /// over the wall-clock horizon, terminating early once the current
+    /// incumbent is within the scheduled target. Backends without callback
+    /// support silently ignore this field and fall back to the static
+    /// `mip_rel_gap` / `time_limit_secs` safety net.
+    pub mip_gap_schedule: Option<MipGapSchedule>,
+    /// Optional primal start for LP/QP/MIP backends.
+    ///
+    /// Backends may ignore this hint when they do not support warm starts.
+    pub primal_start: Option<LpPrimalStart>,
+    /// Preferred continuous algorithm, when the backend supports it.
+    pub algorithm: LpAlgorithm,
     /// Print level: 0 = silent, 1+ = verbose.
     pub print_level: u8,
+}
+
+/// Optional primal start representation for LP/QP/MIP backends.
+#[derive(Debug, Clone)]
+pub enum LpPrimalStart {
+    /// Dense primal assignment for all columns.
+    Dense(Vec<f64>),
+    /// Sparse primal assignment for a subset of columns.
+    Sparse {
+        indices: Vec<usize>,
+        values: Vec<f64>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LpAlgorithm {
+    #[default]
+    Auto,
+    Simplex,
+    Ipm,
 }
 
 impl Default for LpOptions {
@@ -167,6 +618,10 @@ impl Default for LpOptions {
         Self {
             tolerance: 1e-8,
             time_limit_secs: None,
+            mip_rel_gap: None,
+            mip_gap_schedule: None,
+            primal_start: None,
+            algorithm: LpAlgorithm::Auto,
             print_level: 0,
         }
     }
@@ -255,18 +710,21 @@ pub fn run_nlp_solver_with_policy<T, E>(
 /// Return the default LP solver, detecting availability at runtime.
 ///
 /// Controlled by the `SURGE_LP_SOLVER` environment variable:
-/// - **unset / `"highs"`** — HiGHS (loaded at runtime via libhighs.{so,dylib})
-/// - **`"auto"`** — probe Gurobi → COPT → CPLEX → HiGHS at runtime
+/// - **unset / `"auto"`** — probe Gurobi → COPT → CPLEX → HiGHS at runtime
+///   (commercial solvers first because they are typically 2–10× faster and
+///   more robust on ill-conditioned QP/QCQP problems than HiGHS).
+/// - **`"highs"`** — HiGHS (loaded at runtime via libhighs.{so,dylib})
 /// - **`"gurobi"` / `"copt"` / `"cplex"`** — use that solver directly
 ///
-/// Returns `Err` if the requested solver (or any solver, in auto mode) is not found.
+/// Returns `Err` if the requested solver (or any solver, in the default probe
+/// path) is not found.
 pub fn try_default_lp_solver() -> Result<Arc<dyn LpSolver>, String> {
     let choice = std::env::var("SURGE_LP_SOLVER")
         .unwrap_or_default()
         .to_ascii_lowercase();
     match choice.as_str() {
-        "auto" => probe_lp_solvers(),
-        "" | "highs" => {
+        "" | "auto" => probe_lp_solvers(),
+        "highs" => {
             let s = self::highs::HiGHSLpSolver::new()?;
             tracing::info!("LP solver: HiGHS (open-source)");
             Ok(Arc::new(s))

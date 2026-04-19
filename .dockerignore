@@ -13,3 +13,13 @@ research/
 vendor/
 *.md
 !src/
+# Python caches and venvs — always rebuilt in-image, never copy from host
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+.venv/
+**/.venv/
+# Local dashboard-specific leftovers that don't belong in the build context
+/tmp/
+markets/go_c3/server/static/__pycache__/

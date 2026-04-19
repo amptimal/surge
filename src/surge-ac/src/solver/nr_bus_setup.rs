@@ -277,7 +277,7 @@ pub(crate) fn build_remote_reg_map(
     let mut remote_controllers: HashMap<usize, Vec<usize>> = HashMap::new();
 
     for g in &network.generators {
-        if !g.in_service || !g.voltage_regulated {
+        if !g.can_voltage_regulate() {
             continue;
         }
         let Some(&gen_idx) = bus_map.get(&g.bus) else {
@@ -388,7 +388,7 @@ pub(crate) fn apply_generator_p_limit_demotions(network: &Network, bus_types: &m
         let gens_on_bus: Vec<&surge_network::network::Generator> = network
             .generators
             .iter()
-            .filter(|g| g.bus == bus.number && g.in_service && g.voltage_regulated)
+            .filter(|g| g.bus == bus.number && g.can_voltage_regulate())
             .collect();
         if gens_on_bus.is_empty() {
             continue;
@@ -411,8 +411,7 @@ pub(crate) fn apply_generator_voltage_setpoints(
     vm: &mut [f64],
 ) {
     for g in &network.generators {
-        if g.in_service
-            && g.voltage_regulated
+        if g.can_voltage_regulate()
             && let Some(&gen_idx) = bus_map.get(&g.bus)
             && (bus_types[gen_idx] == BusType::PV || bus_types[gen_idx] == BusType::Slack)
         {

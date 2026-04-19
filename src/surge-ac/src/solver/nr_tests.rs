@@ -201,7 +201,17 @@ fn test_nr_power_balance() {
         return;
     }
     let net = load_case("case9");
-    let sol = solve_ac_pf(&net, &AcPfOptions::default()).expect("NR should converge");
+    // Force single-slack. With `distributed_slack = true` (the default
+    // since commit dd086c70) every generator absorbs a share of the
+    // total P mismatch, so the spec-vs-computed comparison below would
+    // have to account for per-generator slack shares. Keep the
+    // single-slack reference so the test continues to lock the
+    // mismatch equations rather than the slack distribution policy.
+    let opts = AcPfOptions {
+        distributed_slack: false,
+        ..AcPfOptions::default()
+    };
+    let sol = solve_ac_pf(&net, &opts).expect("NR should converge");
 
     let ybus = build_ybus(&net);
     let (p_calc, q_calc) = crate::matrix::mismatch::compute_power_injection(
@@ -1593,8 +1603,13 @@ fn test_stott_alsac_single_bus_slack_only() {
     }
     let net = load_case("case9");
 
-    // Standard NR — reference
+    // Standard NR — reference. Force `distributed_slack = false` so
+    // bus 0 absorbs the total mismatch; after dd086c70 the default
+    // became `true` with an automatic participation policy that
+    // spreads slack across multiple generators, which would diverge
+    // from the 100%-on-slack reference this test exists to lock down.
     let opts_std = AcPfOptions {
+        distributed_slack: false,
         enforce_q_limits: false,
         detect_islands: false,
         ..AcPfOptions::default()
@@ -1911,10 +1926,15 @@ fn test_stott_alsac_energy_conservation_case9() {
     let net = load_case("case9");
     let base = net.base_mva;
 
-    // Standard NR — reference slack output.
+    // Standard NR — reference slack output. Force `distributed_slack =
+    // false` so all mismatch lands on bus 0 and the derivation below
+    // (`λ × base = slack_p_inject − p_spec_base_slack`) holds exactly.
+    // Since dd086c70 the default became `true` with automatic
+    // participation across every generator.
     let sol_std = solve_ac_pf(
         &net,
         &AcPfOptions {
+            distributed_slack: false,
             enforce_q_limits: false,
             detect_islands: false,
             ..AcPfOptions::default()
@@ -2477,7 +2497,16 @@ fn test_nr_case9_matpower_reference() {
         return;
     }
     let net = load_case("case9");
-    let sol = solve_ac_pf(&net, &AcPfOptions::default()).expect("NR should converge on case9");
+    // MATPOWER's runpf uses single-slack by default — the reference
+    // values below were generated that way. Since dd086c70 surge
+    // defaults to `distributed_slack = true`, which shifts bus angles
+    // by ~0.05° on case9, so force single-slack here to preserve the
+    // apples-to-apples comparison with MATPOWER.
+    let opts = AcPfOptions {
+        distributed_slack: false,
+        ..AcPfOptions::default()
+    };
+    let sol = solve_ac_pf(&net, &opts).expect("NR should converge on case9");
     assert_eq!(sol.status, SolveStatus::Converged);
 
     // MATPOWER reference Vm values (p.u.)
@@ -2589,7 +2618,14 @@ fn test_nr_case30_matpower_reference() {
         return;
     }
     let net = load_case("case30");
-    let sol = solve_ac_pf(&net, &AcPfOptions::default()).expect("NR should converge on case30");
+    // Same treatment as `test_nr_case9_matpower_reference`: force
+    // single-slack so the reference values from MATPOWER's runpf stay
+    // directly comparable.
+    let opts = AcPfOptions {
+        distributed_slack: false,
+        ..AcPfOptions::default()
+    };
+    let sol = solve_ac_pf(&net, &opts).expect("NR should converge on case30");
     assert_eq!(sol.status, SolveStatus::Converged);
 
     // MATPOWER reference Vm values (p.u.)
@@ -3854,6 +3890,7 @@ fn test_q_sharing_modes_multi_gen() {
 fn test_startup_policy_defaults_to_adaptive() {
     let opts = AcPfOptions::default();
     assert_eq!(opts.startup_policy, StartupPolicy::Adaptive);
+    assert!(opts.distributed_slack);
 }
 
 #[cfg(test)]

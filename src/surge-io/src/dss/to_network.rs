@@ -24,7 +24,8 @@ use thiserror::Error;
 
 use surge_network::Network;
 use surge_network::network::{
-    Branch, Bus, BusType, Generator, Load, TransformerConnection, TransformerData,
+    Branch, Bus, BusType, GenType, Generator, GeneratorTechnology, Load, TransformerConnection,
+    TransformerData,
 };
 
 use super::command::{DssCommand, parse_commands};
@@ -609,6 +610,8 @@ fn build_network(
             g.qmax = dss_gen.kvar_max / 1000.0;
             g.qmin = dss_gen.kvar_min / 1000.0;
             g.machine_base_mva = dss_gen.kva / 1000.0;
+            g.gen_type = GenType::Synchronous;
+            g.technology = Some(GeneratorTechnology::Other);
             g.fuel.get_or_insert_with(Default::default).fuel_type =
                 Some("dispatchable".to_string());
 
@@ -644,6 +647,8 @@ fn build_network(
             g.qmax = pv.kva / 1000.0;
             g.qmin = -(pv.kva / 1000.0);
             g.machine_base_mva = pv.kva / 1000.0;
+            g.gen_type = GenType::InverterBased;
+            g.technology = Some(GeneratorTechnology::SolarPv);
             g.fuel.get_or_insert_with(Default::default).fuel_type = Some("solar".to_string());
 
             net.generators.push(g);
@@ -671,6 +676,8 @@ fn build_network(
             g.qmax = stor.kva / 1000.0;
             g.qmin = -(stor.kva / 1000.0);
             g.machine_base_mva = stor.kva / 1000.0;
+            g.gen_type = GenType::InverterBased;
+            g.technology = Some(GeneratorTechnology::BatteryStorage);
             g.fuel.get_or_insert_with(Default::default).fuel_type = Some("storage".to_string());
 
             net.generators.push(g);

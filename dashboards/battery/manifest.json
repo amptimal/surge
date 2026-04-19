@@ -1,0 +1,8 @@
+{
+  "name": "battery",
+  "title": "Battery Operator",
+  "description": "Single-site BESS studies — edit LMP + AS prices, asset spec, and PWL bid strategy; toggle optimal-foresight / PWL × coupled / sequential; see revenue P&L, SOC trajectory, and dispatch live.",
+  "route": "battery",
+  "icon": "🔋",
+  "tag": "operator"
+}

@@ -15,10 +15,39 @@ members = [
     "src/surge-contingency",
     "src/surge-opf",
     "src/surge-transfer",
+    # Dispatch & simulation
+    "src/surge-dispatch",
+    "src/surge-market",
     # Entry points
     "src/surge-bindings",
     "src/surge-py",
 ]
+
+# -----------------------------------------------------------------------------
+# Build profiles
+#
+# Use the right profile for the job:
+#
+#   dev         — default; fast rebuilds, debug symbols, deps built with -O1 so
+#                 tests/examples don't crawl. Use for iteration.
+#   release-dev — realistic performance without the LTO tax. ~90% of release
+#                 throughput at ~30% of the compile time. Use for perf-sensitive
+#                 iteration (e.g. timing a 73-bus GO C3 solve).
+#   release     — ship profile: fat LTO, single codegen unit, stripped. Only
+#                 use for CI/published wheels/benchmarks.
+#   bench       — release + debug info for flamegraphs.
+# -----------------------------------------------------------------------------
+
+[profile.dev]
+opt-level = 0
+debug = 1           # line tables only — smaller artifacts, much faster link
+incremental = true
+split-debuginfo = "unpacked"   # macOS: skip dsymutil, faster link
+
+# Build dependencies with light optimization so debug builds aren't unusable at
+# runtime. We're not stepping through faer/ipopt-sys/etc.
+[profile.dev.package."*"]
+opt-level = 1
 
 [profile.release]
 opt-level = 3
@@ -26,8 +55,18 @@ lto = "fat"
 codegen-units = 1
 strip = "symbols"
 
+# Middle profile: realistic performance, but fast to rebuild.
+# `maturin develop --profile release-dev` or `cargo build --profile release-dev`.
+[profile.release-dev]
+inherits = "release"
+lto = false
+codegen-units = 16
+strip = false
+debug = 1
+incremental = true
+
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.87"
 license = "PolyForm-Noncommercial-1.0.0"
@@ -49,6 +88,8 @@ rayon = "1.10"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_ignored = "0.1"
+schemars = { version = "0.8", features = ["preserve_order"] }
 
 # Date/time
 chrono = { version = "0.4", features = ["serde"] }
@@ -83,19 +124,21 @@ libloading = "0.8"
 clarabel = "0.11"
 
 # Workspace member cross-refs
-surge-network = { path = "src/surge-network", version = "0.1.1" }
-surge-solution = { path = "src/surge-solution", version = "0.1.1" }
-surge-sparse = { path = "src/surge-sparse", version = "0.1.1" }
-surge-io = { path = "src/surge-io", version = "0.1.1" }
-surge-topology = { path = "src/surge-topology", version = "0.1.1" }
-surge-dc = { path = "src/surge-dc", version = "0.1.1" }
-surge-ac = { path = "src/surge-ac", version = "0.1.1" }
-surge-hvdc = { path = "src/surge-hvdc", version = "0.1.1" }
-surge-contingency = { path = "src/surge-contingency", version = "0.1.1" }
-surge-opf = { path = "src/surge-opf", version = "0.1.1" }
-surge-transfer = { path = "src/surge-transfer", version = "0.1.1" }
-surge-bindings = { path = "src/surge-bindings", version = "0.1.1" }
-surge-py = { path = "src/surge-py", version = "0.1.1" }
+surge-network = { path = "src/surge-network", version = "0.1.2" }
+surge-solution = { path = "src/surge-solution", version = "0.1.2" }
+surge-sparse = { path = "src/surge-sparse", version = "0.1.2" }
+surge-io = { path = "src/surge-io", version = "0.1.2" }
+surge-topology = { path = "src/surge-topology", version = "0.1.2" }
+surge-dc = { path = "src/surge-dc", version = "0.1.2" }
+surge-ac = { path = "src/surge-ac", version = "0.1.2" }
+surge-hvdc = { path = "src/surge-hvdc", version = "0.1.2" }
+surge-contingency = { path = "src/surge-contingency", version = "0.1.2" }
+surge-dispatch = { path = "src/surge-dispatch", version = "0.1.2" }
+surge-market = { path = "src/surge-market", version = "0.1.2" }
+surge-opf = { path = "src/surge-opf", version = "0.1.2" }
+surge-transfer = { path = "src/surge-transfer", version = "0.1.2" }
+surge-bindings = { path = "src/surge-bindings", version = "0.1.2" }
+surge-py = { path = "src/surge-py", version = "0.1.2" }
 
 [profile.bench]
 inherits = "release"

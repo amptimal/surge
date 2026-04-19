@@ -578,7 +578,7 @@ fn apply_bus_types(
     let bus_index = bus_number_to_index(buses);
     let regulated_targets: HashSet<u32> = generators
         .iter()
-        .filter(|generator| generator.in_service && generator.voltage_regulated)
+        .filter(|generator| generator.can_voltage_regulate())
         .map(|generator| generator.reg_bus.unwrap_or(generator.bus))
         .collect();
     for bus in buses.iter_mut() {

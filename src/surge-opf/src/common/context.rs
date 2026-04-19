@@ -32,15 +32,18 @@ pub(crate) struct OpfNetworkContext<'a> {
 impl<'a> OpfNetworkContext<'a> {
     /// Build the shared context and map any validation/indexing failures to DC-OPF errors.
     pub(crate) fn for_dc(network: &'a Network) -> Result<Self, DcOpfError> {
-        Self::build(network).map_err(DcOpfError::from)
+        Self::build(network, false).map_err(DcOpfError::from)
     }
 
     /// Build the shared context and map any validation/indexing failures to AC-OPF errors.
     pub(crate) fn for_ac(network: &'a Network) -> Result<Self, AcOpfError> {
-        Self::build(network).map_err(AcOpfError::from)
+        Self::build(network, true).map_err(AcOpfError::from)
     }
 
-    fn build(network: &'a Network) -> Result<Self, OpfContextError> {
+    fn build(
+        network: &'a Network,
+        allow_storage_without_cost: bool,
+    ) -> Result<Self, OpfContextError> {
         let n_bus = network.n_buses();
         let n_br = network.n_branches();
         let base_mva = network.base_mva;
@@ -64,6 +67,9 @@ impl<'a> OpfNetworkContext<'a> {
 
         for &gi in &gen_indices {
             let g = &network.generators[gi];
+            if allow_storage_without_cost && g.is_storage() {
+                continue;
+            }
             if g.cost.is_none() {
                 return Err(OpfContextError::MissingCost {
                     gen_idx: gi,

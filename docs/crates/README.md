@@ -23,6 +23,13 @@ Per-crate documentation for the Surge workspace.
 | [surge-opf](surge-opf.md) | DC-OPF, AC-OPF, SCOPF, OTS, and ORPD |
 | [surge-transfer](surge-transfer.md) | ATC, AFC, and transfer capability studies |
 
+## Markets
+
+| Crate | Description |
+|---|---|
+| [surge-dispatch](surge-dispatch.md) | Unified SCED and SCUC kernel — DC/AC, period-by-period or time-coupled, with reserves, security screening, and SCED-AC Benders |
+| [surge-market](surge-market.md) | Canonical market-formulation layer — reserve catalogues, multi-stage workflows, AC SCED setup, retry/refinement runtime, GO C3 adapter |
+
 ## Interfaces
 
 | Crate | Description |

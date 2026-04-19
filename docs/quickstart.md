@@ -142,5 +142,6 @@ fn main() -> Result<()> {
 - [tutorials/05-python-api.md](tutorials/05-python-api.md)
 - [tutorials/09-pandas-construction.md](tutorials/09-pandas-construction.md)
 - [tutorials/10-subsystems.md](tutorials/10-subsystems.md)
+- [tutorials/12-dispatch-activsg.md](tutorials/12-dispatch-activsg.md)
 - [tutorials/06-cli-reference.md](tutorials/06-cli-reference.md)
 - [notebooks/README.md](notebooks/README.md)

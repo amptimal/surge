@@ -19,6 +19,7 @@ use crate::network::{BranchRef, WeightedBranchRef};
 ///
 /// Interface flow = sum of (coefficient * branch MW flow).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "InterfaceSerde")]
 pub struct Interface {
     /// Human-readable name (e.g. "Houston Import").
     pub name: String,
@@ -46,6 +47,64 @@ pub struct Interface {
     pub limit_reverse_mw_schedule: Vec<f64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct InterfaceSerde {
+    pub name: String,
+    #[serde(default)]
+    pub members: Vec<WeightedBranchRef>,
+    #[serde(default)]
+    pub branches: Vec<(u32, u32, String)>,
+    #[serde(default)]
+    pub coefficients: Vec<f64>,
+    pub limit_forward_mw: f64,
+    pub limit_reverse_mw: f64,
+    pub in_service: bool,
+    #[serde(default)]
+    pub limit_forward_mw_schedule: Vec<f64>,
+    #[serde(default)]
+    pub limit_reverse_mw_schedule: Vec<f64>,
+}
+
+impl TryFrom<InterfaceSerde> for Interface {
+    type Error = String;
+
+    fn try_from(value: InterfaceSerde) -> Result<Self, Self::Error> {
+        let members = if !value.members.is_empty() {
+            value.members
+        } else if value.branches.is_empty() && value.coefficients.is_empty() {
+            Vec::new()
+        } else {
+            if value.branches.len() != value.coefficients.len() {
+                return Err(format!(
+                    "interface '{}' has {} legacy branches but {} coefficients",
+                    value.name,
+                    value.branches.len(),
+                    value.coefficients.len()
+                ));
+            }
+            value
+                .branches
+                .into_iter()
+                .zip(value.coefficients)
+                .map(|(branch, coefficient)| WeightedBranchRef {
+                    branch: branch.into(),
+                    coefficient,
+                })
+                .collect()
+        };
+
+        Ok(Self {
+            name: value.name,
+            members,
+            limit_forward_mw: value.limit_forward_mw,
+            limit_reverse_mw: value.limit_reverse_mw,
+            in_service: value.in_service,
+            limit_forward_mw_schedule: value.limit_forward_mw_schedule,
+            limit_reverse_mw_schedule: value.limit_reverse_mw_schedule,
+        })
+    }
+}
+
 impl Interface {
     /// Forward MW limit at timestep `t`.
     ///
@@ -68,8 +127,15 @@ impl Interface {
     }
 }
 
+/// Sentinel forward-limit value returned by [`Flowgate::effective_limit_mw`]
+/// on periods where a single-period flowgate is inactive. Downstream LP
+/// builders translate this into a row whose bounds are so wide the
+/// constraint is trivially satisfied (Gurobi's GRB_INFINITY convention).
+pub const INACTIVE_FLOWGATE_LIMIT_MW: f64 = 1e30;
+
 /// A flowgate: a monitored element under a specific contingency.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "FlowgateSerde")]
 pub struct Flowgate {
     /// Human-readable name (e.g. "FG_123").
     pub name: String,
@@ -104,13 +170,128 @@ pub struct Flowgate {
     ///   `Σ coeff_i·b_dc_i·(θ_from_i − θ_to_i) + Σ hvdc_coeff_k·P_hvdc[k] ∈ [-limit, limit]`
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hvdc_coefficients: Vec<(usize, f64)>,
+    /// Per-band HVDC coefficients for banded N-1 HVDC contingency constraints.
+    /// Each entry: `(hvdc_link_index, band_index, coefficient_pu)`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hvdc_band_coefficients: Vec<(usize, usize, f64)>,
+    /// Compact single-active-period marker. When `Some(p)`,
+    /// [`Flowgate::effective_limit_mw`] returns `limit_mw` at timestep
+    /// `p` and the [`INACTIVE_FLOWGATE_LIMIT_MW`] sentinel for all
+    /// other timesteps — producing the same LP behaviour as a 18-slot
+    /// `limit_mw_schedule` with 17 sentinel entries but without the
+    /// per-flowgate `Vec<f64>` allocation (~1.2 GB savings on
+    /// 617-bus explicit N-1 SCUC, where this is populated by
+    /// `build_branch_security_flowgate`). When `None`, the legacy
+    /// `limit_mw_schedule` / `limit_mw` lookup is used unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_mw_active_period: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum BranchRefSerde {
+    Structured(BranchRef),
+    Legacy((u32, u32, String)),
+}
+
+impl From<BranchRefSerde> for BranchRef {
+    fn from(value: BranchRefSerde) -> Self {
+        match value {
+            BranchRefSerde::Structured(branch) => branch,
+            BranchRefSerde::Legacy(branch) => branch.into(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FlowgateSerde {
+    pub name: String,
+    #[serde(default)]
+    pub monitored: Vec<WeightedBranchRef>,
+    #[serde(default)]
+    pub monitored_branches: Vec<(u32, u32, String)>,
+    #[serde(default)]
+    pub monitored_coefficients: Vec<f64>,
+    pub contingency_branch: Option<BranchRefSerde>,
+    pub limit_mw: f64,
+    #[serde(default)]
+    pub limit_reverse_mw: f64,
+    pub in_service: bool,
+    #[serde(default)]
+    pub limit_mw_schedule: Vec<f64>,
+    #[serde(default)]
+    pub limit_reverse_mw_schedule: Vec<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hvdc_coefficients: Vec<(usize, f64)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hvdc_band_coefficients: Vec<(usize, usize, f64)>,
+    #[serde(default)]
+    pub limit_mw_active_period: Option<u32>,
+}
+
+impl TryFrom<FlowgateSerde> for Flowgate {
+    type Error = String;
+
+    fn try_from(value: FlowgateSerde) -> Result<Self, Self::Error> {
+        let monitored = if !value.monitored.is_empty() {
+            value.monitored
+        } else if value.monitored_branches.is_empty() && value.monitored_coefficients.is_empty() {
+            Vec::new()
+        } else {
+            if value.monitored_branches.len() != value.monitored_coefficients.len() {
+                return Err(format!(
+                    "flowgate '{}' has {} legacy monitored branches but {} coefficients",
+                    value.name,
+                    value.monitored_branches.len(),
+                    value.monitored_coefficients.len()
+                ));
+            }
+            value
+                .monitored_branches
+                .into_iter()
+                .zip(value.monitored_coefficients)
+                .map(|(branch, coefficient)| WeightedBranchRef {
+                    branch: branch.into(),
+                    coefficient,
+                })
+                .collect()
+        };
+
+        Ok(Self {
+            name: value.name,
+            monitored,
+            contingency_branch: value.contingency_branch.map(Into::into),
+            limit_mw: value.limit_mw,
+            limit_reverse_mw: value.limit_reverse_mw,
+            in_service: value.in_service,
+            limit_mw_schedule: value.limit_mw_schedule,
+            limit_reverse_mw_schedule: value.limit_reverse_mw_schedule,
+            hvdc_coefficients: value.hvdc_coefficients,
+            hvdc_band_coefficients: value.hvdc_band_coefficients,
+            limit_mw_active_period: value.limit_mw_active_period,
+        })
+    }
 }
 
 impl Flowgate {
     /// Forward MW limit at timestep `t`.
     ///
-    /// Returns `limit_mw_schedule[t]` when available, else `limit_mw`.
+    /// Resolution order:
+    /// 1. If `limit_mw_active_period` is `Some(p)`: return `limit_mw` at
+    ///    `t == p`, and [`INACTIVE_FLOWGATE_LIMIT_MW`] otherwise. This is
+    ///    the compact encoding used by explicit N-1 security flowgates
+    ///    (one period active, all others disabled). Avoids allocating an
+    ///    `n_periods`-length `Vec<f64>` per flowgate.
+    /// 2. Else if `limit_mw_schedule[t]` exists: return it.
+    /// 3. Else: fall back to `limit_mw`.
     pub fn effective_limit_mw(&self, t: usize) -> f64 {
+        if let Some(active) = self.limit_mw_active_period {
+            return if t == active as usize {
+                self.limit_mw
+            } else {
+                INACTIVE_FLOWGATE_LIMIT_MW
+            };
+        }
         self.limit_mw_schedule
             .get(t)
             .copied()
@@ -248,6 +429,8 @@ mod tests {
             limit_mw_schedule: vec![90.0, 80.0, 70.0],
             limit_reverse_mw_schedule: vec![],
             hvdc_coefficients: vec![],
+            hvdc_band_coefficients: vec![],
+            limit_mw_active_period: None,
         };
         assert_eq!(fg.effective_limit_mw(0), 90.0);
         assert_eq!(fg.effective_limit_mw(2), 70.0);

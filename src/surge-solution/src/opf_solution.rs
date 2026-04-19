@@ -5,7 +5,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use surge_network::market::VirtualBidResult;
 
-use crate::{ParResult, PfSolution};
+use crate::{
+    AuditableSolution, ObjectiveLedgerMismatch, ObjectiveLedgerScopeKind, ObjectiveTerm, ParResult,
+    PfSolution, SolutionAuditReport,
+};
 
 fn serialize_branch_loading_pct<S>(values: &[f64], serializer: S) -> Result<S::Ok, S::Error>
 where
@@ -129,6 +132,15 @@ pub struct OpfBranchResults {
     /// Shadow prices on branch angmax constraints ($/MWh per rad).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shadow_price_angmax: Vec<f64>,
+    /// From-side thermal overflow slack (MVA), one entry per network branch.
+    ///
+    /// Non-zero values mean AC-OPF was allowed to exceed the branch's apparent
+    /// power rating on the from side by this amount.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thermal_limit_slack_from_mva: Vec<f64>,
+    /// To-side thermal overflow slack (MVA), one entry per network branch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thermal_limit_slack_to_mva: Vec<f64>,
     /// Shadow prices for flowgate constraints ($/MWh).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub flowgate_shadow_prices: Vec<f64>,
@@ -177,6 +189,48 @@ pub struct OpfDeviceDispatch {
     /// Net storage dispatch (MW). Positive = discharging, negative = charging.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub storage_net_mw: Vec<f64>,
+    /// Dispatchable-load real power served (MW), in active resource order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dispatchable_load_served_mw: Vec<f64>,
+    /// Dispatchable-load reactive power served (MVAr), in active resource order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dispatchable_load_served_q_mvar: Vec<f64>,
+    /// Cleared producer reactive up-reserve award per in-service
+    /// generator (MVAr), in `gen_indices` order. AC-OPF only; empty
+    /// otherwise or when the network has no reactive reserve products.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub producer_q_reserve_up_mvar: Vec<f64>,
+    /// Cleared producer reactive down-reserve award per in-service
+    /// generator (MVAr).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub producer_q_reserve_down_mvar: Vec<f64>,
+    /// Cleared consumer reactive up-reserve award per in-service
+    /// dispatchable load (MVAr).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consumer_q_reserve_up_mvar: Vec<f64>,
+    /// Cleared consumer reactive down-reserve award per in-service
+    /// dispatchable load (MVAr).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub consumer_q_reserve_down_mvar: Vec<f64>,
+    /// Zonal reactive up-reserve shortfall per (zone, up product) pair
+    /// (MVAr). Parallel to the zonal requirement order the AC-OPF walked
+    /// when building its reactive reserve plan.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub zone_q_reserve_up_shortfall_mvar: Vec<f64>,
+    /// Zonal reactive down-reserve shortfall per (zone, down product)
+    /// pair (MVAr).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub zone_q_reserve_down_shortfall_mvar: Vec<f64>,
+    /// Point-to-point HVDC link P dispatch (MW), in the order the
+    /// joint AC-DC NLP exposes them. Positive = flow from the link's
+    /// from-bus (rectifier) to its to-bus (inverter). Non-empty only
+    /// when at least one in-service `LccHvdcLink`/`VscHvdcLink` has a
+    /// non-degenerate `[p_dc_min_mw, p_dc_max_mw]` range AND the AC
+    /// OPF ran through the joint-NLP path (rather than the legacy
+    /// sequential AC-DC iteration, which reports the same quantity
+    /// via `AcOpfHvdcResult.hvdc_p_dc_mw`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hvdc_p2p_dispatch_mw: Vec<f64>,
     /// Whether the discrete round-and-check verification passed.
     ///
     /// `None` = continuous mode. `Some(true)` = passed. `Some(false)` = violations.
@@ -202,7 +256,7 @@ pub struct OpfSolution {
     pub power_flow: PfSolution,
 
     // System totals
-    /// Total generation cost ($/hr).
+    /// Total objective cost for the solved interval (dollars).
     pub total_cost: f64,
     /// Total system load (MW).
     pub total_load_mw: f64,
@@ -235,6 +289,45 @@ pub struct OpfSolution {
     /// Benders cut dual values from AC-SCOPF.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub benders_cut_duals: Vec<f64>,
+    /// Exact objective decomposition.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub objective_terms: Vec<ObjectiveTerm>,
+    /// Persisted exact-audit status for this solution payload.
+    #[serde(default)]
+    pub audit: SolutionAuditReport,
+
+    /// Per-bus reactive-power balance slack (positive direction, MVAr).
+    /// Entry `i` corresponds to bus index `i` in the network.  Non-empty
+    /// only when `bus_reactive_power_balance_slack_penalty_per_mvar > 0`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bus_q_slack_pos_mvar: Vec<f64>,
+    /// Per-bus reactive-power balance slack (negative direction, MVAr).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bus_q_slack_neg_mvar: Vec<f64>,
+    /// Per-bus active-power balance slack (positive direction, MW).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bus_p_slack_pos_mw: Vec<f64>,
+    /// Per-bus active-power balance slack (negative direction, MW).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bus_p_slack_neg_mw: Vec<f64>,
+    /// Per-bus voltage-magnitude high slack (pu), one per bus.
+    /// `σ_high[i] = max(0, vm[i] - vm_max[i])`. Non-empty only when
+    /// `voltage_magnitude_slack_penalty_per_pu > 0`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vm_slack_high_pu: Vec<f64>,
+    /// Per-bus voltage-magnitude low slack (pu), one per bus.
+    /// `σ_low[i] = max(0, vm_min[i] - vm[i])`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vm_slack_low_pu: Vec<f64>,
+    /// Per-branch angle-difference high slack (radians), indexed by network branch order.
+    /// `sigma_high[i]` allows `Va_from - Va_to` to exceed `angmax` by this amount.
+    /// Non-empty only when `angle_difference_slack_penalty_per_rad > 0`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub angle_diff_slack_high_rad: Vec<f64>,
+    /// Per-branch angle-difference low slack (radians), indexed by network branch order.
+    /// `sigma_low[i]` allows `Va_from - Va_to` to go below `angmin` by this amount.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub angle_diff_slack_low_rad: Vec<f64>,
 
     // Solver metadata
     /// Total solve time in seconds.
@@ -248,11 +341,133 @@ pub struct OpfSolution {
     /// Version string of the solver.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub solver_version: Option<String>,
+    /// Per-phase timing breakdown within the OPF solve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ac_opf_timings: Option<AcOpfTimings>,
+}
+
+/// Per-phase timing breakdown for a single AC-OPF solve call.
+///
+/// Populated inside `solve_ac_opf_with_context_once`. Each `nlp_build`
+/// + `nlp_solve` pair corresponds to one NLP construction and Ipopt
+///   call; the constraint-screening fallback path may produce a second
+///   pair, reflected in `nlp_attempts`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct AcOpfTimings {
+    /// FACTS expansion, network canonicalize, validation, missing-cost
+    /// check — everything before solver lookup and warm-start decisions.
+    pub network_prep_secs: f64,
+    /// NLP solver lookup, DC-OPF warm-start decision, constraint
+    /// screening setup — between network prep and NLP construction.
+    pub solve_setup_secs: f64,
+    /// Time spent constructing `AcOpfProblem` (Y-bus, branch admittances,
+    /// Jacobian sparsity enumeration). Cumulative across all attempts.
+    pub nlp_build_secs: f64,
+    /// Time spent inside `NlpSolver::solve()` (the actual interior-point
+    /// iterations). Cumulative across all attempts.
+    pub nlp_solve_secs: f64,
+    /// Time spent extracting the solution from NLP variables into
+    /// `OpfSolution` fields (voltages, dispatch, slacks, LMPs).
+    pub extract_secs: f64,
+    /// Wall-clock total for the entire `solve_ac_opf_with_context_once`
+    /// call (equals `solve_time_secs` on the parent `OpfSolution`).
+    pub total_secs: f64,
+    /// Number of `AcOpfProblem::new()` + `nlp.solve()` pairs executed.
+    /// 1 normally; 2 when constraint-screening fallback activates.
+    pub nlp_attempts: u32,
+}
+
+const OBJECTIVE_LEDGER_TOLERANCE: f64 = 1e-6;
+
+fn objective_term_total(terms: &[ObjectiveTerm]) -> f64 {
+    terms.iter().map(|term| term.dollars).sum()
+}
+
+fn residual_term_total(terms: &[ObjectiveTerm]) -> f64 {
+    terms
+        .iter()
+        .filter(|term| {
+            term.kind == crate::ObjectiveTermKind::Other && term.component_id == "residual"
+        })
+        .map(|term| term.dollars)
+        .sum()
+}
+
+fn maybe_push_objective_ledger_mismatch(
+    mismatches: &mut Vec<ObjectiveLedgerMismatch>,
+    scope_kind: ObjectiveLedgerScopeKind,
+    scope_id: impl Into<String>,
+    field: &str,
+    expected_dollars: f64,
+    actual_dollars: f64,
+) {
+    let difference = actual_dollars - expected_dollars;
+    if difference.abs() > OBJECTIVE_LEDGER_TOLERANCE {
+        mismatches.push(ObjectiveLedgerMismatch {
+            scope_kind,
+            scope_id: scope_id.into(),
+            field: field.to_string(),
+            expected_dollars,
+            actual_dollars,
+            difference,
+        });
+    }
+}
+
+impl OpfSolution {
+    /// Persisted exact-audit status stored on the serialized solution payload.
+    pub fn audit(&self) -> &SolutionAuditReport {
+        &self.audit
+    }
+
+    /// Whether this solution carries an exact objective ledger that can be audited.
+    pub fn has_objective_ledger(&self) -> bool {
+        !self.objective_terms.is_empty()
+    }
+
+    /// Recompute and store the persisted audit block from the exact objective ledger.
+    pub fn refresh_audit(&mut self) {
+        self.audit = <Self as AuditableSolution>::computed_solution_audit(self);
+    }
+
+    /// Return every objective-ledger mismatch found on this OPF solution.
+    pub fn objective_ledger_mismatches(&self) -> Vec<ObjectiveLedgerMismatch> {
+        let mut mismatches = Vec::new();
+        maybe_push_objective_ledger_mismatch(
+            &mut mismatches,
+            ObjectiveLedgerScopeKind::OpfSolution,
+            "opf",
+            "total_cost",
+            objective_term_total(&self.objective_terms),
+            self.total_cost,
+        );
+        maybe_push_objective_ledger_mismatch(
+            &mut mismatches,
+            ObjectiveLedgerScopeKind::OpfSolution,
+            "opf",
+            "residual",
+            0.0,
+            residual_term_total(&self.objective_terms),
+        );
+        mismatches
+    }
+
+    /// Whether the OPF solution's exact objective ledger reconciles cleanly.
+    pub fn objective_ledger_is_consistent(&self) -> bool {
+        self.objective_ledger_mismatches().is_empty()
+    }
+}
+
+impl AuditableSolution for OpfSolution {
+    fn computed_solution_audit(&self) -> SolutionAuditReport {
+        SolutionAuditReport::from_mismatches(self.objective_ledger_mismatches())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ObjectiveBucket, ObjectiveSubjectKind, ObjectiveTermKind};
 
     fn make_opf(
         opf_type: OpfType,
@@ -354,5 +569,32 @@ mod tests {
         assert_eq!(binding, vec![1, 3]);
         assert_eq!(sol.branches.branch_shadow_prices[1], 5.2);
         assert_eq!(sol.branches.branch_shadow_prices[3], -3.1);
+    }
+
+    #[test]
+    fn test_opf_solution_objective_ledger_validation() {
+        let mut sol = make_opf(OpfType::DcOpf, vec![50.0], vec![], vec![30.0]);
+        sol.total_cost = 500.0;
+        sol.objective_terms = vec![ObjectiveTerm {
+            component_id: "energy".to_string(),
+            bucket: ObjectiveBucket::Energy,
+            kind: ObjectiveTermKind::GeneratorEnergy,
+            subject_kind: ObjectiveSubjectKind::Resource,
+            subject_id: "gen_1_0".to_string(),
+            dollars: 500.0,
+            quantity: Some(50.0),
+            quantity_unit: Some(crate::ObjectiveQuantityUnit::Mwh),
+            unit_rate: Some(10.0),
+        }];
+        assert!(sol.objective_ledger_is_consistent());
+
+        sol.total_cost = 400.0;
+        let mismatches = sol.objective_ledger_mismatches();
+        assert_eq!(mismatches.len(), 1);
+        assert_eq!(
+            mismatches[0].scope_kind,
+            ObjectiveLedgerScopeKind::OpfSolution
+        );
+        assert_eq!(mismatches[0].field, "total_cost");
     }
 }
