@@ -236,6 +236,8 @@ struct HighsLib {
     ) -> HighsInt,
     Highs_setBoolOptionValue:
         unsafe extern "C" fn(*mut std::ffi::c_void, *const c_char, HighsInt) -> HighsInt,
+    Highs_setIntOptionValue:
+        unsafe extern "C" fn(*mut std::ffi::c_void, *const c_char, HighsInt) -> HighsInt,
     Highs_setDoubleOptionValue:
         unsafe extern "C" fn(*mut std::ffi::c_void, *const c_char, f64) -> HighsInt,
     Highs_setStringOptionValue:
@@ -460,6 +462,10 @@ unsafe fn load_highs_symbols(lib: Library) -> Result<HighsLib, String> {
             b"Highs_setBoolOptionValue\0",
             unsafe extern "C" fn(*mut std::ffi::c_void, *const c_char, HighsInt) -> HighsInt
         ),
+        Highs_setIntOptionValue: sym!(
+            b"Highs_setIntOptionValue\0",
+            unsafe extern "C" fn(*mut std::ffi::c_void, *const c_char, HighsInt) -> HighsInt
+        ),
         Highs_setDoubleOptionValue: sym!(
             b"Highs_setDoubleOptionValue\0",
             unsafe extern "C" fn(*mut std::ffi::c_void, *const c_char, f64) -> HighsInt
@@ -534,7 +540,146 @@ fn set_string_option(lib: &HighsLib, highs: *mut std::ffi::c_void, option_name: 
     }
 }
 
-fn configure_presolve(lib: &HighsLib, highs: *mut std::ffi::c_void, preserve_primal_start: bool) {
+fn set_int_option(lib: &HighsLib, highs: *mut std::ffi::c_void, option_name: &str, value: HighsInt) {
+    let option = CString::new(option_name).expect("static string contains no null bytes");
+    unsafe {
+        (lib.Highs_setIntOptionValue)(highs, option.as_ptr(), value);
+    }
+}
+
+fn set_double_option(lib: &HighsLib, highs: *mut std::ffi::c_void, option_name: &str, value: f64) {
+    let option = CString::new(option_name).expect("static string contains no null bytes");
+    unsafe {
+        (lib.Highs_setDoubleOptionValue)(highs, option.as_ptr(), value);
+    }
+}
+
+fn set_bool_option(lib: &HighsLib, highs: *mut std::ffi::c_void, option_name: &str, value: bool) {
+    let option = CString::new(option_name).expect("static string contains no null bytes");
+    unsafe {
+        (lib.Highs_setBoolOptionValue)(highs, option.as_ptr(), if value { 1 } else { 0 });
+    }
+}
+
+fn env_trimmed(name: &str) -> Option<String> {
+    std::env::var(name).ok().and_then(|s| {
+        let t = s.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    })
+}
+
+fn parse_bool_flag(raw: &str) -> Option<bool> {
+    match raw.to_ascii_lowercase().as_str() {
+        "0" | "off" | "false" | "no" => Some(false),
+        "1" | "on" | "true" | "yes" => Some(true),
+        _ => None,
+    }
+}
+
+/// Apply env-var overrides that affect both LP and MIP solves.
+///
+/// Recognized variables:
+///
+/// * `SURGE_HIGHS_THREADS` (int)            → `threads` (0 = use all)
+/// * `SURGE_HIGHS_PARALLEL` (on/off/choose) → `parallel`
+/// * `SURGE_HIGHS_RANDOM_SEED` (int)        → `random_seed`
+/// * `SURGE_HIGHS_SIMPLEX_STRAT` (1..4)     → `simplex_strategy`
+/// * `SURGE_HIGHS_SCALE_STRAT` (0..4)       → `simplex_scale_strategy`
+/// * `SURGE_HIGHS_PRIMAL_FEAS_TOL` (float)  → overrides `primal_feasibility_tolerance`
+/// * `SURGE_HIGHS_DUAL_FEAS_TOL` (float)    → overrides `dual_feasibility_tolerance`
+/// * `SURGE_HIGHS_CROSSOVER` (on/off)       → `run_crossover` (IPM)
+fn apply_env_overrides_common(lib: &HighsLib, highs: *mut std::ffi::c_void) {
+    if let Some(v) = env_trimmed("SURGE_HIGHS_THREADS") {
+        if let Ok(n) = v.parse::<HighsInt>() {
+            set_int_option(lib, highs, "threads", n);
+        }
+    }
+    if let Some(v) = env_trimmed("SURGE_HIGHS_PARALLEL") {
+        let normalized = v.to_ascii_lowercase();
+        let mapped = match normalized.as_str() {
+            "0" | "off" | "false" | "no" => "off",
+            "1" | "on" | "true" | "yes" => "on",
+            "choose" => "choose",
+            _ => return,
+        };
+        set_string_option(lib, highs, "parallel", mapped);
+    }
+    if let Some(v) = env_trimmed("SURGE_HIGHS_RANDOM_SEED") {
+        if let Ok(n) = v.parse::<HighsInt>() {
+            set_int_option(lib, highs, "random_seed", n);
+        }
+    }
+    if let Some(v) = env_trimmed("SURGE_HIGHS_SIMPLEX_STRAT") {
+        if let Ok(n) = v.parse::<HighsInt>() {
+            set_int_option(lib, highs, "simplex_strategy", n);
+        }
+    }
+    if let Some(v) = env_trimmed("SURGE_HIGHS_SCALE_STRAT") {
+        if let Ok(n) = v.parse::<HighsInt>() {
+            set_int_option(lib, highs, "simplex_scale_strategy", n);
+        }
+    }
+    if let Some(v) = env_trimmed("SURGE_HIGHS_PRIMAL_FEAS_TOL") {
+        if let Ok(f) = v.parse::<f64>() {
+            set_double_option(lib, highs, "primal_feasibility_tolerance", f);
+        }
+    }
+    if let Some(v) = env_trimmed("SURGE_HIGHS_DUAL_FEAS_TOL") {
+        if let Ok(f) = v.parse::<f64>() {
+            set_double_option(lib, highs, "dual_feasibility_tolerance", f);
+        }
+    }
+    if let Some(v) = env_trimmed("SURGE_HIGHS_CROSSOVER") {
+        if let Some(flag) = parse_bool_flag(&v) {
+            set_string_option(lib, highs, "run_crossover", if flag { "on" } else { "off" });
+        }
+    }
+}
+
+/// Apply MIP-only env-var overrides.  Must be called AFTER the default
+/// MIP tolerances/heuristic effort are set so env vars take precedence.
+///
+/// Recognized variables:
+///
+/// * `SURGE_HIGHS_MIP_HEURISTIC` (float 0..1) → `mip_heuristic_effort`
+/// * `SURGE_HIGHS_MIP_DETECT_SYM` (on/off)    → `mip_detect_symmetry`
+/// * `SURGE_HIGHS_MIP_FEAS_TOL` (float)       → `mip_feasibility_tolerance`
+/// * `SURGE_HIGHS_MIP_REL_GAP` (float)        → `mip_rel_gap` (overrides caller)
+fn apply_env_overrides_mip(lib: &HighsLib, highs: *mut std::ffi::c_void) {
+    if let Some(v) = env_trimmed("SURGE_HIGHS_MIP_HEURISTIC") {
+        if let Ok(f) = v.parse::<f64>() {
+            set_double_option(lib, highs, "mip_heuristic_effort", f);
+        }
+    }
+    if let Some(v) = env_trimmed("SURGE_HIGHS_MIP_DETECT_SYM") {
+        if let Some(flag) = parse_bool_flag(&v) {
+            set_bool_option(lib, highs, "mip_detect_symmetry", flag);
+        }
+    }
+    if let Some(v) = env_trimmed("SURGE_HIGHS_MIP_FEAS_TOL") {
+        if let Ok(f) = v.parse::<f64>() {
+            set_double_option(lib, highs, "mip_feasibility_tolerance", f);
+        }
+    }
+    if let Some(v) = env_trimmed("SURGE_HIGHS_MIP_REL_GAP") {
+        if let Ok(f) = v.parse::<f64>() {
+            set_double_option(lib, highs, "mip_rel_gap", f);
+        }
+    }
+}
+
+fn configure_presolve(lib: &HighsLib, highs: *mut std::ffi::c_void, _preserve_primal_start: bool) {
+    // Default: leave presolve at HiGHS's default ("choose", effectively on).
+    //
+    // Historically surge forced presolve off whenever a primal_start was
+    // provided because we worried the hint would be invalidated by presolve.
+    // Empirically HiGHS postsolves the user-supplied MIP start correctly and
+    // presolve is a massive win (8x+ on 73-bus SCUC: 139s → 17s), so we
+    // leave it on by default and only override when the env var says so.
     if let Ok(value) = std::env::var("SURGE_HIGHS_PRESOLVE") {
         let normalized = value.trim().to_ascii_lowercase();
         let override_value = match normalized.as_str() {
@@ -543,11 +688,6 @@ fn configure_presolve(lib: &HighsLib, highs: *mut std::ffi::c_void, preserve_pri
             _ => return,
         };
         set_presolve_option(lib, highs, override_value);
-        return;
-    }
-
-    if preserve_primal_start {
-        set_presolve_option(lib, highs, "off");
     }
 }
 
@@ -572,6 +712,12 @@ fn configure_mip_lp_solver(lib: &HighsLib, highs: *mut std::ffi::c_void) {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "simplex".to_string());
     set_string_option(lib, highs, "mip_lp_solver", &value);
+
+    // Scaling strategy 4 is the most aggressive HiGHS scaler.  Empirically
+    // ~30% faster on 617-bus D1 SCUC, neutral on everything else we've
+    // measured.  SURGE_HIGHS_SCALE_STRAT (applied later via
+    // apply_env_overrides_common) still takes precedence.
+    set_int_option(lib, highs, "simplex_scale_strategy", 4);
 }
 
 fn apply_primal_start_hint(
@@ -974,6 +1120,8 @@ unsafe fn solve_sparse_qp_inner(
         let time_opt = CString::new("time_limit").expect("static string contains no null bytes");
         unsafe { (lib.Highs_setDoubleOptionValue)(highs, time_opt.as_ptr(), limit) };
     }
+
+    apply_env_overrides_common(lib, highs);
 
     // Load the model.  For QP problems we use Highs_passModel, which passes
     // the LP and Hessian atomically so HiGHS knows from the start that it is
@@ -1500,9 +1648,12 @@ unsafe fn solve_sparse_mip_inner(
     mip_rel_gap: Option<f64>,
     primal_start: Option<&LpPrimalStart>,
 ) -> Result<SparseQpSolution, String> {
-    // Suppress output
+    // Suppress output (set SURGE_HIGHS_VERBOSE=1 to enable HiGHS MIP logging)
+    let verbose = std::env::var("SURGE_HIGHS_VERBOSE").is_ok();
     let output_flag = CString::new("output_flag").expect("static string contains no null bytes");
-    unsafe { (lib.Highs_setBoolOptionValue)(highs, output_flag.as_ptr(), 0) };
+    unsafe {
+        (lib.Highs_setBoolOptionValue)(highs, output_flag.as_ptr(), if verbose { 1 } else { 0 })
+    };
     configure_presolve(lib, highs, primal_start.is_some());
     configure_mip_lp_solver(lib, highs);
 
@@ -1565,6 +1716,9 @@ unsafe fn solve_sparse_mip_inner(
             unsafe { (lib.Highs_setDoubleOptionValue)(highs, heuristic_effort_opt.as_ptr(), 0.0) };
         }
     }
+
+    apply_env_overrides_common(lib, highs);
+    apply_env_overrides_mip(lib, highs);
 
     // Pass MIP model in one call (CSC format)
     let a_num_nz = a_value.len();
