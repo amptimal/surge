@@ -11,8 +11,8 @@ runs the canonical Rust workflow (SCUC → AC-SCED), and writes:
 
 Nothing else. Archive rotation, downstream scoring (violation report,
 load-value report), validator integration, retry heuristics, and
-per-scenario path conventions are not market concerns — they live in
-``benchmarks/go_c3/``.
+per-scenario path conventions are not market concerns — wrap
+:func:`solve` in your own harness for those.
 """
 
 from __future__ import annotations
@@ -165,8 +165,7 @@ def solve(
       console when ``policy.capture_solver_log`` is True).
 
     Returns the run-report dict. Callers that need scoring or
-    dashboard artifacts should wrap this function (see
-    ``benchmarks/go_c3/runner.py``).
+    dashboard artifacts should wrap this function.
     """
     import surge.market.go_c3 as go_c3_native
 
