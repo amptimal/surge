@@ -153,8 +153,8 @@ def solve(
 
     Runs the canonical Rust workflow (SCUC → AC-SCED) via
     :mod:`surge.market.go_c3`. One pass, no retries — operational
-    workarounds (e.g. retry with a reactive-support pin) live in
-    :mod:`benchmarks.go_c3.runner`.
+    workarounds (e.g. retry with a reactive-support pin) are left to
+    the caller.
 
     Writes four files to *workdir*:
 
