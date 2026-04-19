@@ -445,6 +445,8 @@ pub fn solve_scrd(
         q_start: None,
         q_index: None,
         q_value: None,
+        col_names: None,
+        row_names: None,
         integrality: None,
     };
 
@@ -711,6 +713,7 @@ mod tests {
                     objective: 0.0,
                     status: LpSolveStatus::Optimal,
                     iterations: 0,
+                    mip_trace: None,
                 })
             }
 

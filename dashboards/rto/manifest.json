@@ -1,0 +1,8 @@
+{
+  "name": "rto",
+  "title": "RTO Day-Ahead Market",
+  "description": "Build a day-ahead RTO market on any network. Load built-in IEEE / GO-C3 cases or upload your own; tune loads, generator offers, reserves, and policy; see LMPs, dispatch, and settlement live.",
+  "route": "rto",
+  "icon": "🌐",
+  "tag": "market"
+}

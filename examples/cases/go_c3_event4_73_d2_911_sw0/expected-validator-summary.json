@@ -1,0 +1,18 @@
+{
+  "error_diagnostics": "",
+  "feas": 1,
+  "infeas": 0,
+  "infeas_diagnostics": {},
+  "obj": 58819856.63677555,
+  "pass": 1,
+  "phys_feas": 0,
+  "problem_pass": 1,
+  "problem_surplus_total": 59781593.928331316,
+  "z": 58819856.63677555,
+  "z_base": 58914660.54065492,
+  "z_cost": 951301.5624654075,
+  "z_k_average_case": -46472.48615409092,
+  "z_k_worst_case": -48331.41772527811,
+  "z_penalty": 171945.87559418153,
+  "z_value": 60037907.97871451
+}

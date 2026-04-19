@@ -495,6 +495,8 @@ fn test_fast_violation_helper_includes_flowgate_and_interface_limits() {
         limit_mw_schedule: Vec::new(),
         limit_reverse_mw_schedule: Vec::new(),
         hvdc_coefficients: Vec::new(),
+        hvdc_band_coefficients: Vec::new(),
+        limit_mw_active_period: None,
     });
     net.interfaces.push(Interface {
         name: "IF_1".into(),
@@ -559,6 +561,8 @@ fn test_fast_violation_helper_ignores_outaged_branches_for_flowgates() {
         limit_mw_schedule: Vec::new(),
         limit_reverse_mw_schedule: Vec::new(),
         hvdc_coefficients: Vec::new(),
+        hvdc_band_coefficients: Vec::new(),
+        limit_mw_active_period: None,
     });
 
     let bus_map = net.bus_index_map();

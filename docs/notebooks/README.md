@@ -15,7 +15,7 @@ The canonical packaged case bundle for repo-level examples lives under
   more narrative context
 
 ```bash
-pip install maturin jupyterlab
+pip install maturin jupyterlab pandas matplotlib
 cd src/surge-py && maturin develop --release
 jupyter lab
 ```
@@ -35,12 +35,15 @@ jupyter lab
 | [09-pandas-construction.ipynb](09-pandas-construction.ipynb) | [Tutorial 09](../tutorials/09-pandas-construction.md) | Build networks from pandas DataFrames |
 | [10-subsystems.ipynb](10-subsystems.ipynb) | [Tutorial 10](../tutorials/10-subsystems.md) | Bus-set filters, areas, tie lines |
 | [11-loss-sensitivities.ipynb](11-loss-sensitivities.ipynb) | [Tutorial 11](../tutorials/11-loss-sensitivities.md) | Marginal loss factors, loss-aware OPF, LMP decomposition |
+| [12-dispatch-activsg.ipynb](12-dispatch-activsg.ipynb) | [Tutorial 12](../tutorials/12-dispatch-activsg.md) | 24-hour ACTIVSg dispatch and LMP heat maps |
 
 ## Requirements
 
 - Python 3.12 through 3.14
 - `surge` built from this repository
 - `numpy`
+- `pandas`
+- `matplotlib`
 - JupyterLab or another notebook frontend
 
 Some workflows require user-supplied case files or topology models. Those

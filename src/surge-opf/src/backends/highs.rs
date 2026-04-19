@@ -8,12 +8,20 @@
 
 use std::ffi::CString;
 use std::os::raw::c_char;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use libloading::Library;
 use tracing::{debug, info, warn};
 
-use super::{LpOptions, LpResult, LpSolveStatus, LpSolver, SparseProblem, VariableDomain};
+use super::{
+    LpAlgorithm, LpOptions, LpPrimalStart, LpResult, LpSolveStatus, LpSolver, SparseProblem,
+    VariableDomain,
+};
+
+fn log_highs_mip_trace(message: impl AsRef<str>) {
+    info!("highs_mip: {}", message.as_ref());
+}
 
 // ---------------------------------------------------------------------------
 // HiGHS C API types and constants
@@ -32,6 +40,11 @@ const MODEL_STATUS_OBJECTIVE_TARGET: HighsInt = 12;
 const MODEL_STATUS_REACHED_TIME_LIMIT: HighsInt = 13;
 const MATRIX_FORMAT_COLUMN_WISE: HighsInt = 1;
 const OBJECTIVE_SENSE_MINIMIZE: HighsInt = 1;
+const CALLBACK_MIP_SOLUTION: HighsInt = 3;
+const CALLBACK_MIP_IMPROVING_SOLUTION: HighsInt = 4;
+const CALLBACK_MIP_LOGGING: HighsInt = 5;
+const CALLBACK_MIP_INTERRUPT: HighsInt = 6;
+const MODEL_STATUS_INTERRUPT: HighsInt = 17;
 
 fn is_integer_domain(domain: VariableDomain) -> bool {
     !matches!(domain, VariableDomain::Continuous)
@@ -41,6 +54,86 @@ fn highs_integrality_value(domain: VariableDomain) -> HighsInt {
     match domain {
         VariableDomain::Continuous => 0,
         VariableDomain::Binary | VariableDomain::Integer => 1,
+    }
+}
+
+#[repr(C)]
+struct HighsCallbackDataOut {
+    cbdata: *mut std::ffi::c_void,
+    log_type: i32,
+    running_time: f64,
+    simplex_iteration_count: HighsInt,
+    ipm_iteration_count: HighsInt,
+    pdlp_iteration_count: HighsInt,
+    objective_function_value: f64,
+    mip_node_count: i64,
+    mip_total_lp_iterations: i64,
+    mip_primal_bound: f64,
+    mip_dual_bound: f64,
+    mip_gap: f64,
+    mip_solution: *mut f64,
+    mip_solution_size: HighsInt,
+}
+
+#[repr(C)]
+struct HighsCallbackDataIn {
+    user_interrupt: i32,
+    user_solution: *mut f64,
+    cbdata: *mut std::ffi::c_void,
+    user_has_solution: i32,
+    user_solution_size: HighsInt,
+}
+
+type HighsCCallbackType = unsafe extern "C" fn(
+    HighsInt,
+    *const c_char,
+    *const HighsCallbackDataOut,
+    *mut HighsCallbackDataIn,
+    *mut std::ffi::c_void,
+);
+
+struct MipIncumbentCapture {
+    best_solution: Mutex<Option<Vec<f64>>>,
+    interrupt_after_secs: Option<f64>,
+    interrupt_requested: AtomicBool,
+}
+
+unsafe extern "C" fn capture_highs_mip_solution_callback(
+    _callback_type: HighsInt,
+    _message: *const c_char,
+    data_out: *const HighsCallbackDataOut,
+    data_in: *mut HighsCallbackDataIn,
+    user_data: *mut std::ffi::c_void,
+) {
+    if data_out.is_null() || user_data.is_null() {
+        return;
+    }
+
+    let capture = unsafe { &*(user_data as *const MipIncumbentCapture) };
+    let data_out = unsafe { &*data_out };
+    if !data_out.mip_solution.is_null() && data_out.mip_solution_size > 0 {
+        let values = unsafe {
+            std::slice::from_raw_parts(data_out.mip_solution, data_out.mip_solution_size as usize)
+                .to_vec()
+        };
+        if let Ok(mut slot) = capture.best_solution.lock() {
+            *slot = Some(values);
+        }
+    }
+    if let Some(limit) = capture.interrupt_after_secs
+        && data_out.running_time + 1e-9 >= limit
+        && !data_in.is_null()
+        && capture
+            .best_solution
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(Vec::len))
+            .is_some()
+    {
+        unsafe {
+            (*data_in).user_interrupt = 1;
+        }
+        capture.interrupt_requested.store(true, Ordering::Relaxed);
     }
 }
 
@@ -135,6 +228,12 @@ struct HighsLib {
         *const f64,
         *const f64,
     ) -> HighsInt,
+    Highs_setSparseSolution: unsafe extern "C" fn(
+        *mut std::ffi::c_void,
+        HighsInt,
+        *const HighsInt,
+        *const f64,
+    ) -> HighsInt,
     Highs_setBoolOptionValue:
         unsafe extern "C" fn(*mut std::ffi::c_void, *const c_char, HighsInt) -> HighsInt,
     Highs_setDoubleOptionValue:
@@ -145,6 +244,15 @@ struct HighsLib {
         unsafe extern "C" fn(*mut std::ffi::c_void, *const c_char, *mut f64) -> HighsInt,
     Highs_getIntInfoValue:
         unsafe extern "C" fn(*mut std::ffi::c_void, *const c_char, *mut HighsInt) -> HighsInt,
+    Highs_setCallback: Option<
+        unsafe extern "C" fn(
+            *mut std::ffi::c_void,
+            HighsCCallbackType,
+            *mut std::ffi::c_void,
+        ) -> HighsInt,
+    >,
+    Highs_startCallback: Option<unsafe extern "C" fn(*mut std::ffi::c_void, HighsInt) -> HighsInt>,
+    Highs_stopCallback: Option<unsafe extern "C" fn(*mut std::ffi::c_void, HighsInt) -> HighsInt>,
     Highs_getIis: unsafe extern "C" fn(
         *mut std::ffi::c_void,
         *mut HighsInt,
@@ -216,6 +324,11 @@ unsafe fn load_highs_symbols(lib: Library) -> Result<HighsLib, String> {
         ($name:literal, $ty:ty) => {
             *unsafe { lib.get::<$ty>($name) }
                 .map_err(|e| format!("HiGHS symbol {} not found: {e}", stringify!($name)))?
+        };
+    }
+    macro_rules! optional_sym {
+        ($name:literal, $ty:ty) => {
+            unsafe { lib.get::<$ty>($name) }.ok().map(|symbol| *symbol)
         };
     }
     Ok(HighsLib {
@@ -334,6 +447,15 @@ unsafe fn load_highs_symbols(lib: Library) -> Result<HighsLib, String> {
                 *const f64,
             ) -> HighsInt
         ),
+        Highs_setSparseSolution: sym!(
+            b"Highs_setSparseSolution\0",
+            unsafe extern "C" fn(
+                *mut std::ffi::c_void,
+                HighsInt,
+                *const HighsInt,
+                *const f64,
+            ) -> HighsInt
+        ),
         Highs_setBoolOptionValue: sym!(
             b"Highs_setBoolOptionValue\0",
             unsafe extern "C" fn(*mut std::ffi::c_void, *const c_char, HighsInt) -> HighsInt
@@ -353,6 +475,22 @@ unsafe fn load_highs_symbols(lib: Library) -> Result<HighsLib, String> {
         Highs_getIntInfoValue: sym!(
             b"Highs_getIntInfoValue\0",
             unsafe extern "C" fn(*mut std::ffi::c_void, *const c_char, *mut HighsInt) -> HighsInt
+        ),
+        Highs_setCallback: optional_sym!(
+            b"Highs_setCallback\0",
+            unsafe extern "C" fn(
+                *mut std::ffi::c_void,
+                HighsCCallbackType,
+                *mut std::ffi::c_void,
+            ) -> HighsInt
+        ),
+        Highs_startCallback: optional_sym!(
+            b"Highs_startCallback\0",
+            unsafe extern "C" fn(*mut std::ffi::c_void, HighsInt) -> HighsInt
+        ),
+        Highs_stopCallback: optional_sym!(
+            b"Highs_stopCallback\0",
+            unsafe extern "C" fn(*mut std::ffi::c_void, HighsInt) -> HighsInt
         ),
         Highs_getIis: sym!(
             b"Highs_getIis\0",
@@ -380,21 +518,180 @@ unsafe fn load_highs_symbols(lib: Library) -> Result<HighsLib, String> {
 // Solver logic (unchanged, just calls through lib.* instead of bare FFI)
 // ---------------------------------------------------------------------------
 
-fn maybe_override_presolve(lib: &HighsLib, highs: *mut std::ffi::c_void) {
-    let Some(value) = std::env::var("SURGE_HIGHS_PRESOLVE").ok() else {
-        return;
-    };
-    let normalized = value.trim().to_ascii_lowercase();
-    let override_value = match normalized.as_str() {
-        "0" | "off" | "false" => "off",
-        "1" | "on" | "true" => "on",
-        _ => return,
-    };
+fn set_presolve_option(lib: &HighsLib, highs: *mut std::ffi::c_void, override_value: &str) {
     let option = CString::new("presolve").expect("static string contains no null bytes");
     let setting = CString::new(override_value).expect("static string contains no null bytes");
     unsafe {
         (lib.Highs_setStringOptionValue)(highs, option.as_ptr(), setting.as_ptr());
     }
+}
+
+fn set_string_option(lib: &HighsLib, highs: *mut std::ffi::c_void, option_name: &str, value: &str) {
+    let option = CString::new(option_name).expect("static string contains no null bytes");
+    let setting = CString::new(value).expect("static string contains no null bytes");
+    unsafe {
+        (lib.Highs_setStringOptionValue)(highs, option.as_ptr(), setting.as_ptr());
+    }
+}
+
+fn configure_presolve(lib: &HighsLib, highs: *mut std::ffi::c_void, preserve_primal_start: bool) {
+    if let Ok(value) = std::env::var("SURGE_HIGHS_PRESOLVE") {
+        let normalized = value.trim().to_ascii_lowercase();
+        let override_value = match normalized.as_str() {
+            "0" | "off" | "false" => "off",
+            "1" | "on" | "true" => "on",
+            _ => return,
+        };
+        set_presolve_option(lib, highs, override_value);
+        return;
+    }
+
+    if preserve_primal_start {
+        set_presolve_option(lib, highs, "off");
+    }
+}
+
+fn configure_lp_algorithm(lib: &HighsLib, highs: *mut std::ffi::c_void, algorithm: LpAlgorithm) {
+    let Some(value) = (match algorithm {
+        LpAlgorithm::Auto => None,
+        LpAlgorithm::Simplex => Some("simplex"),
+        LpAlgorithm::Ipm => Some("ipm"),
+    }) else {
+        return;
+    };
+    set_string_option(lib, highs, "solver", value);
+    if matches!(algorithm, LpAlgorithm::Ipm) {
+        set_string_option(lib, highs, "run_crossover", "off");
+    }
+}
+
+fn configure_mip_lp_solver(lib: &HighsLib, highs: *mut std::ffi::c_void) {
+    let value = std::env::var("SURGE_HIGHS_MIP_LP_SOLVER")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "simplex".to_string());
+    set_string_option(lib, highs, "mip_lp_solver", &value);
+}
+
+fn apply_primal_start_hint(
+    lib: &HighsLib,
+    highs: *mut std::ffi::c_void,
+    primal_start: Option<&LpPrimalStart>,
+    expected_n_col: usize,
+    trace_prefix: &str,
+) {
+    let Some(start) = primal_start else {
+        return;
+    };
+
+    match start {
+        LpPrimalStart::Dense(start) => {
+            if start.len() != expected_n_col {
+                warn!(
+                    expected = expected_n_col,
+                    actual = start.len(),
+                    trace_prefix,
+                    "Ignoring HiGHS dense primal start with mismatched column count"
+                );
+                return;
+            }
+            let set_solution_status = unsafe {
+                (lib.Highs_setSolution)(
+                    highs,
+                    start.as_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            };
+            if set_solution_status != STATUS_OK {
+                warn!(
+                    set_solution_status,
+                    trace_prefix, "HiGHS rejected the provided dense primal start"
+                );
+            } else if env_flag("SURGE_DEBUG_HIGHS_MIP") {
+                log_highs_mip_trace(format!(
+                    "{trace_prefix} start_type=dense assigned={}",
+                    start.len()
+                ));
+            }
+        }
+        LpPrimalStart::Sparse { indices, values } => {
+            if indices.len() != values.len() {
+                warn!(
+                    indices = indices.len(),
+                    values = values.len(),
+                    trace_prefix,
+                    "Ignoring HiGHS sparse primal start with mismatched arrays"
+                );
+                return;
+            }
+            let sparse_indices: Vec<HighsInt> = indices
+                .iter()
+                .filter_map(|&idx| HighsInt::try_from(idx).ok())
+                .collect();
+            if sparse_indices.len() != indices.len() {
+                warn!(
+                    trace_prefix,
+                    "Ignoring HiGHS sparse primal start with out-of-range column indices"
+                );
+                return;
+            }
+            let set_solution_status = unsafe {
+                (lib.Highs_setSparseSolution)(
+                    highs,
+                    sparse_indices.len() as HighsInt,
+                    sparse_indices.as_ptr(),
+                    values.as_ptr(),
+                )
+            };
+            if set_solution_status != STATUS_OK {
+                warn!(
+                    set_solution_status,
+                    assigned = sparse_indices.len(),
+                    trace_prefix,
+                    "HiGHS rejected the provided sparse primal start"
+                );
+            } else if env_flag("SURGE_DEBUG_HIGHS_MIP") {
+                log_highs_mip_trace(format!(
+                    "{trace_prefix} start_type=sparse assigned={}",
+                    sparse_indices.len()
+                ));
+            }
+        }
+    }
+}
+
+fn env_flag(name: &str) -> bool {
+    matches!(
+        std::env::var(name)
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1" | "true" | "on" | "yes")
+    )
+}
+
+fn objective_scale_factor(col_cost: &[f64], q_value: Option<&[f64]>) -> f64 {
+    let max_linear = col_cost
+        .iter()
+        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    let max_quadratic = q_value
+        .map(|values| {
+            values
+                .iter()
+                .fold(0.0_f64, |acc, value| acc.max(value.abs()))
+        })
+        .unwrap_or(0.0);
+    let max_coeff = max_linear.max(max_quadratic);
+    if !max_coeff.is_finite() || max_coeff <= 1.0e4 {
+        return 1.0;
+    }
+    let exponent = (max_coeff.log10().floor() - 3.0).max(0.0);
+    10.0_f64.powf(exponent)
 }
 
 /// Sparse QP solution (primal + dual).
@@ -554,6 +851,9 @@ fn solve_sparse_qp(
     q_index: Option<&[HighsInt]>,
     q_value: Option<&[f64]>,
     tolerance: f64,
+    time_limit_secs: Option<f64>,
+    primal_start: Option<&LpPrimalStart>,
+    algorithm: LpAlgorithm,
 ) -> Result<SparseQpSolution, String> {
     let has_hessian = q_value.is_some_and(|v| !v.is_empty());
     debug!(
@@ -581,8 +881,25 @@ fn solve_sparse_qp(
         }
 
         let result = solve_sparse_qp_inner(
-            lib, highs, n_col, n_row, col_cost, col_lower, col_upper, row_lower, row_upper,
-            a_start, a_index, a_value, q_start, q_index, q_value, tolerance,
+            lib,
+            highs,
+            n_col,
+            n_row,
+            col_cost,
+            col_lower,
+            col_upper,
+            row_lower,
+            row_upper,
+            a_start,
+            a_index,
+            a_value,
+            q_start,
+            q_index,
+            q_value,
+            tolerance,
+            time_limit_secs,
+            primal_start,
+            algorithm,
         );
 
         (lib.Highs_destroy)(highs);
@@ -608,6 +925,9 @@ unsafe fn solve_sparse_qp_inner(
     q_index: Option<&[HighsInt]>,
     q_value: Option<&[f64]>,
     tolerance: f64,
+    time_limit_secs: Option<f64>,
+    primal_start: Option<&LpPrimalStart>,
+    algorithm: LpAlgorithm,
 ) -> Result<SparseQpSolution, String> {
     // Suppress output (set SURGE_HIGHS_VERBOSE=1 to enable HiGHS logging)
     let verbose = std::env::var("SURGE_HIGHS_VERBOSE").is_ok();
@@ -615,7 +935,32 @@ unsafe fn solve_sparse_qp_inner(
     unsafe {
         (lib.Highs_setBoolOptionValue)(highs, output_flag.as_ptr(), if verbose { 1 } else { 0 })
     };
-    maybe_override_presolve(lib, highs);
+    configure_presolve(lib, highs, primal_start.is_some());
+    configure_lp_algorithm(lib, highs, algorithm);
+
+    let objective_scale = objective_scale_factor(col_cost, q_value);
+    let scaled_col_cost_storage = if objective_scale != 1.0 {
+        Some(
+            col_cost
+                .iter()
+                .map(|value| *value / objective_scale)
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        None
+    };
+    let scaled_q_value_storage = if objective_scale != 1.0 {
+        q_value.map(|values| {
+            values
+                .iter()
+                .map(|value| *value / objective_scale)
+                .collect::<Vec<_>>()
+        })
+    } else {
+        None
+    };
+    let scaled_col_cost = scaled_col_cost_storage.as_deref().unwrap_or(col_cost);
+    let scaled_q_value = scaled_q_value_storage.as_deref().or(q_value);
 
     // Set tolerances
     let tol = tolerance.max(1e-10);
@@ -625,6 +970,10 @@ unsafe fn solve_sparse_qp_inner(
         CString::new("dual_feasibility_tolerance").expect("static string contains no null bytes");
     unsafe { (lib.Highs_setDoubleOptionValue)(highs, primal_tol.as_ptr(), tol) };
     unsafe { (lib.Highs_setDoubleOptionValue)(highs, dual_tol.as_ptr(), tol) };
+    if let Some(limit) = time_limit_secs {
+        let time_opt = CString::new("time_limit").expect("static string contains no null bytes");
+        unsafe { (lib.Highs_setDoubleOptionValue)(highs, time_opt.as_ptr(), limit) };
+    }
 
     // Load the model.  For QP problems we use Highs_passModel, which passes
     // the LP and Hessian atomically so HiGHS knows from the start that it is
@@ -652,7 +1001,7 @@ unsafe fn solve_sparse_qp_inner(
         Some((
             q_start.expect("q_start Some when q_nnz > 0"),
             q_index.expect("q_index Some when q_nnz > 0"),
-            q_value.expect("q_value Some when q_nnz > 0"),
+            scaled_q_value.expect("q_value Some when q_nnz > 0"),
         ))
     } else {
         None
@@ -697,6 +1046,11 @@ unsafe fn solve_sparse_qp_inner(
                         .expect("static string contains no null bytes");
                     (lib.Highs_setDoubleOptionValue)(lp_highs, ptol.as_ptr(), tol);
                     (lib.Highs_setDoubleOptionValue)(lp_highs, dtol.as_ptr(), tol);
+                    if let Some(limit) = time_limit_secs {
+                        let time_opt = CString::new("time_limit")
+                            .expect("static string contains no null bytes");
+                        (lib.Highs_setDoubleOptionValue)(lp_highs, time_opt.as_ptr(), limit);
+                    }
                     (lib.Highs_passLp)(
                         lp_highs,
                         n_col as HighsInt,
@@ -705,7 +1059,7 @@ unsafe fn solve_sparse_qp_inner(
                         MATRIX_FORMAT_COLUMN_WISE,
                         OBJECTIVE_SENSE_MINIMIZE,
                         0.0,
-                        col_cost.as_ptr(),
+                        scaled_col_cost.as_ptr(),
                         col_lower.as_ptr(),
                         col_upper.as_ptr(),
                         row_lower.as_ptr(),
@@ -768,7 +1122,7 @@ unsafe fn solve_sparse_qp_inner(
                 1,                         // kHighsHessianFormatTriangular
                 OBJECTIVE_SENSE_MINIMIZE,
                 0.0, // offset
-                col_cost.as_ptr(),
+                scaled_col_cost.as_ptr(),
                 col_lower.as_ptr(),
                 col_upper.as_ptr(),
                 row_lower.as_ptr(),
@@ -793,7 +1147,7 @@ unsafe fn solve_sparse_qp_inner(
                 MATRIX_FORMAT_COLUMN_WISE,
                 OBJECTIVE_SENSE_MINIMIZE,
                 0.0,
-                col_cost.as_ptr(),
+                scaled_col_cost.as_ptr(),
                 col_lower.as_ptr(),
                 col_upper.as_ptr(),
                 row_lower.as_ptr(),
@@ -823,6 +1177,7 @@ unsafe fn solve_sparse_qp_inner(
         let null_ptr: *const f64 = std::ptr::null();
         unsafe { (lib.Highs_setSolution)(highs, col_vals.as_ptr(), null_ptr, null_ptr, null_ptr) };
     }
+    apply_primal_start_hint(lib, highs, primal_start, n_col, "highs_lp_trace");
 
     // For QP problems, set an adaptive diagonal regularization value.
     //
@@ -913,6 +1268,19 @@ unsafe fn solve_sparse_qp_inner(
             let obj_info_c =
                 CString::new("objective_function_value").expect("static CStr has no null bytes");
             unsafe { (lib.Highs_getDoubleInfoValue)(highs, obj_info_c.as_ptr(), &mut obj_val_rec) };
+            obj_val_rec *= objective_scale;
+            // Unscale duals/reduced costs to match the unscaled objective.
+            // HiGHS solved a problem with cost coefficients divided by
+            // `objective_scale`, so the duals it returns are also scaled
+            // down by the same factor.
+            if objective_scale != 1.0 {
+                for v in row_dual_rec.iter_mut() {
+                    *v *= objective_scale;
+                }
+                for v in col_dual_rec.iter_mut() {
+                    *v *= objective_scale;
+                }
+            }
 
             warn!(
                 max_viol,
@@ -987,7 +1355,7 @@ unsafe fn solve_sparse_qp_inner(
     let mut row_value = vec![0.0; n_row];
     let mut row_dual_out = vec![0.0; n_row];
 
-    unsafe {
+    let get_solution_status = unsafe {
         (lib.Highs_getSolution)(
             highs,
             col_value.as_mut_ptr(),
@@ -996,11 +1364,30 @@ unsafe fn solve_sparse_qp_inner(
             row_dual_out.as_mut_ptr(),
         )
     };
+    if get_solution_status != STATUS_OK {
+        warn!(
+            get_solution_status,
+            model_status, "HiGHS_getSolution returned a non-OK status for MIP solve"
+        );
+    }
 
     let mut obj_val = 0.0;
     let obj_info =
         CString::new("objective_function_value").expect("static string contains no null bytes");
     unsafe { (lib.Highs_getDoubleInfoValue)(highs, obj_info.as_ptr(), &mut obj_val) };
+    obj_val *= objective_scale;
+    // Unscale duals/reduced costs to match the unscaled objective.
+    // HiGHS solved a problem with cost coefficients divided by
+    // `objective_scale`, so the duals it returns are also scaled
+    // down by the same factor.
+    if objective_scale != 1.0 {
+        for v in row_dual_out.iter_mut() {
+            *v *= objective_scale;
+        }
+        for v in col_dual_out.iter_mut() {
+            *v *= objective_scale;
+        }
+    }
 
     let mut iters: HighsInt = 0;
     let iter_info =
@@ -1039,6 +1426,8 @@ fn solve_sparse_mip_with_limit(
     integrality: &[HighsInt],
     tolerance: f64,
     time_limit_secs: Option<f64>,
+    mip_rel_gap: Option<f64>,
+    primal_start: Option<&LpPrimalStart>,
 ) -> Result<SparseQpSolution, String> {
     let n_integer = integrality.iter().filter(|&&v| v != 0).count();
     info!(
@@ -1082,6 +1471,8 @@ fn solve_sparse_mip_with_limit(
             integrality,
             tolerance,
             time_limit_secs,
+            mip_rel_gap,
+            primal_start,
         );
 
         (lib.Highs_destroy)(highs);
@@ -1106,11 +1497,27 @@ unsafe fn solve_sparse_mip_inner(
     integrality: &[HighsInt],
     tolerance: f64,
     time_limit_secs: Option<f64>,
+    mip_rel_gap: Option<f64>,
+    primal_start: Option<&LpPrimalStart>,
 ) -> Result<SparseQpSolution, String> {
     // Suppress output
     let output_flag = CString::new("output_flag").expect("static string contains no null bytes");
     unsafe { (lib.Highs_setBoolOptionValue)(highs, output_flag.as_ptr(), 0) };
-    maybe_override_presolve(lib, highs);
+    configure_presolve(lib, highs, primal_start.is_some());
+    configure_mip_lp_solver(lib, highs);
+
+    let objective_scale = objective_scale_factor(col_cost, None);
+    let scaled_col_cost_storage = if objective_scale != 1.0 {
+        Some(
+            col_cost
+                .iter()
+                .map(|value| *value / objective_scale)
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        None
+    };
+    let scaled_col_cost = scaled_col_cost_storage.as_deref().unwrap_or(col_cost);
 
     // Set tolerances
     let tol = tolerance.max(1e-10);
@@ -1132,6 +1539,33 @@ unsafe fn solve_sparse_mip_inner(
         unsafe { (lib.Highs_setDoubleOptionValue)(highs, time_opt.as_ptr(), limit) };
     }
 
+    // Set MIP relative gap.  When the caller provides an explicit target, use
+    // that.  Otherwise, for large warm-started UC models the HiGHS default
+    // 0.01% gap can spend a long time in root-node cut separation; fall back
+    // to a 2% gap in that case.
+    {
+        let effective_gap = mip_rel_gap.or(
+            if matches!(primal_start, Some(LpPrimalStart::Dense(_))) && n_col >= 100_000 {
+                Some(0.02)
+            } else {
+                None
+            },
+        );
+        if let Some(gap) = effective_gap {
+            let rel_gap_opt =
+                CString::new("mip_rel_gap").expect("static string contains no null bytes");
+            unsafe { (lib.Highs_setDoubleOptionValue)(highs, rel_gap_opt.as_ptr(), gap) };
+        }
+        if matches!(primal_start, Some(LpPrimalStart::Dense(_)))
+            && n_col >= 100_000
+            && mip_rel_gap.is_none()
+        {
+            let heuristic_effort_opt =
+                CString::new("mip_heuristic_effort").expect("static string contains no null bytes");
+            unsafe { (lib.Highs_setDoubleOptionValue)(highs, heuristic_effort_opt.as_ptr(), 0.0) };
+        }
+    }
+
     // Pass MIP model in one call (CSC format)
     let a_num_nz = a_value.len();
     let status = unsafe {
@@ -1143,7 +1577,7 @@ unsafe fn solve_sparse_mip_inner(
             MATRIX_FORMAT_COLUMN_WISE,
             OBJECTIVE_SENSE_MINIMIZE,
             0.0, // offset
-            col_cost.as_ptr(),
+            scaled_col_cost.as_ptr(),
             col_lower.as_ptr(),
             col_upper.as_ptr(),
             row_lower.as_ptr(),
@@ -1157,6 +1591,40 @@ unsafe fn solve_sparse_mip_inner(
     if status < 0 {
         return Err(format!("Highs_passMip failed: status {status}"));
     }
+
+    apply_primal_start_hint(lib, highs, primal_start, n_col, "highs_mip_trace");
+
+    let incumbent_capture = MipIncumbentCapture {
+        best_solution: Mutex::new(None),
+        interrupt_after_secs: time_limit_secs.filter(|limit| limit.is_finite() && *limit > 0.0),
+        interrupt_requested: AtomicBool::new(false),
+    };
+    let callback_registered = if let (Some(set_callback), Some(start_callback)) =
+        (lib.Highs_setCallback, lib.Highs_startCallback)
+    {
+        let status = unsafe {
+            set_callback(
+                highs,
+                capture_highs_mip_solution_callback,
+                (&incumbent_capture as *const MipIncumbentCapture)
+                    .cast_mut()
+                    .cast(),
+            )
+        };
+        if status == STATUS_OK {
+            unsafe {
+                start_callback(highs, CALLBACK_MIP_SOLUTION);
+                start_callback(highs, CALLBACK_MIP_IMPROVING_SOLUTION);
+                start_callback(highs, CALLBACK_MIP_LOGGING);
+                start_callback(highs, CALLBACK_MIP_INTERRUPT);
+            }
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
 
     // Solve
     let run_status = unsafe { (lib.Highs_run)(highs) };
@@ -1172,6 +1640,7 @@ unsafe fn solve_sparse_mip_inner(
     let converged = model_status == MODEL_STATUS_OPTIMAL
         || model_status == MODEL_STATUS_OBJECTIVE_BOUND
         || model_status == MODEL_STATUS_OBJECTIVE_TARGET;
+    let interrupted = model_status == MODEL_STATUS_INTERRUPT;
     let time_limit_feasible = model_status == MODEL_STATUS_REACHED_TIME_LIMIT;
 
     if model_status == MODEL_STATUS_INFEASIBLE {
@@ -1183,17 +1652,41 @@ unsafe fn solve_sparse_mip_inner(
     if model_status == MODEL_STATUS_UNBOUNDED {
         return Err("MIP is unbounded".into());
     }
-    if !converged && !time_limit_feasible {
+    if !converged && !time_limit_feasible && !interrupted {
         return Err(format!(
             "MIP solver stopped with model status {model_status}"
         ));
     }
-    if time_limit_feasible {
+    if time_limit_feasible || interrupted {
         warn!(
             model_status,
-            "HiGHS MIP reached time limit — returning best feasible solution; \
+            "HiGHS MIP stopped before proving optimality — returning best feasible solution; \
              solution is NOT proven optimal (LpSolveStatus will be SubOptimal)"
         );
+    }
+
+    let mut mip_primal_bound = f64::NAN;
+    let mut mip_dual_bound = f64::NAN;
+    let mut mip_gap = f64::NAN;
+    let mip_primal_bound_info =
+        CString::new("mip_primal_bound").expect("static string contains no null bytes");
+    let mip_dual_bound_info =
+        CString::new("mip_dual_bound").expect("static string contains no null bytes");
+    let mip_gap_info = CString::new("mip_gap").expect("static string contains no null bytes");
+    unsafe {
+        (lib.Highs_getDoubleInfoValue)(
+            highs,
+            mip_primal_bound_info.as_ptr(),
+            &mut mip_primal_bound,
+        );
+        (lib.Highs_getDoubleInfoValue)(highs, mip_dual_bound_info.as_ptr(), &mut mip_dual_bound);
+        (lib.Highs_getDoubleInfoValue)(highs, mip_gap_info.as_ptr(), &mut mip_gap);
+    }
+    if mip_primal_bound.is_finite() {
+        mip_primal_bound *= objective_scale;
+    }
+    if mip_dual_bound.is_finite() {
+        mip_dual_bound *= objective_scale;
     }
 
     // Extract solution (duals are not meaningful for MIP)
@@ -1202,7 +1695,7 @@ unsafe fn solve_sparse_mip_inner(
     let mut row_value = vec![0.0; n_row];
     let mut row_dual_out = vec![0.0; n_row];
 
-    unsafe {
+    let get_solution_status = unsafe {
         (lib.Highs_getSolution)(
             highs,
             col_value.as_mut_ptr(),
@@ -1211,11 +1704,78 @@ unsafe fn solve_sparse_mip_inner(
             row_dual_out.as_mut_ptr(),
         )
     };
+    if get_solution_status != STATUS_OK {
+        warn!(
+            get_solution_status,
+            model_status, "HiGHS_getSolution returned a non-OK status for MIP solve"
+        );
+    }
+
+    if callback_registered {
+        if let Some(stop_callback) = lib.Highs_stopCallback {
+            unsafe {
+                stop_callback(highs, CALLBACK_MIP_SOLUTION);
+                stop_callback(highs, CALLBACK_MIP_IMPROVING_SOLUTION);
+                stop_callback(highs, CALLBACK_MIP_LOGGING);
+                stop_callback(highs, CALLBACK_MIP_INTERRUPT);
+            }
+        }
+    }
+
+    let callback_incumbent = incumbent_capture
+        .best_solution
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().cloned());
+    let has_callback_incumbent = callback_incumbent
+        .as_ref()
+        .is_some_and(|best_solution| best_solution.len() == n_col);
+    let has_feasible_incumbent = mip_primal_bound.is_finite() || has_callback_incumbent;
+
+    if (time_limit_feasible || interrupted) && !has_feasible_incumbent {
+        return Err(
+            "HiGHS MIP reached the time limit before producing any feasible incumbent".into(),
+        );
+    }
+
+    if (!converged || time_limit_feasible || interrupted)
+        && let Some(best_solution) = callback_incumbent.as_ref()
+        && best_solution.len() == n_col
+    {
+        col_value.clone_from(best_solution);
+    }
+
+    if env_flag("SURGE_DEBUG_HIGHS_MIP") {
+        let incumbent_captured = callback_incumbent.as_ref().map(Vec::len).unwrap_or(0);
+        log_highs_mip_trace(format!(
+            "highs_mip_trace model_status={} converged={} time_limit_feasible={} has_feasible_incumbent={} get_solution_status={} incumbent_captured_len={} primal_bound={:.12} dual_bound={:.12} mip_gap={:.12}",
+            model_status,
+            converged,
+            time_limit_feasible || interrupted,
+            has_feasible_incumbent,
+            get_solution_status,
+            incumbent_captured,
+            mip_primal_bound,
+            mip_dual_bound,
+            mip_gap,
+        ));
+    }
 
     let mut obj_val = 0.0;
     let obj_info =
         CString::new("objective_function_value").expect("static string contains no null bytes");
     unsafe { (lib.Highs_getDoubleInfoValue)(highs, obj_info.as_ptr(), &mut obj_val) };
+    obj_val *= objective_scale;
+    // MIP: duals are not meaningful, but unscale defensively in case any
+    // downstream consumer treats them as if they were.
+    if objective_scale != 1.0 {
+        for v in row_dual_out.iter_mut() {
+            *v *= objective_scale;
+        }
+        for v in col_dual_out.iter_mut() {
+            *v *= objective_scale;
+        }
+    }
 
     let mut iters: HighsInt = 0;
     let iter_info =
@@ -1299,6 +1859,8 @@ impl LpSolver for HiGHSLpSolver {
                 &highs_integ,
                 opts.tolerance,
                 opts.time_limit_secs,
+                opts.mip_rel_gap,
+                opts.primal_start.as_ref(),
             )?;
 
             let status = if sol.converged {
@@ -1314,6 +1876,7 @@ impl LpSolver for HiGHSLpSolver {
                 objective: sol.objective,
                 status,
                 iterations: sol.iterations,
+                mip_trace: None,
             })
         } else {
             let sol = solve_sparse_qp(
@@ -1332,6 +1895,9 @@ impl LpSolver for HiGHSLpSolver {
                 prob.q_index.as_deref(),
                 prob.q_value.as_deref(),
                 opts.tolerance,
+                opts.time_limit_secs,
+                opts.primal_start.as_ref(),
+                opts.algorithm,
             )?;
 
             let status = if sol.converged {
@@ -1347,6 +1913,7 @@ impl LpSolver for HiGHSLpSolver {
                 objective: sol.objective,
                 status,
                 iterations: sol.iterations,
+                mip_trace: None,
             })
         }
     }

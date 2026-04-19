@@ -1,0 +1,42 @@
+[package]
+name = "surge-dispatch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Surge dispatch — SCED and multi-period production cost simulation"
+readme = "README.md"
+keywords = ["power-systems", "dispatch", "sced", "scuc"]
+categories = ["science", "simulation", "algorithms"]
+
+[dependencies]
+surge-network.workspace = true
+surge-solution.workspace = true
+surge-ac.workspace = true
+surge-dc.workspace = true
+surge-hvdc.workspace = true
+surge-opf.workspace = true
+surge-sparse.workspace = true
+faer.workspace = true
+rayon.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+chrono.workspace = true
+csv.workspace = true
+parquet = { version = "57.3.0", optional = true, features = ["arrow"] }
+arrow-array = { version = "57.3.0", optional = true }
+arrow-schema = { version = "57.3.0", optional = true }
+
+[features]
+default = []
+parquet = ["dep:parquet", "dep:arrow-array", "dep:arrow-schema"]
+
+[dev-dependencies]
+anyhow.workspace = true
+surge-io.workspace = true

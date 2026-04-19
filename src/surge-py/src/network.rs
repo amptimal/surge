@@ -31,6 +31,17 @@ pub struct Network {
     pub(crate) switched_shunts: Vec<surge_network::network::SwitchedShunt>,
 }
 
+impl Network {
+    /// Wrap an owned `surge_network::Network` for Python consumption.
+    pub fn from_inner(inner: surge_network::Network) -> Self {
+        Self {
+            inner: Arc::new(inner),
+            oltc_controls: Vec::new(),
+            switched_shunts: Vec::new(),
+        }
+    }
+}
+
 #[pymethods]
 impl Network {
     /// Create an empty network.
@@ -1589,6 +1600,71 @@ impl Network {
                 v_target,
                 v_band,
                 n_active_steps: 0,
+            });
+        Ok(())
+    }
+
+    /// Register a switched shunt for AC-OPF continuous optimization.
+    ///
+    /// Unlike ``add_switched_shunt`` (which populates a power-flow outer-loop
+    /// control list tracked on the Python wrapper), this pushes a
+    /// ``SwitchedShuntOpf`` record onto ``network.controls.switched_shunts_opf``
+    /// so the AC-OPF can co-optimize the shunt as a continuous NLP variable
+    /// ``b_sw ∈ [b_min_pu, b_max_pu]``. Requires ``AcOpfOptions::optimize_switched_shunts = True``
+    /// to actually activate the variable; otherwise the NLP ignores the entry.
+    ///
+    /// Args:
+    ///   bus: External bus number hosting this shunt.
+    ///   b_min_pu: Minimum susceptance in per-unit (most inductive; typically
+    ///     negative for reactors).
+    ///   b_max_pu: Maximum susceptance in per-unit (most capacitive).
+    ///   b_init_pu: Initial / warm-start susceptance in per-unit.
+    ///   b_step_pu: Discrete step size in per-unit (for post-solve rounding
+    ///     in ``DiscreteMode::RoundAndCheck``). Set to 0 for continuous.
+    #[pyo3(signature = (bus, b_min_pu, b_max_pu, b_init_pu, b_step_pu=0.0))]
+    fn add_switched_shunt_opf(
+        &mut self,
+        bus: u32,
+        b_min_pu: f64,
+        b_max_pu: f64,
+        b_init_pu: f64,
+        b_step_pu: f64,
+    ) -> PyResult<()> {
+        if !self.inner.buses.iter().any(|b| b.number == bus) {
+            return Err(NetworkError::new_err(format!("Bus {bus} not found")));
+        }
+        if !(b_min_pu.is_finite() && b_max_pu.is_finite() && b_init_pu.is_finite()) {
+            return Err(PyValueError::new_err(
+                "add_switched_shunt_opf: b_min_pu, b_max_pu, b_init_pu must all be finite",
+            ));
+        }
+        if b_min_pu > b_max_pu {
+            return Err(PyValueError::new_err(format!(
+                "add_switched_shunt_opf bus {bus}: b_min_pu ({b_min_pu}) must be <= b_max_pu ({b_max_pu})"
+            )));
+        }
+        if !b_step_pu.is_finite() || b_step_pu < 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "add_switched_shunt_opf bus {bus}: b_step_pu ({b_step_pu}) must be finite and >= 0"
+            )));
+        }
+        let net = Arc::make_mut(&mut self.inner);
+        let ordinal = net
+            .controls
+            .switched_shunts_opf
+            .iter()
+            .filter(|ss| ss.bus == bus)
+            .count()
+            + 1;
+        net.controls
+            .switched_shunts_opf
+            .push(surge_network::network::SwitchedShuntOpf {
+                id: format!("switched_shunt_opf_{}_{}", bus, ordinal),
+                bus,
+                b_min_pu,
+                b_max_pu,
+                b_init_pu,
+                b_step_pu,
             });
         Ok(())
     }

@@ -381,6 +381,11 @@ class AcOpfOptions:
     Attributes:
         enforce_thermal_limits: Enforce branch apparent-power thermal
             limits (S <= rating_a). Default True.
+        thermal_limit_slack_penalty_per_mva: Optional penalty
+            ($/MVA-h) for explicit branch thermal overflow slack.
+            Positive values relax thermal limits with a heavily
+            penalized overflow variable instead of hard-failing.
+            Default 0.0 (disabled).
         minimum_branch_rating_a_mva: Branches with rate_a below this
             value (MVA) are treated as unconstrained. Default 1.0.
         enforce_angle_limits: Enforce branch angle-difference limits
@@ -414,6 +419,7 @@ class AcOpfOptions:
     """
 
     enforce_thermal_limits: bool = True
+    thermal_limit_slack_penalty_per_mva: float = 0.0
     minimum_branch_rating_a_mva: float = 1.0
     enforce_angle_limits: bool = False
     optimize_switched_shunts: bool = False
@@ -431,6 +437,10 @@ class AcOpfOptions:
     def __post_init__(self) -> None:
         _require_positive(
             "AcOpfOptions.minimum_branch_rating_a_mva", self.minimum_branch_rating_a_mva
+        )
+        _require_non_negative(
+            "AcOpfOptions.thermal_limit_slack_penalty_per_mva",
+            self.thermal_limit_slack_penalty_per_mva,
         )
         _require_positive("AcOpfOptions.interval_hours", self.interval_hours)
         for generator_id, energy_mwh in self.storage_state_mwh_by_generator_id.items():
@@ -464,6 +474,7 @@ class AcOpfOptions:
         return _compact_kwargs(
             {
                 "enforce_thermal_limits": self.enforce_thermal_limits,
+                "thermal_limit_slack_penalty_per_mva": self.thermal_limit_slack_penalty_per_mva,
                 "min_rate_a": self.minimum_branch_rating_a_mva,
                 "enforce_angle_limits": self.enforce_angle_limits,
                 "optimize_switched_shunts": self.optimize_switched_shunts,
@@ -506,6 +517,14 @@ class AcOpfRuntime:
         print_level: NLP solver verbosity. 0 (default) is silent,
             5 is maximum verbosity.
         warm_start: Prior OPF result to warm-start the NLP solver.
+        warm_start_vm_pu: Explicit initial bus voltage magnitudes in
+            per-unit. When provided together with warm_start, these
+            override the bus-voltage magnitudes from the prior OPF
+            result while preserving its generator/load dispatch seed.
+        warm_start_va_rad: Explicit initial bus voltage angles in
+            radians. When provided together with warm_start, these
+            override the bus-voltage angles from the prior OPF result
+            while preserving its generator/load dispatch seed.
         angle_warm_start: Angle initialization strategy. AUTO (default)
             uses DC-OPF warm start for large cases (n_buses > 2000).
             DC_OPF always seeds from a DC-OPF solution. DC_POWER_FLOW
@@ -520,6 +539,8 @@ class AcOpfRuntime:
     nlp_solver: str | None = None
     print_level: int = 0
     warm_start: OpfResult | None = None
+    warm_start_vm_pu: list[float] | None = None
+    warm_start_va_rad: list[float] | None = None
     angle_warm_start: AcAngleWarmStartMode = AcAngleWarmStartMode.AUTO
     constraint_screening: ConstraintScreening | None = None
 
@@ -546,6 +567,8 @@ class AcOpfRuntime:
             "nlp_solver": self.nlp_solver,
             "print_level": self.print_level,
             "warm_start": self.warm_start,
+            "warm_start_vm_pu": self.warm_start_vm_pu,
+            "warm_start_va_rad": self.warm_start_va_rad,
             "use_dc_opf_warm_start": use_dc_opf_warm_start,
         }
         if self.constraint_screening is not None:

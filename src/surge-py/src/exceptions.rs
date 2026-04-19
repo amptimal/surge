@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0
 //! Custom exception hierarchy and panic-handling helpers for Surge Python bindings.
 
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -107,6 +108,24 @@ pub(crate) fn to_scopf_pyerr(error: &surge_opf::security::types::ScopfError) -> 
             UnsupportedFeatureError::new_err(error.to_string())
         }
         ScopfError::SolverError(_) => SurgeError::new_err(error.to_string()),
+    }
+}
+
+pub(crate) fn to_dispatch_pyerr(error: &surge_dispatch::DispatchError) -> PyErr {
+    use surge_dispatch::DispatchError;
+
+    match error {
+        DispatchError::NoSlackBus
+        | DispatchError::NoGenerators
+        | DispatchError::MissingCost { .. } => NetworkError::new_err(error.to_string()),
+        DispatchError::InsufficientCapacity { .. } | DispatchError::InsufficientReserve { .. } => {
+            InfeasibleError::new_err(error.to_string())
+        }
+        DispatchError::InvalidInput(_) | DispatchError::HourOutOfRange { .. } => {
+            PyValueError::new_err(error.to_string())
+        }
+        DispatchError::NotConverged { .. } => ConvergenceError::new_err(error.to_string()),
+        DispatchError::SolverError(_) => SurgeError::new_err(error.to_string()),
     }
 }
 

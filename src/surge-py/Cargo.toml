@@ -21,6 +21,8 @@ surge-dc.workspace = true
 surge-ac.workspace = true
 surge-io.workspace = true
 surge-contingency.workspace = true
+surge-dispatch.workspace = true
+surge-market.workspace = true
 surge-opf.workspace = true
 surge-hvdc.workspace = true
 surge-topology.workspace = true
@@ -32,6 +34,8 @@ pyo3 = { version = "0.28", features = ["extension-module", "multiple-pymethods"]
 numpy = "0.28"
 chrono.workspace = true
 rayon.workspace = true
+serde.workspace = true
+serde_ignored.workspace = true
 serde_json.workspace = true
 zstd = "0.13"
 tracing.workspace = true

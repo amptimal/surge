@@ -58,6 +58,9 @@ pub struct CombinedCycleTransition {
 /// A combined cycle power plant with multiple configurations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CombinedCyclePlant {
+    /// Stable identifier for external references. Falls back to `name` when empty.
+    #[serde(default)]
+    pub id: String,
     /// Plant name.
     pub name: String,
     /// Available configurations.

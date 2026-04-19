@@ -1,0 +1,28 @@
+[package]
+name = "surge-market"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Higher-level market workflows, adapters, and dataset helpers for Surge dispatch"
+readme = "README.md"
+keywords = ["power-systems", "market", "dispatch", "workflow"]
+categories = ["science", "simulation", "algorithms"]
+
+[dependencies]
+surge-dispatch.workspace = true
+surge-io.workspace = true
+surge-network.workspace = true
+surge-opf.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+surge-io.workspace = true
+

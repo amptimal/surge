@@ -736,6 +736,8 @@ fn solve_ots_dc(
         q_value: quadratic_objective
             .as_ref()
             .map(|(_, _, value)| value.clone()),
+        col_names: None,
+        row_names: None,
         integrality: if relaxed { None } else { Some(integrality) },
     };
     let lp_opts = LpOptions {
@@ -745,6 +747,10 @@ fn solve_ots_dc(
             options.mip_gap.max(options.tolerance)
         },
         time_limit_secs: Some(options.time_limit_s),
+        mip_rel_gap: (!relaxed && options.mip_gap > 0.0).then_some(options.mip_gap),
+        mip_gap_schedule: None,
+        primal_start: None,
+        algorithm: crate::backends::LpAlgorithm::Auto,
         print_level: 0,
     };
     let result = lp_solver

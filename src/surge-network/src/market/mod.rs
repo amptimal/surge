@@ -37,7 +37,8 @@ pub use profiles::{
 pub use pumped_hydro::PumpedHydroUnit;
 pub use reserve::{
     EnergyCoupling, QualificationMap, QualificationRule, RampSharingConfig, ReserveDirection,
-    ReserveOffer, ReserveProduct, SystemReserveRequirement, ZonalReserveRequirement, qualifies_for,
+    ReserveKind, ReserveOffer, ReserveProduct, SystemReserveRequirement, ZonalReserveRequirement,
+    qualifications_can_overlap, qualifies_for,
 };
 pub use rules::{MarketRules, ReserveZone};
 pub use virtual_bid::{VirtualBid, VirtualBidDirection, VirtualBidResult};

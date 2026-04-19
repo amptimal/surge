@@ -60,19 +60,32 @@ fn dc_opf_json_envelope(
     }
 }
 
-fn ac_opf_json_envelope(
-    result: &surge_solution::OpfSolution,
-) -> CliResultEnvelope<'_, surge_solution::OpfSolution> {
-    CliResultEnvelope {
-        termination: CliTermination {
+fn ac_opf_json_envelope(result: &surge_solution::OpfSolution) -> Result<serde_json::Value> {
+    let encoded_result = surge_io::json::encode_checked_audited_solution(result)
+        .context("failed to encode audited AC-OPF result")?;
+    Ok(serde_json::json!({
+        "termination": CliTermination {
             kind: "local_nlp_solution",
             converged: result.power_flow.status == surge_solution::SolveStatus::Converged,
             optimality_proven: false,
             hard_feasible: None,
             discrete_feasible: result.devices.discrete_feasible,
         },
-        result,
+        "result": encoded_result,
+    }))
+}
+
+fn encode_solved_state_artifact(artifact: &SolvedStateArtifact) -> Result<serde_json::Value> {
+    let mut json = serde_json::to_value(artifact)?;
+    if let SolvedStateResult::Opf(solution) = &artifact.result {
+        let encoded_solution = surge_io::json::encode_checked_audited_solution(solution)
+            .context("failed to encode audited OPF artifact result")?;
+        let object = json
+            .as_object_mut()
+            .context("solved-state artifact must serialize as a JSON object")?;
+        object.insert("result".to_string(), encoded_solution);
     }
+    Ok(json)
 }
 
 fn method_supports_angle_reference(method: CliMethod) -> bool {
@@ -1183,11 +1196,20 @@ fn main() -> Result<()> {
                      Check generator limits (pmin/pmax/qmin/qmax), voltage bounds, \
                      and total load vs. capacity."
                 })?;
+            if sol.has_objective_ledger() && !sol.objective_ledger_is_consistent() {
+                let audit = sol.audit();
+                anyhow::bail!(
+                    "AC-OPF objective ledger audit failed ({} mismatches, residual_terms={}): {:?}",
+                    audit.ledger_mismatches.len(),
+                    audit.has_residual_terms,
+                    audit.ledger_mismatches
+                );
+            }
 
             if !suppress_stdout {
                 match cli.output {
                     TextOrJson::Json => {
-                        print_json_result(&ac_opf_json_envelope(&sol));
+                        print_json_value(&ac_opf_json_envelope(&sol)?);
                     }
                     TextOrJson::Text => {
                         println!("\n--- AC-OPF Results ---");
@@ -1805,6 +1827,7 @@ fn save_solved_state_artifact(
     path: &std::path::Path,
     artifact: &SolvedStateArtifact,
 ) -> Result<()> {
+    let json = encode_solved_state_artifact(artifact)?;
     let file = std::fs::File::create(path)?;
     if path
         .extension()
@@ -1812,10 +1835,10 @@ fn save_solved_state_artifact(
         .is_some_and(|ext| ext.eq_ignore_ascii_case("zst"))
     {
         let mut encoder = zstd::stream::write::Encoder::new(file, 3)?;
-        serde_json::to_writer_pretty(&mut encoder, artifact)?;
+        serde_json::to_writer_pretty(&mut encoder, &json)?;
         encoder.finish()?;
     } else {
-        serde_json::to_writer_pretty(file, artifact)?;
+        serde_json::to_writer_pretty(file, &json)?;
     }
     Ok(())
 }
@@ -1824,6 +1847,10 @@ fn save_solved_state_artifact(
 mod tests {
     use super::*;
     use surge_network::network::{Bus, BusType, Network};
+    use surge_solution::{
+        ObjectiveBucket, ObjectiveSubjectKind, ObjectiveTerm, ObjectiveTermKind,
+        SolutionAuditReport,
+    };
 
     #[test]
     fn save_solved_state_artifact_writes_network_and_result() {
@@ -1859,5 +1886,87 @@ mod tests {
         assert_eq!(json["result"]["status"], "Converged");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_solved_state_artifact_refreshes_opf_audit_block() {
+        let mut network = Network::new("artifact-opf");
+        network.buses.push(Bus::new(1, BusType::Slack, 230.0));
+
+        let solution = surge_solution::OpfSolution {
+            total_cost: 10.0,
+            objective_terms: vec![ObjectiveTerm {
+                component_id: "energy".to_string(),
+                bucket: ObjectiveBucket::Energy,
+                kind: ObjectiveTermKind::GeneratorEnergy,
+                subject_kind: ObjectiveSubjectKind::System,
+                subject_id: "system".to_string(),
+                dollars: 10.0,
+                ..Default::default()
+            }],
+            audit: SolutionAuditReport::default(),
+            ..Default::default()
+        };
+        let artifact = SolvedStateArtifact {
+            artifact_version: 1,
+            method: "ac-opf".to_string(),
+            network,
+            result: SolvedStateResult::Opf(solution),
+        };
+
+        let path = std::env::temp_dir().join("surge_solved_artifact_opf_audit_test.json");
+        let _ = std::fs::remove_file(&path);
+
+        save_solved_state_artifact(&path, &artifact).expect("audited OPF artifact should save");
+
+        let raw = std::fs::read_to_string(&path).expect("artifact file should exist");
+        let json: serde_json::Value =
+            serde_json::from_str(&raw).expect("artifact should be valid JSON");
+        assert_eq!(json["result_kind"], "opf");
+        assert_eq!(json["result"]["audit"]["audit_passed"], true);
+        assert_eq!(json["result"]["audit"]["has_residual_terms"], false);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_solved_state_artifact_rejects_failed_opf_audit() {
+        let mut network = Network::new("artifact-opf-fail");
+        network.buses.push(Bus::new(1, BusType::Slack, 230.0));
+
+        let solution = surge_solution::OpfSolution {
+            total_cost: 11.0,
+            objective_terms: vec![ObjectiveTerm {
+                component_id: "energy".to_string(),
+                bucket: ObjectiveBucket::Energy,
+                kind: ObjectiveTermKind::GeneratorEnergy,
+                subject_kind: ObjectiveSubjectKind::System,
+                subject_id: "system".to_string(),
+                dollars: 10.0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let artifact = SolvedStateArtifact {
+            artifact_version: 1,
+            method: "ac-opf".to_string(),
+            network,
+            result: SolvedStateResult::Opf(solution),
+        };
+
+        let path = std::env::temp_dir().join("surge_solved_artifact_opf_audit_fail_test.json");
+        let _ = std::fs::remove_file(&path);
+
+        let err = save_solved_state_artifact(&path, &artifact)
+            .expect_err("artifact export should fail when the exact OPF audit fails");
+        assert!(
+            err.to_string()
+                .contains("failed to encode audited OPF artifact result"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !path.exists(),
+            "failed audited export should not leave an artifact behind"
+        );
     }
 }

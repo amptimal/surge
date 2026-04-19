@@ -22,6 +22,7 @@
 //! | `case9()` | 9 | 9 | 3 | WSCC 9-bus (Anderson & Fouad) |
 //! | `case14()` | 14 | 20 | 5 | IEEE 14-bus |
 //! | `case30()` | 30 | 41 | 6 | IEEE 30-bus |
+//! | `market30()` | 30 | 41 | 10 | Custom market-enabled IEEE 30-bus derivative |
 //! | `case57()` | 57 | 80 | 7 | IEEE 57-bus |
 //! | `case118()` | 118 | 186 | 54 | IEEE 118-bus |
 //! | `case300()` | 300 | 411 | 69 | IEEE 300-bus |
@@ -34,6 +35,8 @@ use crate::Network;
 const CASE9_ZST: &[u8] = include_bytes!("../../../examples/cases/case9/case9.surge.json.zst");
 const CASE14_ZST: &[u8] = include_bytes!("../../../examples/cases/case14/case14.surge.json.zst");
 const CASE30_ZST: &[u8] = include_bytes!("../../../examples/cases/case30/case30.surge.json.zst");
+const MARKET30_ZST: &[u8] =
+    include_bytes!("../../../examples/cases/market30/market30.surge.json.zst");
 const CASE57_ZST: &[u8] = include_bytes!("../../../examples/cases/case57/case57.surge.json.zst");
 const CASE118_ZST: &[u8] = include_bytes!("../../../examples/cases/ieee118/case118.surge.json.zst");
 const CASE300_ZST: &[u8] = include_bytes!("../../../examples/cases/case300/case300.surge.json.zst");
@@ -46,9 +49,13 @@ fn parse_embedded_zst(zst_bytes: &[u8], name: &str) -> PyResult<Network> {
     let json_str = std::str::from_utf8(&json_bytes).map_err(|e| {
         crate::exceptions::SurgeError::new_err(format!("Invalid UTF-8 in {name}: {e}"))
     })?;
-    let net = surge_io::json::loads(json_str).map_err(|e| {
+    let mut net = surge_io::json::loads(json_str).map_err(|e| {
         crate::exceptions::SurgeError::new_err(format!("Failed to load {name}: {e}"))
     })?;
+    // Ensure every generator / load / branch has a canonical resource id
+    // so downstream market code can rely on ``Generator.resource_id``
+    // without needing to canonicalise by hand.
+    net.canonicalize_runtime_identities();
     Ok(Network {
         inner: Arc::new(net),
         oltc_controls: Vec::new(),
@@ -90,6 +97,18 @@ pub fn case14() -> PyResult<Network> {
 #[pyfunction]
 pub fn case30() -> PyResult<Network> {
     parse_embedded_zst(CASE30_ZST, "case30")
+}
+
+/// Market-enabled 30-bus example.
+///
+/// A custom IEEE 30-bus derivative with thermal fleet diversity, storage,
+/// dispatchable load, HVDC, interfaces, and flowgates for dispatch testing.
+///
+/// Returns:
+///   Network: 30 buses, 41 branches, 10 generators, base_mva=100.
+#[pyfunction]
+pub fn market30() -> PyResult<Network> {
+    parse_embedded_zst(MARKET30_ZST, "market30")
 }
 
 /// IEEE 57-bus system.

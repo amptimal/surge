@@ -14,4 +14,10 @@ pub struct PowerBalanceViolation {
     pub curtailment_mw: f64,
     /// Excess generation: MW of supply that could not be absorbed (generation > load).
     pub excess_mw: f64,
+    /// Penalty cost for curtailment slack (dollars for this period).
+    #[serde(default)]
+    pub curtailment_cost: f64,
+    /// Penalty cost for excess generation slack (dollars for this period).
+    #[serde(default)]
+    pub excess_cost: f64,
 }

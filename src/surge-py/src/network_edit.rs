@@ -417,6 +417,17 @@ impl Network {
         Ok(())
     }
 
+    /// Canonicalize runtime-facing identities after topology/service edits.
+    ///
+    /// This demotes stale PV buses without active regulating generators,
+    /// canonicalizes branch circuit ids, and ensures runtime ids stay
+    /// consistent after editing in-service equipment.
+    pub fn canonicalize_runtime_identities(&mut self) -> PyResult<()> {
+        let net = Arc::make_mut(&mut self.inner);
+        net.canonicalize_runtime_identities();
+        Ok(())
+    }
+
     /// Set the load at a bus.
     ///
     /// Updates Load objects at this bus. If no Load exists, one is created.
@@ -675,6 +686,27 @@ impl Network {
             NetworkError::new_err(format!("Branch {from_bus}-{to_bus} circuit {c} not found"))
         })?;
         net.branches[idx].tap = tap;
+        Ok(())
+    }
+
+    /// Set the phase-shift angle of a transformer branch (degrees).
+    ///
+    /// Raises:
+    ///   ValueError: if no matching branch is found.
+    #[pyo3(signature = (from_bus, to_bus, shift_deg, circuit=1))]
+    pub fn set_branch_phase_shift(
+        &mut self,
+        from_bus: u32,
+        to_bus: u32,
+        shift_deg: f64,
+        circuit: i64,
+    ) -> PyResult<()> {
+        let net = Arc::make_mut(&mut self.inner);
+        let c = circuit.to_string();
+        let idx = find_branch_str(&net.branches, from_bus, to_bus, &c).ok_or_else(|| {
+            NetworkError::new_err(format!("Branch {from_bus}-{to_bus} circuit {c} not found"))
+        })?;
+        net.branches[idx].phase_shift_rad = shift_deg.to_radians();
         Ok(())
     }
 
@@ -1159,6 +1191,109 @@ impl Network {
             .expect("generator push should create a last element"))
     }
 
+    /// Add a storage resource (BESS, pumped hydro in storage mode) as a
+    /// generator with ``StorageParams`` attached.
+    ///
+    /// The resulting generator has ``pmin = -charge_mw_max`` (negative) and
+    /// ``pmax = discharge_mw_max`` (positive), matching the convention the
+    /// solver uses for bidirectional resources.
+    ///
+    /// Args:
+    ///   bus:              Bus number where the storage is connected.
+    ///   charge_mw_max:    Maximum charge rate in MW (positive; stored as
+    ///                     negative pmin).
+    ///   discharge_mw_max: Maximum discharge rate in MW (positive; stored
+    ///                     as pmax).
+    ///   params:           ``StorageParams`` describing SOC bounds,
+    ///                     efficiency, dispatch mode, and offers.
+    ///   machine_id:       PSS/E machine id (default ``"1"``).
+    ///   id:               Explicit canonical id; auto-assigned
+    ///                     ``gen_{bus}_{ordinal}`` when omitted.
+    ///
+    /// Returns:
+    ///   Canonical generator id of the newly-added storage resource.
+    ///
+    /// Raises:
+    ///   ValueError: if the bus number is not in the network, or the
+    ///     ``StorageParams`` fail validation
+    ///     (``efficiency ∉ (0, 1]``, invalid SOC range, etc.).
+    #[pyo3(signature = (bus, charge_mw_max, discharge_mw_max, params, machine_id=None, id=None))]
+    pub fn add_storage(
+        &mut self,
+        bus: u32,
+        charge_mw_max: f64,
+        discharge_mw_max: f64,
+        params: PyRef<'_, rich_objects::StorageParams>,
+        machine_id: Option<String>,
+        id: Option<String>,
+    ) -> PyResult<String> {
+        if charge_mw_max < 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "charge_mw_max must be >= 0, got {charge_mw_max}"
+            )));
+        }
+        if discharge_mw_max < 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "discharge_mw_max must be >= 0, got {discharge_mw_max}"
+            )));
+        }
+        let storage_params = params.to_core()?;
+        storage_params
+            .validate()
+            .map_err(|e| PyValueError::new_err(format!("invalid StorageParams: {e}")))?;
+
+        let net = Arc::make_mut(&mut self.inner);
+        if !net.buses.iter().any(|b| b.number == bus) {
+            return Err(NetworkError::new_err(format!("Bus {bus} not found")));
+        }
+
+        let mut generator = Generator::new(bus, 0.0, 1.0);
+        generator.pmax = discharge_mw_max;
+        generator.pmin = -charge_mw_max;
+        generator.qmax = 0.0;
+        generator.qmin = 0.0;
+        generator.machine_id = Some(machine_id.unwrap_or_else(|| "1".to_string()));
+        if let Some(explicit_id) = id {
+            generator.id = explicit_id;
+        }
+        generator.storage = Some(storage_params);
+
+        net.generators.push(generator);
+        net.canonicalize_generator_ids();
+        Ok(net
+            .generators
+            .last()
+            .map(|generator| generator.id.clone())
+            .expect("generator push should create a last element"))
+    }
+
+    /// Attach (or replace) ``StorageParams`` on an existing generator.
+    ///
+    /// Raises:
+    ///   ValueError: if no matching generator is found, or the
+    ///     ``StorageParams`` fail validation.
+    pub fn set_generator_storage(
+        &mut self,
+        id: &str,
+        params: PyRef<'_, rich_objects::StorageParams>,
+    ) -> PyResult<()> {
+        let storage_params = params.to_core()?;
+        storage_params
+            .validate()
+            .map_err(|e| PyValueError::new_err(format!("invalid StorageParams: {e}")))?;
+        let net = Arc::make_mut(&mut self.inner);
+        find_generator_mut_by_id(&mut net.generators, id)?.storage = Some(storage_params);
+        Ok(())
+    }
+
+    /// Remove ``StorageParams`` from a generator, turning it back into a
+    /// conventional one-directional unit.
+    pub fn clear_generator_storage(&mut self, id: &str) -> PyResult<()> {
+        let net = Arc::make_mut(&mut self.inner);
+        find_generator_mut_by_id(&mut net.generators, id)?.storage = None;
+        Ok(())
+    }
+
     /// Remove a generator.
     ///
     /// Raises:
@@ -1182,6 +1317,16 @@ impl Network {
     pub fn set_generator_p(&mut self, id: &str, p_mw: f64) -> PyResult<()> {
         let net = Arc::make_mut(&mut self.inner);
         find_generator_mut_by_id(&mut net.generators, id)?.p = p_mw;
+        Ok(())
+    }
+
+    /// Set the reactive power output of a generator (MVAr).
+    ///
+    /// Raises:
+    ///   ValueError: if no matching generator is found.
+    pub fn set_generator_q(&mut self, id: &str, q_mvar: f64) -> PyResult<()> {
+        let net = Arc::make_mut(&mut self.inner);
+        find_generator_mut_by_id(&mut net.generators, id)?.q = q_mvar;
         Ok(())
     }
 
@@ -1339,6 +1484,13 @@ impl Network {
             commit.status = commitment_status;
             commit.min_up_time_hr = generator.min_up_time_hr;
             commit.min_down_time_hr = generator.min_down_time_hr;
+            commit.max_up_time_hr = generator.max_up_time_hr;
+            commit.min_run_at_pmin_hr = generator.min_run_at_pmin_hr;
+            commit.max_starts_per_day = generator.max_starts_per_day;
+            commit.max_starts_per_week = generator.max_starts_per_week;
+            commit.max_energy_mwh_per_day = generator.max_energy_mwh_per_day;
+            commit.startup_ramp_mw_per_min = generator.startup_ramp_mw_per_min;
+            commit.shutdown_ramp_mw_per_min = generator.shutdown_ramp_mw_per_min;
         }
         target.quick_start = generator.quick_start;
         target.storage = generator
@@ -1432,6 +1584,13 @@ impl Network {
             commit.status = commitment_status;
             commit.min_up_time_hr = generator.min_up_time_hr;
             commit.min_down_time_hr = generator.min_down_time_hr;
+            commit.max_up_time_hr = generator.max_up_time_hr;
+            commit.min_run_at_pmin_hr = generator.min_run_at_pmin_hr;
+            commit.max_starts_per_day = generator.max_starts_per_day;
+            commit.max_starts_per_week = generator.max_starts_per_week;
+            commit.max_energy_mwh_per_day = generator.max_energy_mwh_per_day;
+            commit.startup_ramp_mw_per_min = generator.startup_ramp_mw_per_min;
+            commit.shutdown_ramp_mw_per_min = generator.shutdown_ramp_mw_per_min;
         }
         target.quick_start = generator.quick_start;
         target.storage = generator
@@ -1513,6 +1672,78 @@ impl Network {
             }
         }
 
+        Ok(())
+    }
+}
+
+#[pymethods]
+impl Network {
+    /// Enable or disable AC voltage regulation for a generator.
+    ///
+    /// Raises:
+    ///   ValueError: if no matching generator is found.
+    #[pyo3(signature = (id, voltage_regulated))]
+    pub fn set_generator_voltage_regulated(
+        &mut self,
+        id: &str,
+        voltage_regulated: bool,
+    ) -> PyResult<()> {
+        let net = Arc::make_mut(&mut self.inner);
+        find_generator_mut_by_id(&mut net.generators, id)?.voltage_regulated = voltage_regulated;
+        Ok(())
+    }
+
+    /// Set the regulated bus for a generator. ``None`` restores local regulation.
+    ///
+    /// Raises:
+    ///   ValueError: if no matching generator is found.
+    #[pyo3(signature = (id, regulated_bus=None))]
+    pub fn set_generator_regulated_bus(
+        &mut self,
+        id: &str,
+        regulated_bus: Option<u32>,
+    ) -> PyResult<()> {
+        let net = Arc::make_mut(&mut self.inner);
+        find_generator_mut_by_id(&mut net.generators, id)?.reg_bus = regulated_bus;
+        Ok(())
+    }
+
+    /// Attach a GO Competition Challenge 3 §4.6 linear p-q linking
+    /// constraint to a generator. ``kind`` is one of ``"equality"``
+    /// (eq 116, J^pqe), ``"upper"`` (eq 114, J^pqmax), or ``"lower"``
+    /// (eq 115, J^pqmin). The intercept and slope are in per-unit on
+    /// the device base.
+    ///
+    /// Raises:
+    ///   ValueError: if no matching generator is found or ``kind`` is
+    ///   invalid.
+    #[pyo3(signature = (id, kind, q_at_p_zero_pu, beta))]
+    pub fn set_generator_pq_linear_link(
+        &mut self,
+        id: &str,
+        kind: &str,
+        q_at_p_zero_pu: f64,
+        beta: f64,
+    ) -> PyResult<()> {
+        let net = Arc::make_mut(&mut self.inner);
+        let generator = find_generator_mut_by_id(&mut net.generators, id)?;
+        let rc = generator
+            .reactive_capability
+            .get_or_insert_with(surge_network::network::ReactiveCapability::default);
+        let link = surge_network::network::PqLinearLink {
+            q_at_p_zero_pu,
+            beta,
+        };
+        match kind {
+            "equality" => rc.pq_linear_equality = Some(link),
+            "upper" => rc.pq_linear_upper = Some(link),
+            "lower" => rc.pq_linear_lower = Some(link),
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "set_generator_pq_linear_link: unknown kind {other:?} (expected \"equality\", \"upper\", or \"lower\")"
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -1695,6 +1926,8 @@ impl Network {
             limit_mw_schedule: Vec::new(),
             limit_reverse_mw_schedule: Vec::new(),
             hvdc_coefficients: Vec::new(),
+            hvdc_band_coefficients: Vec::new(),
+            limit_mw_active_period: None,
         });
         Ok(())
     }
@@ -2094,6 +2327,102 @@ impl Network {
         Ok(())
     }
 
+    /// Set the per-side (asymmetric) shunt admittance additions for a branch.
+    ///
+    /// GO Competition Challenge 3 §4.8 eqs (148)-(151) allow AC lines and
+    /// transformers to carry distinct shunt-to-ground components at the
+    /// from and to terminals (via `additional_shunt = 1` + the four
+    /// `g_fr/b_fr/g_to/b_to` fields in the JSON). These are additions
+    /// on top of the symmetric `b/2` and `g_pi/2` pi-model split stored
+    /// in `Branch::b`/`Branch::g_pi`. Default values are 0.0, preserving
+    /// the symmetric pi-model for branches without per-side data.
+    ///
+    /// Args:
+    ///   from_bus:  From-bus number.
+    ///   to_bus:    To-bus number.
+    ///   g_from_pu: From-terminal shunt conductance (pu).
+    ///   b_from_pu: From-terminal shunt susceptance (pu).
+    ///   g_to_pu:   To-terminal shunt conductance (pu).
+    ///   b_to_pu:   To-terminal shunt susceptance (pu).
+    ///   circuit:   Circuit identifier integer (default 1).
+    ///
+    /// Raises:
+    ///   NetworkError: if the branch is not found.
+    #[pyo3(signature = (
+        from_bus,
+        to_bus,
+        g_from_pu,
+        b_from_pu,
+        g_to_pu,
+        b_to_pu,
+        circuit=1,
+    ))]
+    pub fn set_branch_additional_shunt(
+        &mut self,
+        from_bus: u32,
+        to_bus: u32,
+        g_from_pu: f64,
+        b_from_pu: f64,
+        g_to_pu: f64,
+        b_to_pu: f64,
+        circuit: i64,
+    ) -> PyResult<()> {
+        let net = Arc::make_mut(&mut self.inner);
+        let c = circuit.to_string();
+        let idx = find_branch_str(&net.branches, from_bus, to_bus, &c).ok_or_else(|| {
+            NetworkError::new_err(format!("Branch {from_bus}-{to_bus} circuit {c} not found"))
+        })?;
+        net.branches[idx].g_shunt_from = g_from_pu;
+        net.branches[idx].b_shunt_from = b_from_pu;
+        net.branches[idx].g_shunt_to = g_to_pu;
+        net.branches[idx].b_shunt_to = b_to_pu;
+        Ok(())
+    }
+
+    /// Set the branch switching transition costs (`c^su_j`, `c^sd_j`).
+    ///
+    /// GO Competition Challenge 3 §4.4.6 eqs (62)-(63) price the binary
+    /// startup and shutdown indicators `u^su_jt`/`u^sd_jt` at a fixed
+    /// cost per transition for every `j ∈ J^pr,cs,ac` — including AC
+    /// branches. The GO C3 data format surfaces these as the
+    /// `connection_cost` and `disconnection_cost` fields on AC line
+    /// and transformer records. The default is `0.0`, which matches
+    /// the behaviour of non-GO datasets that do not carry branch
+    /// transition costs.
+    ///
+    /// The stored costs are consulted by SCUC only when
+    /// `allow_branch_switching = true`; under the default
+    /// `AllowSwitching = 0` mode the branch commitment columns are
+    /// pinned to `u^on,0_j` and no transitions occur.
+    ///
+    /// Args:
+    ///   from_bus:    From-bus number.
+    ///   to_bus:      To-bus number.
+    ///   startup:     Cost ($) per open-to-closed transition.
+    ///   shutdown:    Cost ($) per closed-to-open transition.
+    ///   circuit:     Circuit identifier integer (default 1).
+    ///
+    /// Raises:
+    ///   NetworkError: if the branch is not found.
+    #[pyo3(signature = (from_bus, to_bus, startup, shutdown, circuit=1))]
+    pub fn set_branch_transition_costs(
+        &mut self,
+        from_bus: u32,
+        to_bus: u32,
+        startup: f64,
+        shutdown: f64,
+        circuit: i64,
+    ) -> PyResult<()> {
+        let net = Arc::make_mut(&mut self.inner);
+        let c = circuit.to_string();
+        let idx = find_branch_str(&net.branches, from_bus, to_bus, &c).ok_or_else(|| {
+            NetworkError::new_err(format!("Branch {from_bus}-{to_bus} circuit {c} not found"))
+        })?;
+        net.branches[idx].cost_startup = startup;
+        net.branches[idx].cost_shutdown = shutdown;
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // LCC HVDC lines (#13)
     // -----------------------------------------------------------------------
@@ -2108,17 +2437,25 @@ impl Network {
     /// most studies. Use the ``LccHvdcLink`` data returned by ``network.hvdc.links`` for
     /// fine-grained control.
     ///
+    /// When ``p_dc_min_mw < p_dc_max_mw`` the joint AC-DC OPF treats this
+    /// link's DC power as an NLP decision variable bounded by the given
+    /// range; otherwise (the default) it's pinned at ``setvl_mw`` and the
+    /// sequential AC-DC iteration handles it.
+    ///
     /// Args:
-    ///   name:      Unique name for the DC link.
-    ///   rect_bus:  AC bus number of the rectifier (AC → DC).
-    ///   inv_bus:   AC bus number of the inverter (DC → AC).
-    ///   setvl_mw:  Scheduled DC power (MW, positive = rectifier to inverter).
-    ///   vschd_kv:  Scheduled DC voltage (kV).
-    ///   rdc:       DC circuit resistance (Ω, default 0.0).
+    ///   name:          Unique name for the DC link.
+    ///   rect_bus:      AC bus number of the rectifier (AC → DC).
+    ///   inv_bus:       AC bus number of the inverter (DC → AC).
+    ///   setvl_mw:      Scheduled DC power (MW, positive = rectifier to inverter).
+    ///   vschd_kv:      Scheduled DC voltage (kV).
+    ///   rdc:           DC circuit resistance (Ω, default 0.0).
+    ///   p_dc_min_mw:   Minimum DC power for joint AC-DC OPF (MW, default 0.0).
+    ///   p_dc_max_mw:   Maximum DC power for joint AC-DC OPF (MW, default 0.0).
     ///
     /// Raises:
-    ///   NetworkError: if ``rect_bus`` or ``inv_bus`` does not exist.
-    #[pyo3(signature = (name, rect_bus, inv_bus, setvl_mw, vschd_kv, rdc=0.0))]
+    ///   NetworkError: if ``rect_bus`` or ``inv_bus`` does not exist, or
+    ///     if ``p_dc_min_mw > p_dc_max_mw``.
+    #[pyo3(signature = (name, rect_bus, inv_bus, setvl_mw, vschd_kv, rdc=0.0, p_dc_min_mw=0.0, p_dc_max_mw=0.0))]
     pub fn add_lcc_dc_line(
         &mut self,
         name: &str,
@@ -2127,6 +2464,8 @@ impl Network {
         setvl_mw: f64,
         vschd_kv: f64,
         rdc: f64,
+        p_dc_min_mw: f64,
+        p_dc_max_mw: f64,
     ) -> PyResult<()> {
         let net = Arc::make_mut(&mut self.inner);
         let bm = net.bus_index_map();
@@ -2140,11 +2479,19 @@ impl Network {
                 "Inverter bus {inv_bus} not found"
             )));
         }
+        if p_dc_min_mw > p_dc_max_mw {
+            return Err(NetworkError::new_err(format!(
+                "LCC DC line '{name}': p_dc_min_mw ({p_dc_min_mw}) must be \
+                 ≤ p_dc_max_mw ({p_dc_max_mw})"
+            )));
+        }
         let mut line = LccHvdcLink {
             name: name.to_string(),
             scheduled_setpoint: setvl_mw,
             scheduled_voltage_kv: vschd_kv,
             resistance_ohm: rdc,
+            p_dc_min_mw,
+            p_dc_max_mw,
             ..Default::default()
         };
         line.rectifier.bus = rect_bus;
@@ -2181,6 +2528,8 @@ impl Network {
             line.scheduled_setpoint,
             line.scheduled_voltage_kv,
             line.resistance_ohm,
+            line.p_dc_min_mw,
+            line.p_dc_max_mw,
         )?;
         self.update_dc_line_object(line)
     }
@@ -2200,11 +2549,19 @@ impl Network {
             .ok_or_else(|| {
                 NetworkError::new_err(format!("LCC DC line '{}' not found", line.name))
             })?;
+        if line.p_dc_min_mw > line.p_dc_max_mw {
+            return Err(NetworkError::new_err(format!(
+                "LCC DC line '{}': p_dc_min_mw ({}) must be ≤ p_dc_max_mw ({})",
+                line.name, line.p_dc_min_mw, line.p_dc_max_mw
+            )));
+        }
         target.scheduled_setpoint = line.scheduled_setpoint;
         target.scheduled_voltage_kv = line.scheduled_voltage_kv;
         target.resistance_ohm = line.resistance_ohm;
         target.rectifier.bus = line.rectifier_bus;
         target.inverter.bus = line.inverter_bus;
+        target.p_dc_min_mw = line.p_dc_min_mw;
+        target.p_dc_max_mw = line.p_dc_max_mw;
         target.mode = if line.in_service {
             surge_network::network::LccHvdcControlMode::PowerControl
         } else {
@@ -2675,13 +3032,20 @@ impl Network {
                 zonal_requirements: zone
                     .zonal_requirements
                     .iter()
-                    .map(|(zone_id, product_id, requirement_mw)| {
-                        surge_network::market::ZonalReserveRequirement {
-                            zone_id: *zone_id,
-                            product_id: product_id.clone(),
-                            requirement_mw: *requirement_mw,
-                        }
-                    })
+                    .map(
+                        |(zone_id, product_id, requirement_mw, participant_bus_numbers)| {
+                            surge_network::market::ZonalReserveRequirement {
+                                zone_id: *zone_id,
+                                product_id: product_id.clone(),
+                                requirement_mw: *requirement_mw,
+                                per_period_mw: None,
+                                shortfall_cost_per_unit: None,
+                                served_dispatchable_load_coefficient: None,
+                                largest_generator_dispatch_coefficient: None,
+                                participant_bus_numbers: participant_bus_numbers.clone(),
+                            }
+                        },
+                    )
                     .collect(),
             });
         Ok(())
@@ -2704,13 +3068,20 @@ impl Network {
         target.zonal_requirements = zone
             .zonal_requirements
             .iter()
-            .map(|(zone_id, product_id, requirement_mw)| {
-                surge_network::market::ZonalReserveRequirement {
-                    zone_id: *zone_id,
-                    product_id: product_id.clone(),
-                    requirement_mw: *requirement_mw,
-                }
-            })
+            .map(
+                |(zone_id, product_id, requirement_mw, participant_bus_numbers)| {
+                    surge_network::market::ZonalReserveRequirement {
+                        zone_id: *zone_id,
+                        product_id: product_id.clone(),
+                        requirement_mw: *requirement_mw,
+                        per_period_mw: None,
+                        shortfall_cost_per_unit: None,
+                        served_dispatchable_load_coefficient: None,
+                        largest_generator_dispatch_coefficient: None,
+                        participant_bus_numbers: participant_bus_numbers.clone(),
+                    }
+                },
+            )
             .collect();
         Ok(())
     }
@@ -2847,6 +3218,7 @@ impl Network {
         net.market_data
             .combined_cycle_plants
             .push(CoreCombinedCyclePlant {
+                id: String::new(),
                 name: plant.name.clone(),
                 configs: plant
                     .configs

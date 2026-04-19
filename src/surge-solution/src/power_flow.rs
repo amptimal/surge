@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0
 //! Power flow solution representation.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
@@ -241,6 +241,68 @@ impl PfSolution {
             .len()
     }
 
+    /// Estimate per-generator reactive power output (MVAr) in `network.generators` order.
+    ///
+    /// This reconstructs generator reactive dispatch from the solved bus-level
+    /// reactive injections, fixed bus shunts, and static bus load withdrawals.
+    /// For buses with multiple in-service generators, the bus-level reactive
+    /// output is apportioned by reactive capability range `(qmax - qmin)` when
+    /// available; otherwise it is split evenly across the in-service units at
+    /// that bus.
+    pub fn generator_reactive_power_mvar(&self, network: &Network) -> Vec<f64> {
+        let base = network.base_mva;
+        let bus_map = network.bus_index_map();
+        let load_q = network.bus_load_q_mvar_with_map(&bus_map);
+
+        let mut bus_qg: HashMap<u32, f64> = HashMap::new();
+        for (bus_idx, bus) in network.buses.iter().enumerate() {
+            let Some(&solution_bus_idx) = bus_map.get(&bus.number) else {
+                continue;
+            };
+            if solution_bus_idx >= self.reactive_power_injection_pu.len()
+                || solution_bus_idx >= self.voltage_magnitude_pu.len()
+            {
+                continue;
+            }
+            let vm = self.voltage_magnitude_pu[solution_bus_idx];
+            let qd = load_q.get(bus_idx).copied().unwrap_or(0.0);
+            let qg_bus = self.reactive_power_injection_pu[solution_bus_idx] * base + qd
+                - bus.shunt_susceptance_mvar * vm * vm;
+            bus_qg.insert(bus.number, qg_bus);
+        }
+
+        let mut bus_range: HashMap<u32, f64> = HashMap::new();
+        let mut bus_count: HashMap<u32, usize> = HashMap::new();
+        for generator in network
+            .generators
+            .iter()
+            .filter(|generator| generator.in_service)
+        {
+            *bus_range.entry(generator.bus).or_insert(0.0) +=
+                (generator.qmax - generator.qmin).max(0.0);
+            *bus_count.entry(generator.bus).or_insert(0) += 1;
+        }
+
+        network
+            .generators
+            .iter()
+            .map(|generator| {
+                if !generator.in_service {
+                    return 0.0;
+                }
+                let total_qg = bus_qg.get(&generator.bus).copied().unwrap_or(0.0);
+                let total_range = bus_range.get(&generator.bus).copied().unwrap_or(0.0);
+                let generator_range = (generator.qmax - generator.qmin).max(0.0);
+                if total_range > 1e-6 {
+                    total_qg * generator_range / total_range
+                } else {
+                    let units_at_bus = bus_count.get(&generator.bus).copied().unwrap_or(1).max(1);
+                    total_qg / units_at_bus as f64
+                }
+            })
+            .collect()
+    }
+
     /// Compute apparent power flow |S_ij| on each branch in MVA.
     ///
     /// Uses the stored from-end branch P/Q values (MW/MVAr).
@@ -388,6 +450,8 @@ mod tests {
     use serde_json::Value;
     use surge_network::network::branch::Branch;
     use surge_network::network::bus::{Bus, BusType};
+    use surge_network::network::generator::Generator;
+    use surge_network::network::load::Load;
 
     fn two_bus_network(rating_a: f64) -> Network {
         let mut net = Network::new("test");
@@ -419,6 +483,20 @@ mod tests {
             branch_q_to_mvar: vec![q_to_mvar],
             ..Default::default()
         }
+    }
+
+    fn two_bus_generator_network() -> Network {
+        let mut net = two_bus_network(100.0);
+        let mut gen_a = Generator::with_id("g1", 1, 50.0, 1.0);
+        gen_a.qmin = -10.0;
+        gen_a.qmax = 20.0;
+        let mut gen_b = Generator::with_id("g2", 1, 25.0, 1.0);
+        gen_b.qmin = -5.0;
+        gen_b.qmax = 5.0;
+        net.generators.push(gen_a);
+        net.generators.push(gen_b);
+        net.loads.push(Load::new(2, 60.0, 15.0));
+        net
     }
 
     #[test]
@@ -572,6 +650,75 @@ mod tests {
         assert_eq!(sol.voltage_angle_rad, vec![0.0, 0.0]);
         assert_eq!(sol.branch_p_from_mw, vec![0.0]);
         assert_eq!(sol.max_mismatch, 0.0);
+    }
+
+    #[test]
+    fn test_generator_reactive_power_mvar_apportions_by_capability() {
+        let net = two_bus_generator_network();
+        let sol = PfSolution {
+            status: SolveStatus::Converged,
+            voltage_magnitude_pu: vec![1.0, 1.0],
+            voltage_angle_rad: vec![0.0, 0.0],
+            active_power_injection_pu: vec![0.0, 0.0],
+            reactive_power_injection_pu: vec![0.40, -0.15],
+            bus_numbers: vec![1, 2],
+            ..Default::default()
+        };
+
+        let qg = sol.generator_reactive_power_mvar(&net);
+        assert_eq!(qg.len(), 2);
+        assert!(
+            (qg[0] - 30.0).abs() < 1e-9,
+            "first generator should absorb 30 MVAr-equivalent share"
+        );
+        assert!(
+            (qg[1] - 10.0).abs() < 1e-9,
+            "second generator should absorb 10 MVAr-equivalent share"
+        );
+    }
+
+    #[test]
+    fn test_generator_reactive_power_mvar_splits_evenly_without_capability_range() {
+        let mut net = two_bus_network(100.0);
+        let mut gen_a = Generator::with_id("g1", 1, 50.0, 1.0);
+        gen_a.qmin = 0.0;
+        gen_a.qmax = 0.0;
+        let mut gen_b = Generator::with_id("g2", 1, 25.0, 1.0);
+        gen_b.qmin = 0.0;
+        gen_b.qmax = 0.0;
+        net.generators.push(gen_a);
+        net.generators.push(gen_b);
+        let sol = PfSolution {
+            status: SolveStatus::Converged,
+            voltage_magnitude_pu: vec![1.0, 1.0],
+            voltage_angle_rad: vec![0.0, 0.0],
+            active_power_injection_pu: vec![0.0, 0.0],
+            reactive_power_injection_pu: vec![0.12, 0.0],
+            bus_numbers: vec![1, 2],
+            ..Default::default()
+        };
+
+        let qg = sol.generator_reactive_power_mvar(&net);
+        assert_eq!(qg, vec![6.0, 6.0]);
+    }
+
+    #[test]
+    fn test_generator_reactive_power_mvar_accounts_for_bus_shunt_without_extra_base_factor() {
+        let mut net = two_bus_network(100.0);
+        net.buses[0].shunt_susceptance_mvar = -100.0;
+        net.generators.push(Generator::with_id("g1", 1, 50.0, 1.0));
+        let sol = PfSolution {
+            status: SolveStatus::Converged,
+            voltage_magnitude_pu: vec![1.0, 1.0],
+            voltage_angle_rad: vec![0.0, 0.0],
+            active_power_injection_pu: vec![0.0, 0.0],
+            reactive_power_injection_pu: vec![0.0, 0.0],
+            bus_numbers: vec![1, 2],
+            ..Default::default()
+        };
+
+        let qg = sol.generator_reactive_power_mvar(&net);
+        assert_eq!(qg, vec![100.0]);
     }
 
     #[test]

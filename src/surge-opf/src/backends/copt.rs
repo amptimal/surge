@@ -65,7 +65,7 @@ mod impl_ {
     use libloading::Library;
     use std::any::Any;
     use std::cell::RefCell;
-    use std::ffi::{CString, c_char, c_double, c_int, c_void};
+    use std::ffi::{CStr, CString, c_char, c_double, c_int, c_void};
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::ptr;
     use std::sync::{Arc, OnceLock};
@@ -161,6 +161,8 @@ mod impl_ {
         pub type CoptEnvPtr = *mut copt_env;
         pub type CoptProbPtr = *mut copt_prob;
 
+        pub const COPT_BUFFSIZE: c_int = 1000;
+
         // Objective sense.
         pub const COPT_MINIMIZE: c_int = 1;
 
@@ -194,6 +196,10 @@ mod impl_ {
         pub const COPT_MIPSTATUS_INFEASIBLE: c_int = 2;
         pub const COPT_MIPSTATUS_UNBOUNDED: c_int = 3;
         pub const COPT_MIPSTATUS_TIMEOUT: c_int = 8;
+
+        // API return codes.
+        pub const COPT_RETCODE_OK: c_int = 0;
+        pub const COPT_RETCODE_LICENSE: c_int = 4;
     }
 
     // ── COPT libloading — runtime dynamic library detection ───────────────────
@@ -264,6 +270,7 @@ mod impl_ {
         COPT_GetDblAttr:
             unsafe extern "C" fn(ffi::CoptProbPtr, *const c_char, *mut c_double) -> c_int,
         COPT_GetIntAttr: unsafe extern "C" fn(ffi::CoptProbPtr, *const c_char, *mut c_int) -> c_int,
+        COPT_GetLicenseMsg: unsafe extern "C" fn(ffi::CoptEnvPtr, *mut c_char, c_int) -> c_int,
         COPT_SetDblParam: unsafe extern "C" fn(ffi::CoptProbPtr, *const c_char, c_double) -> c_int,
         COPT_SetIntParam: unsafe extern "C" fn(ffi::CoptProbPtr, *const c_char, c_int) -> c_int,
         COPT_SetLogFile: unsafe extern "C" fn(ffi::CoptProbPtr, *const c_char) -> c_int,
@@ -423,6 +430,10 @@ mod impl_ {
                 b"COPT_GetIntAttr\0",
                 unsafe extern "C" fn(ffi::CoptProbPtr, *const c_char, *mut c_int) -> c_int
             ),
+            COPT_GetLicenseMsg: sym!(
+                b"COPT_GetLicenseMsg\0",
+                unsafe extern "C" fn(ffi::CoptEnvPtr, *mut c_char, c_int) -> c_int
+            ),
             COPT_SetDblParam: sym!(
                 b"COPT_SetDblParam\0",
                 unsafe extern "C" fn(ffi::CoptProbPtr, *const c_char, c_double) -> c_int
@@ -554,6 +565,36 @@ mod impl_ {
         .expect("COPT attribute string contains no null bytes")
     }
 
+    fn copt_license_message(lib: &CoptLib, env: ffi::CoptEnvPtr) -> Option<String> {
+        if env.is_null() {
+            return None;
+        }
+        let mut buf = vec![0 as c_char; ffi::COPT_BUFFSIZE as usize];
+        let rc = unsafe { (lib.COPT_GetLicenseMsg)(env, buf.as_mut_ptr(), buf.len() as c_int) };
+        if rc != ffi::COPT_RETCODE_OK {
+            return None;
+        }
+        let msg = unsafe { CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .trim()
+            .to_string();
+        if msg.is_empty() { None } else { Some(msg) }
+    }
+
+    fn format_copt_api_error(
+        lib: &CoptLib,
+        env: ffi::CoptEnvPtr,
+        context: &str,
+        rc: c_int,
+    ) -> String {
+        if rc == ffi::COPT_RETCODE_LICENSE {
+            if let Some(msg) = copt_license_message(lib, env) {
+                return format!("{context} failed (rc={rc}): {msg}");
+            }
+        }
+        format!("{context} failed (rc={rc})")
+    }
+
     // ── CoptLpSolver ──────────────────────────────────────────────────────────
 
     /// COPT LP/QP/MIP solver backend (COPT 8.x, commercial license required).
@@ -663,7 +704,7 @@ mod impl_ {
         let mut copt_prob: CoptProbPtr = ptr::null_mut();
         let rc = COPT_CreateProb(env, &mut copt_prob);
         if rc != 0 || copt_prob.is_null() {
-            return Err(format!("COPT_CreateProb failed (rc={rc})"));
+            return Err(format_copt_api_error(lib, env, "COPT_CreateProb", rc));
         }
         struct ProbGuard(
             ffi::CoptProbPtr,
@@ -720,7 +761,7 @@ mod impl_ {
         // ── Objective sense ───────────────────────────────────────────────────
         let rc = COPT_SetObjSense(copt_prob, COPT_MINIMIZE);
         if rc != 0 {
-            return Err(format!("COPT_SetObjSense failed (rc={rc})"));
+            return Err(format_copt_api_error(lib, env, "COPT_SetObjSense", rc));
         }
 
         // ── Problem type ──────────────────────────────────────────────────────
@@ -762,7 +803,7 @@ mod impl_ {
             ptr::null(), // column names
         );
         if rc != 0 {
-            return Err(format!("COPT_AddCols failed (rc={rc})"));
+            return Err(format_copt_api_error(lib, env, "COPT_AddCols", rc));
         }
 
         // ── Step 2: Add rows with CSR constraint matrix ───────────────────────
@@ -797,7 +838,7 @@ mod impl_ {
             ptr::null(), // row names
         );
         if rc != 0 {
-            return Err(format!("COPT_AddRows failed (rc={rc})"));
+            return Err(format_copt_api_error(lib, env, "COPT_AddRows", rc));
         }
 
         // ── Quadratic objective (QP) ──────────────────────────────────────────
@@ -827,7 +868,7 @@ mod impl_ {
                 q_val_t.as_ptr(),
             );
             if rc != 0 {
-                return Err(format!("COPT_SetQuadObj failed (rc={rc})"));
+                return Err(format_copt_api_error(lib, env, "COPT_SetQuadObj", rc));
             }
         }
 
@@ -838,7 +879,7 @@ mod impl_ {
             COPT_SolveLp(copt_prob)
         };
         if solve_rc != 0 {
-            return Err(format!("COPT solve failed (rc={solve_rc})"));
+            return Err(format_copt_api_error(lib, env, "COPT solve", solve_rc));
         }
 
         // ── Solution status ───────────────────────────────────────────────────
@@ -919,6 +960,7 @@ mod impl_ {
             objective: objval,
             status,
             iterations: iters as u32,
+            mip_trace: None,
         })
     }
 
@@ -1040,7 +1082,7 @@ mod impl_ {
         let mut copt_prob: ffi::CoptProbPtr = ptr::null_mut();
         let rc = COPT_CreateProb(env, &mut copt_prob);
         if rc != 0 || copt_prob.is_null() {
-            return Err(format!("COPT_CreateProb failed (rc={rc})"));
+            return Err(format_copt_api_error(lib, env, "COPT_CreateProb", rc));
         }
         struct QcqpProbGuard(
             ffi::CoptProbPtr,
@@ -1080,7 +1122,7 @@ mod impl_ {
         // ── Objective sense ───────────────────────────────────────────────────
         let rc = COPT_SetObjSense(copt_prob, COPT_MINIMIZE);
         if rc != 0 {
-            return Err(format!("COPT_SetObjSense failed (rc={rc})"));
+            return Err(format_copt_api_error(lib, env, "COPT_SetObjSense", rc));
         }
 
         // ── Step 1: Add columns (no constraint matrix yet) ───────────────────
@@ -1106,7 +1148,7 @@ mod impl_ {
             ptr::null(),
         );
         if rc != 0 {
-            return Err(format!("COPT_AddCols failed (rc={rc})"));
+            return Err(format_copt_api_error(lib, env, "COPT_AddCols", rc));
         }
 
         // ── Step 2: Add linear rows (CSR format) ─────────────────────────────
@@ -1137,7 +1179,7 @@ mod impl_ {
                 ptr::null(),
             );
             if rc != 0 {
-                return Err(format!("COPT_AddRows failed (rc={rc})"));
+                return Err(format_copt_api_error(lib, env, "COPT_AddRows", rc));
             }
         }
 

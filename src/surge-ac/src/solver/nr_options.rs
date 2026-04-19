@@ -510,7 +510,7 @@ impl Default for AcPfOptions {
             enforce_gen_p_limits: true,
             slack_participation: None,
             generator_slack_participation: None,
-            distributed_slack: false,
+            distributed_slack: true,
             slack_attribution: SlackAttributionMode::Automatic,
             detect_islands: true,
             oltc_enabled: true,

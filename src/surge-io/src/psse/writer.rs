@@ -1076,6 +1076,8 @@ mod tests {
                 tap_step: 0.00625,
                 in_service: true,
             },
+            p_dc_min_mw: 0.0,
+            p_dc_max_mw: 0.0,
         });
 
         let s = to_string(&net, 33).unwrap();

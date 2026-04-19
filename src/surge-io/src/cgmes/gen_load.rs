@@ -11,7 +11,7 @@ use surge_network::Network;
 use surge_network::network::power_injection::PowerInjectionKind;
 use surge_network::network::{
     BusType, CgmesEquivalentInjectionSource, CgmesExternalNetworkInjectionSource, GenType,
-    Generator, Load, PowerInjection,
+    Generator, GeneratorTechnology, Load, PowerInjection,
 };
 
 fn push_fixed_injection(
@@ -30,6 +30,31 @@ fn push_fixed_injection(
         reactive_power_injection_mvar: q_mvar,
         in_service: true,
     });
+}
+
+fn cgmes_generating_unit_technology(class: &str) -> Option<GeneratorTechnology> {
+    match class {
+        "ThermalGeneratingUnit" => Some(GeneratorTechnology::Thermal),
+        "NuclearGeneratingUnit" => Some(GeneratorTechnology::Nuclear),
+        "HydroGeneratingUnit" => Some(GeneratorTechnology::Hydro),
+        "WindGeneratingUnit" => Some(GeneratorTechnology::Wind),
+        "PhotovoltaicGeneratingUnit" => Some(GeneratorTechnology::SolarPv),
+        "SolarGeneratingUnit" => Some(GeneratorTechnology::Solar),
+        "StorageUnit" => Some(GeneratorTechnology::Storage),
+        "WaveGeneratingUnit" => Some(GeneratorTechnology::Wave),
+        "OtherGeneratingUnit" => Some(GeneratorTechnology::Other),
+        _ => None,
+    }
+}
+
+fn cgmes_power_electronics_technology(class: &str) -> Option<GeneratorTechnology> {
+    match class {
+        "PhotovoltaicUnit" => Some(GeneratorTechnology::SolarPv),
+        "WindGeneratingUnit" => Some(GeneratorTechnology::Wind),
+        "BatteryUnit" => Some(GeneratorTechnology::BatteryStorage),
+        "PowerElectronicsUnit" => Some(GeneratorTechnology::Storage),
+        _ => None,
+    }
 }
 
 pub(crate) fn build_generators_and_loads(
@@ -252,6 +277,8 @@ pub(crate) fn build_generators_and_loads(
                 g.pmax = 0.0; // motors do not generate active power
                 g.pmin = pg.min(0.0);
                 g.machine_base_mva = base_mva;
+                g.gen_type = GenType::Asynchronous;
+                g.technology = Some(GeneratorTechnology::Motor);
                 network.generators.push(g);
             } else {
                 // No voltage regulation — model as PQ load.
@@ -270,6 +297,9 @@ pub(crate) fn build_generators_and_loads(
 
         let pg = if is_condenser { 0.0 } else { -p_ssh };
         let qg = -q_ssh; // q also negated per IEC convention
+        let gu_id = sm.get_ref("GeneratingUnit");
+        let gu_obj = gu_id.and_then(|id| objects.get(id));
+        let gu_class = gu_obj.map(|gu| gu.class.as_str());
 
         // MAJ-05: CGMES SynchronousMachine.controlEnabled (SSH, default=true for generators).
         // When false, the machine does not participate in voltage regulation and should be
@@ -290,6 +320,9 @@ pub(crate) fn build_generators_and_loads(
             g.pmin = pg.min(sm.parse_f64("minOperatingP").unwrap_or(pg));
             g.machine_base_mva = base_mva;
             g.voltage_regulated = false;
+            g.gen_type = GenType::Synchronous;
+            g.technology = gu_class.and_then(cgmes_generating_unit_technology);
+            g.source_technology_code = gu_class.map(str::to_string);
             network.generators.push(g);
             continue;
         }
@@ -307,7 +340,6 @@ pub(crate) fn build_generators_and_loads(
         let vs = idx.gen_vs(objects, sm, bus_base_kv).unwrap_or(1.0);
 
         // Pmax/Pmin/qmax/qmin from GeneratingUnit + direct fields
-        let gu_id = sm.get_ref("GeneratingUnit");
         let (pmax, pmin) = gu_id
             .and_then(|id| objects.get(id))
             .map(|gu| {
@@ -339,7 +371,6 @@ pub(crate) fn build_generators_and_loads(
         // the GeneratingUnit object rather than the SynchronousMachine). If neither is
         // present, fall back to ReactivePowerLimit from OperationalLimitSet (Wave 17).
         // Last resort: wide defaults (±9999 MVAr = effectively unlimited).
-        let gu_obj = gu_id.and_then(|id| objects.get(id));
         let rpl_fallback = idx.eq_reactive_limits.get(sm_id.as_str()).copied();
         let qmax = sm
             .parse_f64("maxQ")
@@ -381,6 +412,9 @@ pub(crate) fn build_generators_and_loads(
         g.qmax = qmax;
         g.qmin = qmin;
         g.machine_base_mva = base_mva;
+        g.gen_type = GenType::Synchronous;
+        g.technology = gu_class.and_then(cgmes_generating_unit_technology);
+        g.source_technology_code = gu_class.map(str::to_string);
 
         // Populate pq_curve from the full RCC for OPF use.
         // Convention: (p_pu, qmax_pu, qmin_pu) — P in generator sign (positive=generating).
@@ -1101,21 +1135,17 @@ pub(crate) fn build_generators_and_loads(
     //
     // NOTE: BatteryUnit.ratedE and storedE are metadata (energy capacity / SoC in MWh).
     // They do not affect the steady-state PF; stored for future dispatch/UC use.
-    // Build reverse map: PEC mRID → GenType from associated PowerElectronicsUnit subclass.
+    // Build reverse map: PEC mRID → electrical class / technology from associated
+    // PowerElectronicsUnit subclass.
     // PowerElectronicsUnit.PowerElectronicsConnection references the parent PEC.
-    let pec_gen_type: HashMap<String, GenType> = {
+    let pec_classification: HashMap<String, (GenType, GeneratorTechnology, String)> = {
         let mut m = HashMap::new();
         for (id, obj) in objects.iter() {
-            let gt = match obj.class.as_str() {
-                "PhotovoltaicUnit" => Some(GenType::Solar),
-                "WindGeneratingUnit" => Some(GenType::Wind),
-                "BatteryUnit" => Some(GenType::InverterOther),
-                "PowerElectronicsUnit" => Some(GenType::InverterOther),
-                _ => None,
-            };
-            if let Some(gt) = gt {
+            if let Some(technology) = cgmes_power_electronics_technology(obj.class.as_str()) {
+                let electrical_class = GenType::InverterBased;
+                let classification = (electrical_class, technology, obj.class.clone());
                 if let Some(pec_id) = obj.get_ref("PowerElectronicsConnection") {
-                    m.insert(pec_id.to_string(), gt);
+                    m.insert(pec_id.to_string(), classification.clone());
                 }
                 // Some models store the reference under EquipmentContainer
                 if let Some(pec_id) = obj.get_ref("EquipmentContainer") {
@@ -1123,7 +1153,7 @@ pub(crate) fn build_generators_and_loads(
                     if let Some(pec_obj) = objects.get(pec_id)
                         && pec_obj.class == "PowerElectronicsConnection"
                     {
-                        m.entry(pec_id.to_string()).or_insert(gt);
+                        m.entry(pec_id.to_string()).or_insert(classification);
                     }
                 }
                 // Also try matching by mRID suffix for BatteryUnit with inline PEC ref
@@ -1201,11 +1231,18 @@ pub(crate) fn build_generators_and_loads(
             pec_gen.pmax = p_max;
             pec_gen.pmin = p_min;
             pec_gen.in_service = true;
-            // Set gen_type from associated PowerElectronicsUnit subclass
-            pec_gen.gen_type = pec_gen_type
-                .get(pec_id.as_str())
-                .copied()
-                .unwrap_or(GenType::InverterOther);
+            // Set electrical class / technology from associated PowerElectronicsUnit subclass.
+            if let Some((electrical_class, technology, source_code)) =
+                pec_classification.get(pec_id)
+            {
+                pec_gen.gen_type = *electrical_class;
+                pec_gen.technology = Some(*technology);
+                pec_gen.source_technology_code = Some(source_code.clone());
+            } else {
+                pec_gen.gen_type = GenType::InverterBased;
+                pec_gen.technology = Some(GeneratorTechnology::Storage);
+                pec_gen.source_technology_code = Some("PowerElectronicsConnection".to_string());
+            }
             if let Some(&i) = bus_num_to_idx.get(&bus_num) {
                 let b = &mut network.buses[i];
                 if b.bus_type == BusType::PQ {

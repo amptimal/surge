@@ -20,6 +20,7 @@ pub mod dss;
 pub mod epc;
 pub mod export;
 pub mod geo;
+pub mod go_c3;
 pub mod iec62325;
 pub mod ieee_cdf;
 pub mod json;
@@ -54,6 +55,12 @@ pub enum Format {
     SurgeJson,
     Dss,
     Epc,
+    /// GO Competition Challenge 3 JSON format.
+    ///
+    /// `loads()` extracts the static network from the GO C3 problem JSON.
+    /// For full access to time series and reliability data, use the
+    /// [`go_c3`] module directly.
+    GoC3,
 }
 
 /// Errors from [`load`] and [`loads`].
@@ -86,6 +93,8 @@ pub enum LoadError {
     Json(#[from] json::Error),
     #[error(transparent)]
     Bin(#[from] bin::Error),
+    #[error(transparent)]
+    GoC3(#[from] go_c3::Error),
     #[error(transparent)]
     InvalidNetwork(#[from] NetworkError),
 }
@@ -238,6 +247,11 @@ pub fn loads(content: &str, format: Format) -> Result<Network, LoadError> {
         Format::SurgeJson => Ok(json::loads(content)?),
         Format::Dss => Ok(dss::loads(content)?),
         Format::Epc => Ok(epc::loads(content)?),
+        Format::GoC3 => {
+            let problem = go_c3::load_problem_str(content)?;
+            let (net, _ctx) = go_c3::to_network(&problem)?;
+            Ok(net)
+        }
     }
     .and_then(finalize_loaded_network)
 }
@@ -289,6 +303,9 @@ pub fn dumps(network: &Network, format: Format) -> Result<String, SaveError> {
         Format::SurgeJson => Ok(json::dumps(network)?),
         Format::Dss => Ok(dss::dumps(network)?),
         Format::Epc => Ok(epc::dumps(network)?),
+        Format::GoC3 => Err(SaveError::UnsupportedFormat(
+            "GO C3 network-only export is not supported; use go_c3::save_solution() for solution output".to_string(),
+        )),
     }
 }
 

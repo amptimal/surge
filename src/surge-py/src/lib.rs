@@ -10,9 +10,12 @@
 )]
 
 mod contingency;
+mod dispatch;
 mod exceptions;
+mod go_c3;
 mod hvdc;
 mod io;
+mod market;
 mod matrices;
 mod network;
 mod opf;
@@ -93,6 +96,8 @@ fn _surge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<solutions::AcPfResult>()?;
     m.add_class::<solutions::DcPfResult>()?;
     m.add_class::<solutions::OpfSolution>()?;
+    m.add_class::<dispatch::ActivsgTimeSeries>()?;
+    m.add_class::<dispatch::DispatchResult>()?;
     m.add_class::<solutions::BindingContingency>()?;
     m.add_class::<solutions::ContingencyViolation>()?;
     m.add_class::<solutions::FailedContingencyEvaluation>()?;
@@ -100,6 +105,7 @@ fn _surge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<solutions::DcOpfResult>()?;
     m.add_class::<solutions::ScopfResult>()?;
     m.add_class::<solutions::AcOpfHvdcResult>()?;
+    m.add_class::<solutions::AcOpfBendersSubproblemResult>()?;
     m.add_class::<solutions::OtsResult>()?;
     m.add_class::<solutions::OrpdResult>()?;
     m.add_class::<solutions::ContingencyAnalysis>()?;
@@ -189,7 +195,29 @@ fn _surge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // OPF
     m.add_function(wrap_pyfunction!(opf::solve_dc_opf_full, m)?)?;
     m.add_function(wrap_pyfunction!(opf::solve_ac_opf, m)?)?;
+    m.add_function(wrap_pyfunction!(opf::solve_ac_opf_subproblem, m)?)?;
     m.add_function(wrap_pyfunction!(opf::solve_scopf, m)?)?;
+    m.add_function(wrap_pyfunction!(dispatch::solve_dispatch, m)?)?;
+    m.add_function(wrap_pyfunction!(dispatch::assess_dispatch_violations, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        dispatch::read_tamu_activsg_time_series,
+        m
+    )?)?;
+
+    // GO Competition Challenge 3 adapter
+    m.add_class::<go_c3::GoC3Handle>()?;
+    m.add_function(wrap_pyfunction!(go_c3::go_c3_load_problem, m)?)?;
+    m.add_function(wrap_pyfunction!(go_c3::go_c3_build_network, m)?)?;
+    m.add_function(wrap_pyfunction!(go_c3::go_c3_build_request, m)?)?;
+    m.add_function(wrap_pyfunction!(go_c3::go_c3_export_solution, m)?)?;
+    m.add_function(wrap_pyfunction!(go_c3::go_c3_save_solution, m)?)?;
+    m.add_function(wrap_pyfunction!(go_c3::go_c3_build_workflow, m)?)?;
+
+    // Canonical market workflow types (Phase 3).
+    m.add_class::<market::PyMarketStage>()?;
+    m.add_class::<market::PyMarketWorkflow>()?;
+    m.add_function(wrap_pyfunction!(market::market_stage, m)?)?;
+    m.add_function(wrap_pyfunction!(market::solve_market_workflow_py, m)?)?;
     // Contingency
     m.add_class::<contingency::ContingencyOptions>()?;
     m.add_class::<contingency::Contingency>()?;
@@ -244,6 +272,7 @@ fn _surge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(test_networks::case9, m)?)?;
     m.add_function(wrap_pyfunction!(test_networks::case14, m)?)?;
     m.add_function(wrap_pyfunction!(test_networks::case30, m)?)?;
+    m.add_function(wrap_pyfunction!(test_networks::market30, m)?)?;
     m.add_function(wrap_pyfunction!(test_networks::case57, m)?)?;
     m.add_function(wrap_pyfunction!(test_networks::case118, m)?)?;
     m.add_function(wrap_pyfunction!(test_networks::case300, m)?)?;

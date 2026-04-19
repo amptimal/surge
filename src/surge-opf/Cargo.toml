@@ -26,13 +26,13 @@ thiserror.workspace = true
 anyhow.workspace = true
 num-complex.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 libloading.workspace = true
 clarabel.workspace = true
 
 [dev-dependencies]
 surge-io.workspace = true
 surge-ac.workspace = true
-serde_json.workspace = true
 
 [[example]]
 name = "dc_opf"

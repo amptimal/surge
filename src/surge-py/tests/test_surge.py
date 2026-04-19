@@ -22,6 +22,7 @@ _REPO_ROOT = os.path.abspath(
 CASE9 = os.path.join(_REPO_ROOT, "examples", "cases", "case9", "case9.surge.json.zst")
 CASE14 = os.path.join(_REPO_ROOT, "examples", "cases", "case14", "case14.surge.json.zst")
 CASE30 = os.path.join(_REPO_ROOT, "examples", "cases", "case30", "case30.surge.json.zst")
+MARKET30 = os.path.join(_REPO_ROOT, "examples", "cases", "market30", "market30.surge.json.zst")
 CASE118_ZST = os.path.join(_REPO_ROOT, "examples", "cases", "ieee118", "case118.surge.json.zst")
 
 
@@ -58,6 +59,18 @@ class TestLoad:
         net = surge.load(CASE14)
         assert net.n_buses == 14
         assert net.n_branches == 20
+
+    def test_load_market30_builtin(self):
+        net = surge.market30()
+        assert net.n_buses == 30
+        assert net.n_branches == 41
+        assert net.n_generators == 10
+        assert net.name == "market30"
+
+    def test_load_market30_file(self):
+        net = surge.load(MARKET30)
+        assert net.n_buses == 30
+        assert net.n_generators == 10
 
     def test_load_nonexistent_raises(self):
         with pytest.raises(Exception):
@@ -400,7 +413,6 @@ class TestUnsupportedSurface:
             "compute_lole",
             "compute_state_estimation",
             "solve_dc_opf_full",
-            "solve_dispatch",
             "solve_expansion",
             "solve_frequency_response",
             "solve_orpd",
@@ -455,6 +467,15 @@ class TestNetworkEditBus:
         net = surge.load(CASE9)
         with pytest.raises(ValueError, match="bus_type"):
             net.set_bus_type(1, "XX")
+
+    def test_canonicalize_runtime_identities_demotes_stale_pv_bus(self):
+        net = surge.load(CASE9)
+        bus_idx = net.bus_numbers.index(5)
+        net.set_bus_type(5, "PV")
+
+        net.canonicalize_runtime_identities()
+
+        assert net.bus_type_str[bus_idx] == "PQ"
 
     def test_add_bus_increments_count(self):
         """add_bus increases n_buses by 1."""
@@ -626,6 +647,25 @@ class TestNetworkEditGenerator:
         assert net.gen_pmax[idx] == pytest.approx(300.0)
         assert net.gen_pmin[idx] == pytest.approx(20.0)
 
+    def test_set_generator_voltage_regulated_roundtrip(self):
+        """Disabling the slack regulator makes PF invalid; re-enabling restores solvability."""
+        net = surge.load(CASE9)
+        generator_id = _generator_id_at_bus(net, 1)
+        net.set_generator_voltage_regulated(generator_id, False)
+        with pytest.raises(surge.NetworkError, match="slack|voltage_regulated"):
+            surge.solve_ac_pf(net)
+        net.set_generator_voltage_regulated(generator_id, True)
+        assert surge.solve_ac_pf(net).converged
+
+    def test_set_generator_regulated_bus_roundtrip(self):
+        """set_generator_regulated_bus accepts explicit and local regulation targets."""
+        net = surge.load(CASE9)
+        generator_id = _generator_id_at_bus(net, 1)
+        net.set_generator_regulated_bus(generator_id, 1)
+        assert surge.solve_ac_pf(net).converged
+        net.set_generator_regulated_bus(generator_id, None)
+        assert surge.solve_ac_pf(net).converged
+
     def test_add_generator_increments_count(self):
         """add_generator increases n_generators and pg is readable."""
         net = surge.load(CASE9)
@@ -658,6 +698,33 @@ class TestNetworkEditGenerator:
         net = surge.load(CASE9)
         with pytest.raises(surge.NetworkError, match="not found"):
             net.add_generator(999, p_mw=50.0, pmax_mw=100.0)
+
+    def test_update_generator_object_roundtrips_commitment_fields(self):
+        """Editable generator commitment metadata writes back through update_generator_object."""
+        net = surge.load(CASE9)
+        generator_id = _generator_id_at_bus(net, 1)
+        generator = net.generator(generator_id)
+        generator.min_up_time_hr = 4.0
+        generator.min_down_time_hr = 2.0
+        generator.max_up_time_hr = 12.0
+        generator.min_run_at_pmin_hr = 1.5
+        generator.max_starts_per_day = 2
+        generator.max_starts_per_week = 5
+        generator.max_energy_mwh_per_day = 800.0
+        generator.startup_ramp_mw_per_min = 3.0
+        generator.shutdown_ramp_mw_per_min = 2.0
+        net.update_generator_object(generator)
+
+        updated = net.generator(generator_id)
+        assert updated.min_up_time_hr == pytest.approx(4.0)
+        assert updated.min_down_time_hr == pytest.approx(2.0)
+        assert updated.max_up_time_hr == pytest.approx(12.0)
+        assert updated.min_run_at_pmin_hr == pytest.approx(1.5)
+        assert updated.max_starts_per_day == 2
+        assert updated.max_starts_per_week == 5
+        assert updated.max_energy_mwh_per_day == pytest.approx(800.0)
+        assert updated.startup_ramp_mw_per_min == pytest.approx(3.0)
+        assert updated.shutdown_ramp_mw_per_min == pytest.approx(2.0)
 
     def test_scale_generation_exact(self):
         """scale_generation multiplies every in-service gen_p by factor."""

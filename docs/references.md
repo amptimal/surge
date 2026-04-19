@@ -103,6 +103,36 @@ For method classification (reference-equation, approximation, heuristic), see
   The KLU sparse LU factorization used by Surge for Jacobian and
   admittance matrix solves.
 
+## Market Dispatch And Commitment
+
+- **[Holzer2024]** J. T. Holzer, C. J. Coffrin, C. DeMarco, R. Duthu,
+  S. T. Elbert, B. C. Eldridge, T. Elgindy, M. Garcia, S. L. Greene,
+  N. Guo, E. Hale, B. Lesieutre, T. W. Mak, C. McMillan, H. Mittelmann,
+  H. Oh, R. P. O'Neill, T. J. Overbye, B. Palmintier, R. Parker,
+  F. Safdarian, A. Tbaileh, P. Van Hentenryck, A. Veeramany, S. Wangen,
+  and J. L. Wert, "Grid Optimization Competition Challenge 3 Problem
+  Formulation," Pacific Northwest National Laboratory, Report
+  PNNL-35792, April 2024.
+  <https://doi.org/10.2172/2337844>
+  The canonical problem-formulation document for the ARPA-E Grid
+  Optimization Competition Challenge 3: variables, constraints, and
+  objective for a multi-period SCUC with reactive reserves, branch
+  switching, soft energy windows, startup/shutdown trajectory power,
+  linearized N-1 security, and an AC reconcile stage. Surge's
+  [`surge-dispatch`](crates/surge-dispatch.md) and
+  [`surge-market`](crates/surge-market.md) crates implement this
+  formulation; `surge_market::go_c3` adapts GO C3 scenario JSON into
+  the canonical dispatch request model.
+
+- **[Holzer2024b]** J. T. Holzer, S. Elbert, H. Mittelmann,
+  R. O'Neill, and H. Oh, "GO Competition Challenge 3: Problem,
+  Solvers, and Solution Analysis," arXiv:2411.12033 [math.NA],
+  November 2024.
+  <https://arxiv.org/abs/2411.12033>
+  Post-competition analysis paper: motivation, solver approaches
+  from competition entrants, and evaluation results. Companion to
+  the formulation report [Holzer2024].
+
 ## Test Case Libraries
 
 - **[Zimmerman2011]** R. D. Zimmerman, C. E. Murillo-Sanchez, and R. J.

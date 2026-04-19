@@ -20,8 +20,12 @@ venv/
 *.dylib
 *.cu.o
 
-# Benchmark suite lives in amptimal/surge-bench (not in this repo)
-/benchmarks/
+# Benchmark data lives in amptimal/surge-bench (not in this repo).
+# Historically the root ``/benchmarks/`` directory was used for symlinks
+# into that data. It is now a first-class source directory for
+# per-market harness code (``benchmarks/<market>/``); dataset caches
+# live under ``target/benchmarks/`` and are covered by the ``target/``
+# rule already.
 /pyproject.toml
 
 # Test data lives in amptimal/surge-bench (copy instances/ -> tests/data/ to run tests)
@@ -35,6 +39,7 @@ vendor/*/build/
 # IDE
 .idea/
 .vscode/
+.obsidian/
 *.swp
 *.swo
 
@@ -68,5 +73,5 @@ Thumbs.db
 *.csv
 license.key
 
-# Test case data (downloaded, large)
-research/test-cases/data/
+# Research scratch — not shipped
+research/

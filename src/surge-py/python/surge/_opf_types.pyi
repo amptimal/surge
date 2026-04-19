@@ -117,6 +117,7 @@ class DcOpfRuntime:
 @dataclass(frozen=True, kw_only=True)
 class AcOpfOptions:
     enforce_thermal_limits: bool = True
+    thermal_limit_slack_penalty_per_mva: float = 0.0
     minimum_branch_rating_a_mva: float = 1.0
     enforce_angle_limits: bool = False
     optimize_switched_shunts: bool = False
@@ -141,6 +142,8 @@ class AcOpfRuntime:
     nlp_solver: str | None = None
     print_level: int = 0
     warm_start: OpfResult | None = None
+    warm_start_vm_pu: list[float] | None = None
+    warm_start_va_rad: list[float] | None = None
     angle_warm_start: AcAngleWarmStartMode = ...
     constraint_screening: ConstraintScreening | None = None
     def to_native_kwargs(self, network: object | None = None) -> dict[str, object]: ...

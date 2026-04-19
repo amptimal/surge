@@ -48,16 +48,16 @@ pub mod vsc_dc_line;
 
 // ── Core equipment ──────────────────────────────────────────────────────
 pub use branch::{
-    Branch, BranchOpfControl, BranchPiAdmittance, BranchPowerFlowsPu, BranchType, HarmonicData,
-    LineData, LineType, PhaseMode, SeriesCompData, TapMode, TransformerConnection, TransformerData,
-    WindingConnection, ZeroSeqData,
+    Branch, BranchOpfControl, BranchPiAdmittance, BranchPowerFlowsPu, BranchRatingCondition,
+    BranchType, HarmonicData, LineData, LineType, PhaseMode, SeriesCompData, TapMode,
+    TransformerConnection, TransformerData, WindingConnection, ZeroSeqData,
 };
 pub use bus::{Bus, BusType};
 pub use fixed_shunt::{FixedShunt, ShuntType};
 pub use generator::{
     CommitmentParams, CommitmentStatus, FuelParams, FuelSupply, GenFaultData, GenType, Generator,
-    InverterParams, MarketParams, RampingParams, ReactiveCapability, StorageDispatchMode,
-    StorageParams, StorageValidationError,
+    GeneratorTechnology, InverterParams, MarketParams, PqLinearLink, RampingParams,
+    ReactiveCapability, StorageDispatchMode, StorageParams, StorageValidationError,
 };
 pub use load::{Load, LoadClass, LoadConnection};
 
@@ -99,7 +99,7 @@ pub use angle_reference::{
     AngleReference, DistributedAngleWeight, apply_angle_reference, apply_angle_reference_subset,
 };
 pub use area_schedule::AreaSchedule;
-pub use flowgate::{Flowgate, Interface, OperatingNomogram};
+pub use flowgate::{Flowgate, INACTIVE_FLOWGATE_LIMIT_MW, Interface, OperatingNomogram};
 pub use owner::{Owner, OwnershipEntry};
 pub use power_injection::PowerInjection;
 pub use refs::{
