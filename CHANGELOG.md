@@ -6,6 +6,22 @@ this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows Semantic Versioning intent.
 
+## [0.1.3] — 2026-04-19
+
+### Changed
+
+- **HiGHS MIP backend tuning.** Presolve is now left on by default even when a
+  primal-start hint is supplied (previously forced off). `simplex_scale_strategy=4`
+  is now the default for MIP LP solves. HiGHS MIP verbose logging is now gated by
+  `SURGE_HIGHS_VERBOSE` (previously LP/QP only).
+
+### Added
+
+- `SURGE_HIGHS_*` environment variables for tuning HiGHS without a rebuild:
+  `THREADS`, `PARALLEL`, `RANDOM_SEED`, `SIMPLEX_STRAT`, `SCALE_STRAT`,
+  `PRIMAL_FEAS_TOL`, `DUAL_FEAS_TOL`, `CROSSOVER`, `MIP_HEURISTIC`,
+  `MIP_DETECT_SYM`, `MIP_FEAS_TOL`, `MIP_REL_GAP`.
+
 ## [0.1.2] — 2026-04-18
 
 ### Added
