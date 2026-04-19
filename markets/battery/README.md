@@ -234,5 +234,3 @@ The top-line `revenue_summary`:
 - Dashboard (future): `dashboards/battery/` will show SOC
   trajectories, revenue P&L, cycle counts, four-mode side-by-side
   comparisons.
-- Harness (future): `benchmarks/battery/` will carry reference
-  LMP traces and analytic-optimum comparisons.

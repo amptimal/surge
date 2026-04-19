@@ -24,6 +24,17 @@ This index covers the release-facing documentation in this repository.
 | [Method Fidelity](method-fidelity.md) | What Surge means by exact, approximate, heuristic, and experimental methods |
 | [Performance And Scaling](performance.md) | Threading, memory scaling, and large-case guidance |
 
+## Dispatch And Markets
+
+| Document | Purpose |
+|---|---|
+| [Markets Overview](../markets/README.md) | The `markets/` contract — `Policy`, `Problem`, `solve` — and reusable `DispatchRequest` builder |
+| [`markets/rto/`](../markets/rto/README.md) | ISO day-ahead energy + AS clearing reference market |
+| [`markets/battery/`](../markets/battery/README.md) | Single-site price-taker BESS reference market |
+| [`markets/go_c3/`](../markets/go_c3/README.md) | GO Competition Challenge 3 adapter and solve |
+| [`surge-dispatch`](crates/surge-dispatch.md) | Unified SCED/SCUC kernel crate doc |
+| [`surge-market`](crates/surge-market.md) | Canonical market-formulation layer crate doc |
+
 ## Interfaces And Reference
 
 | Document | Purpose |

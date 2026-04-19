@@ -110,7 +110,6 @@ two-stage setup.
 
 ## What lives next to each market
 
-* **Harness** — `benchmarks/<name>/` for dataset fetchers, validators, suite runners, diff tools.
 * **Dashboard** — `dashboards/<name>/` for interactive per-case views.
 
-Both are optional. Small markets can ship with just `markets/<name>/`.
+Optional. Small markets can ship with just `markets/<name>/`.

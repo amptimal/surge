@@ -127,5 +127,3 @@ Phase 1 (this release):
 
 - Dashboard (future): `dashboards/rto/` will host an interactive
   settlement / LMP heatmap view.
-- Harness (future): `benchmarks/rto/` will carry reference cases and
-  comparison tooling.

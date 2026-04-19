@@ -63,13 +63,3 @@ See [`config.py`](config.py) for the `MarketConfig` preset and
 | `commitment_mip_gap_schedule` | Time-varying gap schedule (step function). |
 | `reactive_support_pin_factor` | Retry factor applied on NLP degeneracy fallback. |
 | `capture_solver_log` | Tee Rust tracing + solver console into `solve.log` (~3000 lines). |
-
-## What lives next to this market
-
-* **Benchmark harness** at [`benchmarks/go_c3/`](../../benchmarks/go_c3/) —
-  dataset fetchers, official GO C3 validator integration, winner /
-  leaderboard reference data, suite runners, diff tools, and the
-  scoring-replica `violations.py`.
-* **Dashboard** at [`dashboards/go_c3/`](../../dashboards/go_c3/) —
-  FastAPI server with per-case JSON views, live re-solve /
-  re-validate, solve-log streaming.

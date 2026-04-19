@@ -4,13 +4,12 @@ A **market** in this tree is the declarative spec for a dispatch
 formulation: what problem data it consumes, what products are priced,
 which workflow it runs, and what shape its output takes. Each market
 lives in its own subpackage; this directory is where the *formulations*
-live — not the harness, not the dashboards.
+live — not the dashboards.
 
 | Layer | Lives in | Role |
 |---|---|---|
 | **Market spec** | `markets/<name>/` | What this market *is* — topology conventions, policy, config, solve, export. |
 | **Framework** | `src/surge-py/python/surge/market/` + `src/surge-market/` | Reusable building blocks (MarketConfig, ReserveProductDef, MarketWorkflow, run_market_solve). |
-| **Benchmark harness** | `benchmarks/<name>/` | Dataset fetchers, third-party validators, suite runners, diff tools. |
 | **Dashboard** | `dashboards/<name>/` | Interactive UI — per-case JSON + live re-solve. |
 
 ## Reference implementations
@@ -226,6 +225,5 @@ from markets.battery   import BatteryPolicy,  BatteryProblem,  solve
 from markets.go_c3     import GoC3Policy,     GoC3Problem,     solve
 ```
 
-That's the whole surface. Anything fancier (suite runs, third-party
-validator integration, interactive dashboards) lives in
-`benchmarks/<name>/` or `dashboards/<name>/` and calls into these.
+That's the whole surface. Interactive per-case views live in
+`dashboards/<name>/` and call into these.
