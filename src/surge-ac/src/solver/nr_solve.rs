@@ -187,8 +187,7 @@ fn fdpf_warm_start_attempt(network: &Network, options: &AcPfOptions) -> Option<P
 
     let bus_map = network.bus_index_map();
     for g in &network.generators {
-        if g.in_service
-            && g.voltage_regulated
+        if g.can_voltage_regulate()
             && let Some(&gen_idx) = bus_map.get(&g.bus)
             && (network.buses[gen_idx].bus_type == BusType::PV
                 || network.buses[gen_idx].bus_type == BusType::Slack)

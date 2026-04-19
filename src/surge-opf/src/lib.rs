@@ -59,8 +59,9 @@ pub use switching::{
 
 // AC-OPF
 pub use ac::{
-    AcOpfError, AcOpfOptions, AcOpfRuntime, BendersCut, DiscreteMode, WarmStart,
-    compute_ac_marginal_loss_factors, solve_ac_opf, solve_ac_opf_with_runtime,
+    AcObjectiveTargetTracking, AcOpfBendersSubproblem, AcOpfError, AcOpfOptions, AcOpfRuntime,
+    BendersCut, DiscreteMode, WarmStart, compute_ac_marginal_loss_factors, solve_ac_opf,
+    solve_ac_opf_subproblem, solve_ac_opf_with_runtime,
 };
 
 // DC-OPF

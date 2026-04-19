@@ -217,50 +217,10 @@ fn solved_generator_q_mvar(
     network: &Network,
     pf_result: &surge_solution::PfSolution,
 ) -> Vec<(usize, f64)> {
-    let base = network.base_mva;
-    let bus_map = network.bus_index_map();
-    let load_q = network.bus_load_q_mvar();
-
-    let mut bus_qg = std::collections::HashMap::new();
-    for (bus_idx, bus) in network.buses.iter().enumerate() {
-        let idx = bus_map[&bus.number];
-        if idx >= pf_result.reactive_power_injection_pu.len() {
-            continue;
-        }
-        let vm = pf_result.voltage_magnitude_pu[idx];
-        let qd = load_q.get(bus_idx).copied().unwrap_or(0.0);
-        let qg_bus = pf_result.reactive_power_injection_pu[idx] * base + qd
-            - bus.shunt_susceptance_mvar * vm * vm * base;
-        bus_qg.insert(bus.number, qg_bus);
-    }
-
-    let mut bus_range = std::collections::HashMap::new();
-    for generator in network
-        .generators
-        .iter()
-        .filter(|generator| generator.in_service)
-    {
-        *bus_range.entry(generator.bus).or_insert(0.0) +=
-            (generator.qmax - generator.qmin).max(0.0);
-    }
-
-    network
-        .generators
-        .iter()
+    pf_result
+        .generator_reactive_power_mvar(network)
+        .into_iter()
         .enumerate()
-        .filter_map(|(gi, generator)| {
-            if !generator.in_service {
-                return None;
-            }
-            let total_qg = bus_qg.get(&generator.bus).copied().unwrap_or(0.0);
-            let range = bus_range.get(&generator.bus).copied().unwrap_or(0.0);
-            let gen_range = (generator.qmax - generator.qmin).max(0.0);
-            let qg = if range > 1e-6 {
-                total_qg * gen_range / range
-            } else {
-                total_qg
-            };
-            Some((gi, qg))
-        })
+        .filter_map(|(gi, qg)| network.generators[gi].in_service.then_some((gi, qg)))
         .collect()
 }

@@ -206,7 +206,7 @@ pub struct PenaltyConfig {
     pub voltage_high: PenaltyCurve,
     /// Penalty for voltage below Vmin (per pu below limit).
     pub voltage_low: PenaltyCurve,
-    /// Legacy symmetric penalty for power balance mismatch (per pu MW).
+    /// Legacy symmetric penalty for active-power balance mismatch (per MW).
     ///
     /// Used for both curtailment and excess when the asymmetric fields below
     /// are not explicitly set.
@@ -221,6 +221,16 @@ pub struct PenaltyConfig {
     /// When `None`, falls back to `power_balance`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub power_balance_excess: Option<PenaltyCurve>,
+    /// Penalty for reactive-power balance mismatch (per MVAr).
+    ///
+    /// Applied to AC OPF bus Q-balance slack variables
+    /// (`q_slack_pos_mvar`, `q_slack_neg_mvar` in `BusPeriodResult`).
+    /// When left at its default, callers fall back to `power_balance`
+    /// so Q slack is priced against the same curve as P. Set this
+    /// field when the market specifies a distinct reactive-balance
+    /// violation cost.
+    #[serde(default = "default_reactive_balance_penalty")]
+    pub reactive_balance: PenaltyCurve,
     /// Penalty for ramp rate violation (per MW/min above ramp limit).
     pub ramp: PenaltyCurve,
     /// Penalty for angle limit violation (per radian above limit).
@@ -268,6 +278,9 @@ impl Default for PenaltyConfig {
             },
             power_balance_curtailment: None,
             power_balance_excess: None,
+            // Reactive balance: matches the legacy default (same curve as
+            // active balance) so existing callers see no behavioural change.
+            reactive_balance: default_reactive_balance_penalty(),
             // Ramp: $100/(MW/min) for small violations (≤5 MW/min), $1k/(MW/min) for large
             ramp: PenaltyCurve::PiecewiseLinear {
                 segments: vec![
@@ -293,6 +306,12 @@ impl Default for PenaltyConfig {
     }
 }
 
+fn default_reactive_balance_penalty() -> PenaltyCurve {
+    PenaltyCurve::Linear {
+        cost_per_unit: 1_000_000.0,
+    }
+}
+
 impl PenaltyConfig {
     /// Effective penalty curve for unserved-load / curtailment slack.
     pub fn power_balance_curtailment_curve(&self) -> &PenaltyCurve {
@@ -306,6 +325,16 @@ impl PenaltyConfig {
         self.power_balance_excess
             .as_ref()
             .unwrap_or(&self.power_balance)
+    }
+
+    /// Effective penalty curve for reactive-power balance slack.
+    ///
+    /// Returns `reactive_balance` when it has been explicitly set away from
+    /// the default ($1M/pu), otherwise falls back to `power_balance` to
+    /// preserve legacy behaviour where a single curve priced both active
+    /// and reactive balance slack.
+    pub fn reactive_balance_curve(&self) -> &PenaltyCurve {
+        &self.reactive_balance
     }
 
     /// Build a `PenaltyConfig` with the `reserve` field set to an ERCOT-style

@@ -94,6 +94,8 @@ pub(crate) fn solve_multi_interface_transfer_lp(
         q_start: None,
         q_index: None,
         q_value: None,
+        col_names: None,
+        row_names: None,
         integrality: None,
     };
 

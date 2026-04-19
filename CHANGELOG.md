@@ -6,6 +6,120 @@ this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows Semantic Versioning intent.
 
+## [0.1.2] — 2026-04-18
+
+### Added
+
+#### New crates
+
+- `surge-dispatch` — unified economic dispatch and unit commitment kernel.
+  Typed `DispatchModel` / `DispatchRequest` / `solve_dispatch` API covers DC
+  and AC SCED, DC SCUC, time-coupled multi-period dispatch, reliability
+  commitment, AC redispatch, and SCED-AC Benders decomposition through one
+  request surface with three orthogonal study axes (Formulation × Interval
+  Coupling × Commitment Policy). Includes reserve-product modeling, N-1
+  security screening (explicit contingencies or iterative screening),
+  HVDC co-dispatch, emissions and carbon pricing, and a ledger-first
+  `DispatchSolution` with an exact `ObjectiveTerm` audit.
+- `surge-market` — canonical market-formulation layer on top of
+  `surge-dispatch`. Provides standard reserve-product constructors
+  (regulation, synchronized, non-synchronized, ramping, reactive
+  headroom) and zonal-requirement builders, commitment helpers,
+  piecewise offer-curve construction, per-bus load aggregation,
+  startup/shutdown trajectory derivation, and time-window translators.
+  Adds a typed multi-stage workflow runner (`MarketStage`,
+  `MarketWorkflow`, `solve_market_workflow`) with commitment handoff
+  and dispatch pinning, the canonical two-stage DC SCUC → AC SCED
+  workflow, the AC SCED setup combinator (reactive-reserve filter,
+  commitment augmentation, bandable-subset producer pinning, AC warm
+  start, Q-bound overrides), and the AC refinement runtime
+  (`RetryPolicy` nested grid of OPF / band / NLP / HVDC attempts with
+  feedback providers and commitment probes). Includes the GO Competition
+  Challenge 3 format adapter as the reference implementation.
+
+#### Python
+
+- New `surge.dispatch` namespace exposing the canonical dispatch API —
+  `DispatchRequest`, `DispatchSolution`, study-axis enums, timeline
+  helpers, and reserve/market/network configuration builders.
+- New `surge.market` namespace with `MarketConfig`, `MarketWorkflow`,
+  `WorkflowRunner`, `run_market_solve`, reserve catalog constants,
+  penalty-curve builders, AC reconciliation helpers, and
+  violation-assessment utilities.
+- New `surge.market.go_c3` namespace with a one-call `load` /
+  `build_workflow` / `solve_workflow` / `export` / `save` recipe for the
+  GO C3 adapter.
+- Typed `.pyi` stubs for dispatch and market namespaces; `surge.opf`
+  namespace module added.
+- New `solve_sced` binding.
+
+#### Optimization (`surge-opf`)
+
+- AC-OPF Benders subproblem support that produces the optimality cuts
+  consumed by `surge-dispatch`'s SCED-AC Benders loop.
+- Canonical reactive-reserve modeling in AC-OPF with per-product
+  headroom/footroom constraints and deliverability caps.
+- HVDC co-optimization inside AC-OPF, including converter-terminal Q
+  constraints and per-link dispatch bands.
+- Generator P-Q capability curves, piecewise cost epigraph support, and
+  improved tap / phase-shifter / switched-shunt / SVC / TCSC handling.
+- Pre-solve model-reduction backend (`backends::reduce`) that removes
+  bound-implied-zero columns and duplicate rows before handing the LP
+  to the chosen backend.
+- Canonical MIP gap schedule / progress monitor API so commitment
+  solves can target time-varying gap thresholds.
+- Expanded Gurobi and HiGHS backend coverage (MIP callbacks, incumbent
+  tracking, Benders-compatible LP resolves); improved COPT backend for
+  AC-OPF NLPs.
+- AC-OPF result envelope now carries the full objective-ledger audit,
+  and the `surge-solve` CLI fails closed when the ledger audit fails.
+
+#### Network Model (`surge-network`)
+
+- First-class `DispatchableLoad` with offer schedules and reserve
+  participation.
+- Reserve market primitives: `ReserveProduct`, `ReserveDirection`,
+  `ReserveKind`, `QualificationRule`, `EnergyCoupling`,
+  `ZonalReserveRequirement`, `SystemReserveRequirement`.
+- Generator extensions for reserve capability (regulation, spinning,
+  non-spinning) and startup tiers keyed by offline hours.
+- Flowgate and interface refinements, penalty-curve types, and power-
+  balance penalty configuration.
+
+#### Shared Solution Types (`surge-solution`)
+
+- New `economics` module defining the exact `ObjectiveBucket` /
+  `ObjectiveTerm` / `ObjectiveLedgerMismatch` / `SolutionAuditReport`
+  contracts used by `surge-dispatch` for ledger-first cost reporting.
+- New `ids` module with canonical resource-id helpers
+  (`generator_resource_id`, `dispatchable_load_resource_id`,
+  `combined_cycle_plant_id`, `default_machine_id`).
+
+#### CLI (`surge-bindings`)
+
+- New `refresh_activsg_psse` helper binary for regenerating the
+  ACTIVSg2000 case from upstream PSS/E data used in the dispatch
+  tutorial.
+
+#### Documentation
+
+- New per-crate docs: [`surge-dispatch`](docs/crates/surge-dispatch.md)
+  and [`surge-market`](docs/crates/surge-market.md).
+- New Tutorial 12 — DC dispatch on ACTIVSg with LMP heat maps, with a
+  companion notebook.
+- Expanded generated Python namespace surface to include `surge.dispatch`,
+  `surge.market`, and `surge.market.go_c3`.
+- Refreshed architecture, support matrix, crate index, and release
+  process to cover the new dispatch and market crates.
+
+### Changed
+
+- `surge-bindings` binaries published to crates.io now include the new
+  objective-ledger audit enforcement on AC-OPF outputs.
+- Workspace member count updated — `surge-dispatch` and `surge-market`
+  join the crates.io publication list immediately before
+  `surge-bindings`.
+
 ## [0.1.1] — 2026-03-31
 
 ### Fixed

@@ -26,6 +26,39 @@ def find_case(filename: str = "case118.surge.json.zst") -> Path | None:
     return None
 
 
+def find_activsg_case(case: str = "2000") -> Path | None:
+    root = repo_root()
+    normalized = case.lower()
+    filename = {
+        "2000": "case_ACTIVSg2000.surge.json.zst",
+        "activsg2000": "case_ACTIVSg2000.surge.json.zst",
+        "10k": "case_ACTIVSg10k.surge.json.zst",
+        "10000": "case_ACTIVSg10k.surge.json.zst",
+        "activsg10k": "case_ACTIVSg10k.surge.json.zst",
+    }.get(normalized)
+    if filename is None:
+        return None
+
+    candidates = [
+        root / "examples" / "cases" / filename.removesuffix(".surge.json.zst") / filename,
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
+
+
+def find_activsg_time_series_root() -> Path | None:
+    root = repo_root()
+    candidates = [
+        root / "research" / "test-cases" / "data" / "ACTIVSg_Time_Series",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
+
+
 def find_cli() -> Path | None:
     root = repo_root()
     candidates = [

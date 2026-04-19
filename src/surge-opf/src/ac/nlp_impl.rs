@@ -6,11 +6,38 @@
 #![allow(clippy::needless_range_loop)]
 
 use surge_ac::matrix::mismatch::compute_power_injection;
+use surge_network::network::{StorageDispatchMode, StorageParams};
 
 use super::hvdc::{HvdcAcControlMode, HvdcDcControlMode};
 use super::problem::{AcOpfProblem, HESS_SKIP};
 use super::types::{branch_flow_from, branch_flow_to};
 use crate::nlp::NlpProblem;
+
+/// Discharge-side foldback: 0 MW at ``soc_min``, rising linearly to
+/// ``p_max`` at the foldback threshold, flat above. ``None`` = no cut.
+fn foldback_discharge_cap_nlp(sto: &StorageParams, soc_mwh: f64, p_max: f64) -> f64 {
+    match sto.discharge_foldback_soc_mwh {
+        None => p_max,
+        Some(threshold) => {
+            let range = (threshold - sto.soc_min_mwh).max(1e-12);
+            let frac = ((soc_mwh - sto.soc_min_mwh) / range).clamp(0.0, 1.0);
+            p_max * frac
+        }
+    }
+}
+
+/// Charge-side foldback: 0 MW at ``soc_max``, rising linearly to
+/// ``p_max`` at the threshold, flat below. ``None`` = no cut.
+fn foldback_charge_cap_nlp(sto: &StorageParams, soc_mwh: f64, p_max: f64) -> f64 {
+    match sto.charge_foldback_soc_mwh {
+        None => p_max,
+        Some(threshold) => {
+            let range = (sto.soc_max_mwh - threshold).max(1e-12);
+            let frac = ((sto.soc_max_mwh - soc_mwh) / range).clamp(0.0, 1.0);
+            p_max * frac
+        }
+    }
+}
 
 impl NlpProblem for AcOpfProblem<'_> {
     fn n_vars(&self) -> usize {
@@ -42,20 +69,72 @@ impl NlpProblem for AcOpfProblem<'_> {
             }
         }
 
-        // Vm bounds: [vmin, vmax]
+        // Vm bounds: [vmin, vmax], except regulated buses whose voltage target
+        // is fixed by an in-service voltage-controlling device. When
+        // `enforce_regulated_bus_vm_targets` is `false`, the regulator setpoint
+        // becomes a soft target only and Vm at regulated buses keeps its
+        // normal `[vmin, vmax]` box bounds (used by market-style formulations
+        // that prefer the optimizer to choose voltage rather than honor an
+        // exogenous setpoint).
         for i in 0..m.n_bus {
             let idx = m.vm_var(i);
-            lb[idx] = self.network.buses[i].voltage_min_pu;
-            ub[idx] = self.network.buses[i].voltage_max_pu;
+            let regulated_target = self.regulated_bus_vm_targets[i];
+            if self.enforce_regulated_bus_vm_targets {
+                if let Some(target_vm) = regulated_target {
+                    lb[idx] = target_vm;
+                    ub[idx] = target_vm;
+                    continue;
+                }
+            }
+            if m.has_voltage_slacks() {
+                // Widen Vm bounds to allow slack variables room.
+                // The original bounds are enforced via penalty constraints.
+                lb[idx] = (self.vm_min_orig_pu[i] - 0.5).max(0.0);
+                ub[idx] = self.vm_max_orig_pu[i] + 0.5;
+            } else {
+                lb[idx] = self.network.buses[i].voltage_min_pu;
+                ub[idx] = self.network.buses[i].voltage_max_pu;
+            }
+        }
+
+        // Voltage-magnitude slack variable bounds: [0, 1.0] per bus.
+        if m.has_voltage_slacks() {
+            for i in 0..m.n_bus {
+                lb[m.vm_slack_high_var(i)] = 0.0;
+                ub[m.vm_slack_high_var(i)] = 1.0;
+                lb[m.vm_slack_low_var(i)] = 0.0;
+                ub[m.vm_slack_low_var(i)] = 1.0;
+            }
+        }
+
+        // Angle-difference slack variable bounds: [0, 2π] per constrained branch.
+        if m.has_angle_slacks() {
+            use std::f64::consts::PI;
+            for ai in 0..m.n_angle_slack {
+                lb[m.angle_slack_high_var(ai)] = 0.0;
+                ub[m.angle_slack_high_var(ai)] = 2.0 * PI;
+                lb[m.angle_slack_low_var(ai)] = 0.0;
+                ub[m.angle_slack_low_var(ai)] = 2.0 * PI;
+            }
         }
 
         // Pg bounds: [pmin/base, pmax/base]
+        //
+        // Native-storage real power is modeled through the dedicated discharge/
+        // charge variables, not through generator Pg. Storage generators keep
+        // their reactive-power variables, but their Pg is fixed to zero here to
+        // avoid double-counting active injection.
         for j in 0..m.n_gen {
             let gi = m.gen_indices[j];
             let g = &self.network.generators[gi];
             let idx = m.pg_var(j);
-            lb[idx] = g.pmin / self.base_mva;
-            ub[idx] = g.pmax / self.base_mva;
+            if g.is_storage() {
+                lb[idx] = 0.0;
+                ub[idx] = 0.0;
+            } else {
+                lb[idx] = g.pmin / self.base_mva;
+                ub[idx] = g.pmax / self.base_mva;
+            }
         }
 
         // Qg bounds: [qmin/base, qmax/base]
@@ -149,17 +228,104 @@ impl NlpProblem for AcOpfProblem<'_> {
                 .as_ref()
                 .expect("storage_gen_indices only contains generators with storage");
             let soc = self.storage_soc_mwh[s];
-            let sqrt_eta = sto.efficiency.sqrt();
-            // max_dis (pu): energy available to discharge within dt hours
-            let soc_dis_limit = ((soc - sto.soc_min_mwh) * sqrt_eta / dt).max(0.0);
-            let dis_ub = g.discharge_mw_max().min(soc_dis_limit) / self.base_mva;
+            let eta_ch = sto.charge_efficiency.max(1e-9);
+            let eta_dis = sto.discharge_efficiency.max(1e-9);
+            // Apply SoC-dependent power foldback first, then cap by the
+            // energy available within the interval.
+            let p_dis_max = foldback_discharge_cap_nlp(sto, soc, g.discharge_mw_max());
+            let p_ch_max = foldback_charge_cap_nlp(sto, soc, g.charge_mw_max());
+            // max_dis (pu): energy available to discharge within dt hours —
+            // discharging net MW draws 1/η_dis MWh per MW-hr from SoC.
+            let soc_dis_limit = ((soc - sto.soc_min_mwh) * eta_dis / dt).max(0.0);
+            let dis_ub = p_dis_max.min(soc_dis_limit) / self.base_mva;
             lb[m.discharge_var(s)] = 0.0;
             ub[m.discharge_var(s)] = dis_ub;
-            // max_ch (pu): headroom to charge within dt hours
-            let soc_ch_limit = ((sto.soc_max_mwh - soc) / (dt * sqrt_eta)).max(0.0);
-            let ch_ub = g.charge_mw_max().min(soc_ch_limit) / self.base_mva;
+            // max_ch (pu): headroom to charge within dt hours — charging net
+            // MW stores η_ch MWh per MW-hr into SoC.
+            let soc_ch_limit = ((sto.soc_max_mwh - soc) / (dt * eta_ch)).max(0.0);
+            let ch_ub = p_ch_max.min(soc_ch_limit) / self.base_mva;
             lb[m.charge_var(s)] = 0.0;
             ub[m.charge_var(s)] = ch_ub;
+        }
+
+        for (k, &dl_idx) in self.dispatchable_load_indices.iter().enumerate() {
+            let dl = &self.network.market_data.dispatchable_loads[dl_idx];
+            lb[m.dl_var(k)] = dl.p_min_pu;
+            ub[m.dl_var(k)] = dl.p_max_pu;
+            lb[m.dl_q_var(k)] = dl.q_min_pu;
+            ub[m.dl_q_var(k)] = dl.q_max_pu;
+        }
+
+        if m.has_thermal_limit_slacks() {
+            for (ci, ba) in self.branch_admittances.iter().enumerate() {
+                let slack_ub = (4.0 * ba.s_max_pu()).max(10.0);
+                lb[m.thermal_slack_from_var(ci)] = 0.0;
+                ub[m.thermal_slack_from_var(ci)] = slack_ub;
+                lb[m.thermal_slack_to_var(ci)] = 0.0;
+                ub[m.thermal_slack_to_var(ci)] = slack_ub;
+            }
+        }
+
+        if m.has_p_bus_balance_slacks() {
+            for i in 0..m.n_bus {
+                lb[m.p_balance_slack_pos_var(i)] = 0.0;
+                ub[m.p_balance_slack_pos_var(i)] = 10.0;
+                lb[m.p_balance_slack_neg_var(i)] = 0.0;
+                ub[m.p_balance_slack_neg_var(i)] = 10.0;
+            }
+        }
+        if m.has_q_bus_balance_slacks() {
+            for i in 0..m.n_bus {
+                lb[m.q_balance_slack_pos_var(i)] = 0.0;
+                ub[m.q_balance_slack_pos_var(i)] = 10.0;
+                lb[m.q_balance_slack_neg_var(i)] = 0.0;
+                ub[m.q_balance_slack_neg_var(i)] = 10.0;
+            }
+        }
+
+        // Reactive reserve variable bounds.
+        //   Producers:
+        //     lb = 0, ub = (qmax − qmin)/base, or 0 for pqe devices.
+        //   Consumers: same rule.
+        //   Zone shortfall slacks: [0, +inf].
+        //
+        // The ub values come from the reactive reserve plan built
+        // during `AcOpfProblem::new`, which already collapsed pqe
+        // devices to 0 per eqs (117)-(118) / (127)-(128).
+        for j in 0..m.n_producer_q_reserve {
+            lb[m.producer_q_reserve_up_var(j)] = 0.0;
+            ub[m.producer_q_reserve_up_var(j)] =
+                self.reactive_reserve_plan.producer_q_reserve_up_ub_pu[j];
+            lb[m.producer_q_reserve_down_var(j)] = 0.0;
+            ub[m.producer_q_reserve_down_var(j)] =
+                self.reactive_reserve_plan.producer_q_reserve_down_ub_pu[j];
+        }
+        for k in 0..m.n_consumer_q_reserve {
+            lb[m.consumer_q_reserve_up_var(k)] = 0.0;
+            ub[m.consumer_q_reserve_up_var(k)] =
+                self.reactive_reserve_plan.consumer_q_reserve_up_ub_pu[k];
+            lb[m.consumer_q_reserve_down_var(k)] = 0.0;
+            ub[m.consumer_q_reserve_down_var(k)] =
+                self.reactive_reserve_plan.consumer_q_reserve_down_ub_pu[k];
+        }
+        for i in 0..m.n_zone_q_reserve_up_shortfall {
+            lb[m.zone_q_reserve_up_shortfall_var(i)] = 0.0;
+            ub[m.zone_q_reserve_up_shortfall_var(i)] = f64::INFINITY;
+        }
+        for i in 0..m.n_zone_q_reserve_down_shortfall {
+            lb[m.zone_q_reserve_down_shortfall_var(i)] = 0.0;
+            ub[m.zone_q_reserve_down_shortfall_var(i)] = f64::INFINITY;
+        }
+
+        // HVDC point-to-point P variable bounds (pu). One variable per
+        // in-service link with `p_dc_min_mw < p_dc_max_mw`, sourced from
+        // `HvdcP2PNlpData` and written at the tail of the variable vector.
+        if let Some(p2p) = self.hvdc_p2p.as_ref() {
+            for (k, link) in p2p.links.iter().enumerate() {
+                let idx = m.hvdc_p2p_var(k);
+                lb[idx] = link.p_min_pu;
+                ub[idx] = link.p_max_pu;
+            }
         }
 
         (lb, ub)
@@ -211,11 +377,25 @@ impl NlpProblem for AcOpfProblem<'_> {
         // (rows after DC KCL)
         // Already initialized to 0/0 (equality).
 
-        // D-curve constraints: lhs_lb ≤ Qg - slope·Pg ≤ lhs_ub
+        // D-curve / linear-link / flat-headroom constraints:
+        //   lhs_lb ≤ q_dev − slope·p_dev + sign·q_reserve ≤ lhs_ub
         for (ci, c) in self.pq_constraints.iter().enumerate() {
             let row = m.pq_con_offset + ci;
             gl[row] = c.lhs_lb;
             gu[row] = c.lhs_ub;
+        }
+        // Zonal q-reserve balance rows:
+        //   requirement_pu ≤ Σ q_reserve + q_shortfall ≤ +∞
+        for (i, zone_row) in self.reactive_reserve_plan.zone_rows.iter().enumerate() {
+            let row = m.zone_q_reserve_balance_row(i);
+            gl[row] = zone_row.requirement_pu;
+            gu[row] = f64::INFINITY;
+        }
+        for row_opt in &m.dispatchable_load_pf_rows {
+            if let Some(row) = *row_opt {
+                gl[row] = 0.0;
+                gu[row] = 0.0;
+            }
         }
 
         // Flowgate constraints: -reverse_limit/base ≤ FG_flow ≤ +limit_mw/base
@@ -236,6 +416,20 @@ impl NlpProblem for AcOpfProblem<'_> {
             gu[row] = iface.limit_forward_mw / base;
         }
 
+        // Voltage-magnitude slack constraints:
+        //   High: vm[i] - σ_high[i] ≤ vm_max[i]  →  -∞ ≤ g ≤ vm_max
+        //   Low:  -vm[i] - σ_low[i] ≤ -vm_min[i]  →  -∞ ≤ g ≤ -vm_min
+        if m.has_voltage_slacks() {
+            for i in 0..m.n_vm_slack {
+                let high_row = m.vm_slack_con_offset + i;
+                gl[high_row] = f64::NEG_INFINITY;
+                gu[high_row] = self.vm_max_orig_pu[i];
+                let low_row = m.vm_slack_con_offset + m.n_vm_slack + i;
+                gl[low_row] = f64::NEG_INFINITY;
+                gu[low_row] = -self.vm_min_orig_pu[i];
+            }
+        }
+
         // Benders cut inequality constraints: −∞ ≤ α^T Pg ≤ rhs
         for (c, cut) in self.cuts.iter().enumerate() {
             let row = m.n_con + c;
@@ -253,37 +447,162 @@ impl NlpProblem for AcOpfProblem<'_> {
     fn eval_objective(&self, x: &[f64]) -> f64 {
         let m = &self.mapping;
         let pg = &x[m.pg_offset..m.pg_offset + m.n_gen];
+        let dt = self.dt_hours;
         let mut cost = 0.0;
 
         // Generator production cost.
         for (j, &gi) in m.gen_indices.iter().enumerate() {
             let g = &self.network.generators[gi];
             let p_mw = pg[j] * self.base_mva;
-            cost += g
-                .cost
-                .as_ref()
-                .expect("generator cost validated in AcOpfProblem::new")
-                .evaluate(p_mw);
+            cost += dt
+                * g.cost
+                    .as_ref()
+                    .expect("generator cost validated in AcOpfProblem::new")
+                    .evaluate(p_mw);
+            if let Some(target_p_mw) = self.generator_target_tracking_mw[j] {
+                // One-sided asymmetric quadratic:
+                //   α_up * max(0, Pg − target)² + α_down * max(0, target − Pg)²
+                // Reduces to the legacy symmetric `α * (Pg − target)²`
+                // when `α_up == α_down`.
+                let pair = self.generator_target_tracking_coefficients[j];
+                if !pair.is_zero() {
+                    let delta_mw = p_mw - target_p_mw;
+                    if delta_mw > 0.0 && pair.upward_per_mw2 > 0.0 {
+                        cost += dt * pair.upward_per_mw2 * delta_mw * delta_mw;
+                    } else if delta_mw < 0.0 && pair.downward_per_mw2 > 0.0 {
+                        cost += dt * pair.downward_per_mw2 * delta_mw * delta_mw;
+                    }
+                }
+            }
         }
 
-        // Storage dispatch cost (CostMinimization units only).
-        // dis[s]: (variable_cost + degradation) $/MWh * dis_pu * base_mva MW/pu = $/hr
-        // ch[s]:  degradation $/MWh * ch_pu * base_mva MW/pu = $/hr
+        // Storage dispatch cost / value for native storage units.
         for s in 0..m.n_sto {
             let gi = self.storage_gen_indices[s];
             let sto = self.network.generators[gi]
                 .storage
                 .as_ref()
                 .expect("storage_gen_indices only contains generators with storage");
-            let dis_cost = sto.variable_cost_per_mwh + sto.degradation_cost_per_mwh;
-            cost += dis_cost * x[m.discharge_var(s)] * self.base_mva;
-            cost += sto.degradation_cost_per_mwh * x[m.charge_var(s)] * self.base_mva;
+            let discharge_mw = x[m.discharge_var(s)] * self.base_mva;
+            let charge_mw = x[m.charge_var(s)] * self.base_mva;
+            match sto.dispatch_mode {
+                StorageDispatchMode::CostMinimization => {
+                    let dis_cost = sto.variable_cost_per_mwh + sto.degradation_cost_per_mwh;
+                    cost += dt * dis_cost * discharge_mw;
+                    cost += dt * sto.degradation_cost_per_mwh * charge_mw;
+                }
+                StorageDispatchMode::OfferCurve => {
+                    if let Some(points) = sto.discharge_offer.as_deref() {
+                        cost += dt * StorageParams::market_curve_value(points, discharge_mw);
+                    }
+                    if let Some(points) = sto.charge_bid.as_deref() {
+                        cost -= dt * StorageParams::market_curve_value(points, charge_mw);
+                    }
+                }
+                StorageDispatchMode::SelfSchedule => {}
+            }
+        }
+        for (k, &dl_idx) in self.dispatchable_load_indices.iter().enumerate() {
+            let dl = &self.network.market_data.dispatchable_loads[dl_idx];
+            cost += dt
+                * dl.cost_model.objective_contribution(
+                    x[m.dl_var(k)],
+                    dl.p_sched_pu,
+                    self.base_mva,
+                );
+            if let Some(target_p_mw) = self.dispatchable_load_target_tracking_mw[k] {
+                let pair = self.dispatchable_load_target_tracking_coefficients[k];
+                if !pair.is_zero() {
+                    let p_served_mw = x[m.dl_var(k)] * self.base_mva;
+                    let delta_mw = p_served_mw - target_p_mw;
+                    if delta_mw > 0.0 && pair.upward_per_mw2 > 0.0 {
+                        cost += dt * pair.upward_per_mw2 * delta_mw * delta_mw;
+                    } else if delta_mw < 0.0 && pair.downward_per_mw2 > 0.0 {
+                        cost += dt * pair.downward_per_mw2 * delta_mw * delta_mw;
+                    }
+                }
+            }
+        }
+        if m.has_thermal_limit_slacks() && self.thermal_limit_slack_penalty_per_mva > 0.0 {
+            let penalty = dt * self.thermal_limit_slack_penalty_per_mva * self.base_mva;
+            for ci in 0..self.branch_admittances.len() {
+                cost += penalty * x[m.thermal_slack_from_var(ci)];
+                cost += penalty * x[m.thermal_slack_to_var(ci)];
+            }
+        }
+        if m.has_p_bus_balance_slacks() {
+            let p_penalty = dt * self.bus_active_power_balance_slack_penalty_per_mw * self.base_mva;
+            for i in 0..m.n_bus {
+                cost += p_penalty * x[m.p_balance_slack_pos_var(i)];
+                cost += p_penalty * x[m.p_balance_slack_neg_var(i)];
+            }
+        }
+        if m.has_q_bus_balance_slacks() {
+            let q_penalty =
+                dt * self.bus_reactive_power_balance_slack_penalty_per_mvar * self.base_mva;
+            for i in 0..m.n_bus {
+                cost += q_penalty * x[m.q_balance_slack_pos_var(i)];
+                cost += q_penalty * x[m.q_balance_slack_neg_var(i)];
+            }
+        }
+        if m.has_voltage_slacks() {
+            let vm_penalty = dt * self.voltage_magnitude_slack_penalty_per_pu * self.base_mva;
+            for i in 0..m.n_vm_slack {
+                cost += vm_penalty * x[m.vm_slack_high_var(i)];
+                cost += vm_penalty * x[m.vm_slack_low_var(i)];
+            }
+        }
+        if m.has_angle_slacks() {
+            let ang_penalty = dt * self.angle_difference_slack_penalty_per_rad * self.base_mva;
+            for ai in 0..m.n_angle_slack {
+                cost += ang_penalty * x[m.angle_slack_high_var(ai)];
+                cost += ang_penalty * x[m.angle_slack_low_var(ai)];
+            }
+        }
+
+        // Per-device reactive-reserve cost. Costs are stored in
+        // `$/pu-hr` on the plan so the product with `x[var]` (in pu)
+        // is already in `$/hr`.
+        for j in 0..m.n_producer_q_reserve {
+            let qru = x[m.producer_q_reserve_up_var(j)];
+            let qrd = x[m.producer_q_reserve_down_var(j)];
+            cost += self
+                .reactive_reserve_plan
+                .producer_q_reserve_up_cost_per_pu_hr[j]
+                * qru
+                * dt;
+            cost += self
+                .reactive_reserve_plan
+                .producer_q_reserve_down_cost_per_pu_hr[j]
+                * qrd
+                * dt;
+        }
+        for k in 0..m.n_consumer_q_reserve {
+            let qru = x[m.consumer_q_reserve_up_var(k)];
+            let qrd = x[m.consumer_q_reserve_down_var(k)];
+            cost += self
+                .reactive_reserve_plan
+                .consumer_q_reserve_up_cost_per_pu_hr[k]
+                * qru
+                * dt;
+            cost += self
+                .reactive_reserve_plan
+                .consumer_q_reserve_down_cost_per_pu_hr[k]
+                * qrd
+                * dt;
+        }
+        // Zonal reactive-reserve shortfall penalty.
+        // `shortfall_cost_per_pu_hr` is already scaled to the pu basis
+        // of the slack variables.
+        for zone_row in &self.reactive_reserve_plan.zone_rows {
+            cost += dt * zone_row.shortfall_cost_per_pu_hr * x[zone_row.shortfall_var];
         }
         cost
     }
 
     fn eval_gradient(&self, x: &[f64], grad: &mut [f64]) {
         let m = &self.mapping;
+        let dt = self.dt_hours;
         grad.fill(0.0);
 
         let pg = &x[m.pg_offset..m.pg_offset + m.n_gen];
@@ -298,19 +617,151 @@ impl NlpProblem for AcOpfProblem<'_> {
                 .as_ref()
                 .expect("generator cost validated in AcOpfProblem::new")
                 .marginal_cost(p_mw)
-                * self.base_mva;
+                * self.base_mva
+                * dt;
+            if let Some(target_p_mw) = self.generator_target_tracking_mw[j] {
+                let pair = self.generator_target_tracking_coefficients[j];
+                if !pair.is_zero() {
+                    let delta_mw = p_mw - target_p_mw;
+                    // d/d(Pg_pu) of the one-sided quadratic:
+                    //   delta > 0 → 2 * α_up * delta * base
+                    //   delta < 0 → 2 * α_down * delta * base
+                    // At delta = 0 both sides are zero; the Hessian is
+                    // discontinuous there but the NLP handles it fine.
+                    let penalty = if delta_mw > 0.0 {
+                        pair.upward_per_mw2
+                    } else if delta_mw < 0.0 {
+                        pair.downward_per_mw2
+                    } else {
+                        0.0
+                    };
+                    if penalty > 0.0 {
+                        grad[m.pg_var(j)] += 2.0 * penalty * delta_mw * self.base_mva * dt;
+                    }
+                }
+            }
         }
 
-        // Storage cost gradients (linear — constant marginal cost per pu).
+        // Storage cost gradients.
         for s in 0..m.n_sto {
             let gi = self.storage_gen_indices[s];
             let sto = self.network.generators[gi]
                 .storage
                 .as_ref()
                 .expect("storage_gen_indices only contains generators with storage");
-            let dis_cost = sto.variable_cost_per_mwh + sto.degradation_cost_per_mwh;
-            grad[m.discharge_var(s)] = dis_cost * self.base_mva;
-            grad[m.charge_var(s)] = sto.degradation_cost_per_mwh * self.base_mva;
+            let discharge_mw = x[m.discharge_var(s)] * self.base_mva;
+            let charge_mw = x[m.charge_var(s)] * self.base_mva;
+            match sto.dispatch_mode {
+                StorageDispatchMode::CostMinimization => {
+                    let dis_cost = sto.variable_cost_per_mwh + sto.degradation_cost_per_mwh;
+                    grad[m.discharge_var(s)] = dis_cost * self.base_mva * dt;
+                    grad[m.charge_var(s)] = sto.degradation_cost_per_mwh * self.base_mva * dt;
+                }
+                StorageDispatchMode::OfferCurve => {
+                    grad[m.discharge_var(s)] = sto
+                        .discharge_offer
+                        .as_deref()
+                        .map(|points| {
+                            StorageParams::market_curve_marginal_value(points, discharge_mw)
+                                * self.base_mva
+                                * dt
+                        })
+                        .unwrap_or(0.0);
+                    grad[m.charge_var(s)] = sto
+                        .charge_bid
+                        .as_deref()
+                        .map(|points| {
+                            -StorageParams::market_curve_marginal_value(points, charge_mw)
+                                * self.base_mva
+                                * dt
+                        })
+                        .unwrap_or(0.0);
+                }
+                StorageDispatchMode::SelfSchedule => {}
+            }
+        }
+        for (k, &dl_idx) in self.dispatchable_load_indices.iter().enumerate() {
+            let dl = &self.network.market_data.dispatchable_loads[dl_idx];
+            grad[m.dl_var(k)] = dl.cost_model.d_obj_d_p(x[m.dl_var(k)], self.base_mva) * dt;
+            if let Some(target_p_mw) = self.dispatchable_load_target_tracking_mw[k] {
+                let pair = self.dispatchable_load_target_tracking_coefficients[k];
+                if !pair.is_zero() {
+                    let p_served_mw = x[m.dl_var(k)] * self.base_mva;
+                    let delta_mw = p_served_mw - target_p_mw;
+                    let penalty = if delta_mw > 0.0 {
+                        pair.upward_per_mw2
+                    } else if delta_mw < 0.0 {
+                        pair.downward_per_mw2
+                    } else {
+                        0.0
+                    };
+                    if penalty > 0.0 {
+                        grad[m.dl_var(k)] += 2.0 * penalty * delta_mw * self.base_mva * dt;
+                    }
+                }
+            }
+        }
+        if m.has_thermal_limit_slacks() && self.thermal_limit_slack_penalty_per_mva > 0.0 {
+            let penalty = dt * self.thermal_limit_slack_penalty_per_mva * self.base_mva;
+            for ci in 0..self.branch_admittances.len() {
+                grad[m.thermal_slack_from_var(ci)] = penalty;
+                grad[m.thermal_slack_to_var(ci)] = penalty;
+            }
+        }
+        if m.has_p_bus_balance_slacks() {
+            let p_penalty = dt * self.bus_active_power_balance_slack_penalty_per_mw * self.base_mva;
+            for i in 0..m.n_bus {
+                grad[m.p_balance_slack_pos_var(i)] = p_penalty;
+                grad[m.p_balance_slack_neg_var(i)] = p_penalty;
+            }
+        }
+        if m.has_q_bus_balance_slacks() {
+            let q_penalty =
+                dt * self.bus_reactive_power_balance_slack_penalty_per_mvar * self.base_mva;
+            for i in 0..m.n_bus {
+                grad[m.q_balance_slack_pos_var(i)] = q_penalty;
+                grad[m.q_balance_slack_neg_var(i)] = q_penalty;
+            }
+        }
+        if m.has_voltage_slacks() {
+            let vm_penalty = dt * self.voltage_magnitude_slack_penalty_per_pu * self.base_mva;
+            for i in 0..m.n_vm_slack {
+                grad[m.vm_slack_high_var(i)] = vm_penalty;
+                grad[m.vm_slack_low_var(i)] = vm_penalty;
+            }
+        }
+        if m.has_angle_slacks() {
+            let ang_penalty = dt * self.angle_difference_slack_penalty_per_rad * self.base_mva;
+            for ai in 0..m.n_angle_slack {
+                grad[m.angle_slack_high_var(ai)] = ang_penalty;
+                grad[m.angle_slack_low_var(ai)] = ang_penalty;
+            }
+        }
+        // Reactive-reserve cost gradient. The objective term is linear
+        // in each variable, so the gradient is just the stored cost
+        // coefficient.
+        for j in 0..m.n_producer_q_reserve {
+            grad[m.producer_q_reserve_up_var(j)] = self
+                .reactive_reserve_plan
+                .producer_q_reserve_up_cost_per_pu_hr[j]
+                * dt;
+            grad[m.producer_q_reserve_down_var(j)] = self
+                .reactive_reserve_plan
+                .producer_q_reserve_down_cost_per_pu_hr[j]
+                * dt;
+        }
+        for k in 0..m.n_consumer_q_reserve {
+            grad[m.consumer_q_reserve_up_var(k)] = self
+                .reactive_reserve_plan
+                .consumer_q_reserve_up_cost_per_pu_hr[k]
+                * dt;
+            grad[m.consumer_q_reserve_down_var(k)] = self
+                .reactive_reserve_plan
+                .consumer_q_reserve_down_cost_per_pu_hr[k]
+                * dt;
+        }
+        for zone_row in &self.reactive_reserve_plan.zone_rows {
+            grad[zone_row.shortfall_var] = zone_row.shortfall_cost_per_pu_hr * dt;
         }
     }
 
@@ -335,6 +786,9 @@ impl NlpProblem for AcOpfProblem<'_> {
                 p_gen += pg[lj];
             }
             g[i] = p_calc[i] - p_gen + self.bus_pd_mw[i] / self.base_mva;
+            if m.has_p_bus_balance_slacks() {
+                g[i] += x[m.p_balance_slack_pos_var(i)] - x[m.p_balance_slack_neg_var(i)];
+            }
         }
 
         // Storage P-balance correction: each unit injects (dis[s] − ch[s]) at its bus.
@@ -342,6 +796,43 @@ impl NlpProblem for AcOpfProblem<'_> {
         for s in 0..m.n_sto {
             let bus = m.storage_bus_idx[s];
             g[bus] -= x[m.discharge_var(s)] - x[m.charge_var(s)];
+        }
+        for k in 0..m.n_dl {
+            let bus = m.dispatchable_load_bus_idx[k];
+            let p_served = x[m.dl_var(k)];
+            g[bus] += p_served;
+        }
+
+        // HVDC point-to-point P contributions (split-loss formulation).
+        //
+        // Sign convention mirrors how loads / storage enter the P balance:
+        //   `g[i] = p_calc[i] − Σ Pg_i + Pd_i/base + ...`
+        //
+        // Split-loss model: half of the quadratic DC-line loss
+        // `c_pu * Pg²` is attributed to each terminal. This keeps the
+        // Jacobian and Hessian smooth across the `Pg = 0` direction
+        // flip (the loss is an even function of Pg), at the modeling
+        // cost of splitting the physical loss 50/50 between the two
+        // terminals rather than attributing all of it to the receiver.
+        //
+        // For a lossless link (`c_pu = 0`) this reduces to:
+        //   g[from] += Pg,    g[to] -= Pg
+        // i.e. the from-terminal withdraws `Pg` (like a load) and the
+        // to-terminal injects `Pg` (like a generator).
+        //
+        // For a lossy link:
+        //   g[from] += Pg + 0.5*c*Pg²
+        //   g[to]   -= Pg − 0.5*c*Pg²   ==  -Pg + 0.5*c*Pg²
+        // The from-bus sees `Pg + loss/2` of withdrawal, the to-bus
+        // sees `Pg - loss/2` of net injection, and the total power
+        // "disappeared" into heat is `c * Pg²` — covered by the rest
+        // of the AC network via generation.
+        for k in 0..m.n_hvdc_p2p_links {
+            let p_hvdc = x[m.hvdc_p2p_var(k)];
+            let c_pu = m.hvdc_p2p_loss_c_pu[k];
+            let half_loss = 0.5 * c_pu * p_hvdc * p_hvdc;
+            g[m.hvdc_p2p_from_bus_idx[k]] += p_hvdc + half_loss;
+            g[m.hvdc_p2p_to_bus_idx[k]] += -p_hvdc + half_loss;
         }
 
         // Q-balance: Q_calc[i] - Σ Qg_at_bus_i + Qd_i/base = 0
@@ -351,28 +842,55 @@ impl NlpProblem for AcOpfProblem<'_> {
                 q_gen += qg[lj];
             }
             g[m.n_bus + i] = q_calc[i] - q_gen + self.bus_qd_mvar[i] / self.base_mva;
+            if m.has_q_bus_balance_slacks() {
+                g[m.n_bus + i] += x[m.q_balance_slack_pos_var(i)] - x[m.q_balance_slack_neg_var(i)];
+            }
+        }
+        for k in 0..m.n_dl {
+            let bus = m.dispatchable_load_bus_idx[k];
+            g[m.n_bus + bus] += x[m.dl_q_var(k)];
         }
 
         // Branch flow limits (from): Pf² + Qf²
         let n_br = self.branch_admittances.len();
         for (ci, ba) in self.branch_admittances.iter().enumerate() {
             let (pf, qf) = branch_flow_from(ba, vm, &va);
-            g[2 * m.n_bus + ci] = pf * pf + qf * qf;
+            let mut row_value = pf * pf + qf * qf;
+            if m.has_thermal_limit_slacks() {
+                let sigma = x[m.thermal_slack_from_var(ci)];
+                row_value -= 2.0 * ba.s_max_pu() * sigma + sigma * sigma;
+            }
+            g[2 * m.n_bus + ci] = row_value;
         }
         // Branch flow limits (to): Pt² + Qt²
         for (ci, ba) in self.branch_admittances.iter().enumerate() {
             let (pt, qt) = branch_flow_to(ba, vm, &va);
-            g[2 * m.n_bus + n_br + ci] = pt * pt + qt * qt;
+            let mut row_value = pt * pt + qt * qt;
+            if m.has_thermal_limit_slacks() {
+                let sigma = x[m.thermal_slack_to_var(ci)];
+                row_value -= 2.0 * ba.s_max_pu() * sigma + sigma * sigma;
+            }
+            g[2 * m.n_bus + n_br + ci] = row_value;
         }
 
         // Angle difference constraints: g_k = Va_from - Va_to
         // Bounds [angmin_k, angmax_k] enforced by Ipopt via constraint_bounds().
+        //
+        // When angle slacks are active, the residual is relaxed:
+        //   g_k = Va_from - Va_to - σ_high[k] + σ_low[k]
+        // so the same [angmin, angmax] bounds become effectively
+        // `angmin - σ_low ≤ Va_from - Va_to ≤ angmax + σ_high`.
         let ang_row_offset = 2 * m.n_bus + 2 * n_br;
         for (ai, &(br_idx, _, _)) in m.angle_constrained_branches.iter().enumerate() {
             let br = &self.network.branches[br_idx];
             let f = self.bus_map[&br.from_bus];
             let t = self.bus_map[&br.to_bus];
-            g[ang_row_offset + ai] = va[f] - va[t];
+            let mut residual = va[f] - va[t];
+            if m.has_angle_slacks() {
+                residual -= x[m.angle_slack_high_var(ai)];
+                residual += x[m.angle_slack_low_var(ai)];
+            }
+            g[ang_row_offset + ai] = residual;
         }
 
         // Switched shunt injection correction.
@@ -704,9 +1222,45 @@ impl NlpProblem for AcOpfProblem<'_> {
             }
         }
 
-        // D-curve constraints: g[row] = Qg[j] - slope·Pg[j]
+        // D-curve / linear-link / q-headroom constraints:
+        //   g[row] = q_dev − slope·p_dev + reserve_sign · q_reserve
+        //
+        // Producers read (Pg, Qg); consumers read the dispatchable-load
+        // variables. The optional q-reserve term couples reactive
+        // reserves to the p-q curve by adding ±q^qru / q^qrd on the
+        // LHS.
+        use super::pq_curve::PqDeviceKind;
         for (ci, c) in self.pq_constraints.iter().enumerate() {
-            g[m.pq_con_offset + ci] = qg[c.gen_local] - c.slope * pg[c.gen_local];
+            let (p_dev, q_dev) = match c.kind {
+                PqDeviceKind::Producer => (pg[c.device_local], qg[c.device_local]),
+                PqDeviceKind::Consumer => {
+                    (x[m.dl_var(c.device_local)], x[m.dl_q_var(c.device_local)])
+                }
+            };
+            let base = q_dev - c.slope * p_dev;
+            let reserve_term = match c.q_reserve_var {
+                Some(col) => c.q_reserve_sign * x[col],
+                None => 0.0,
+            };
+            g[m.pq_con_offset + ci] = base + reserve_term;
+        }
+        for (k, row_opt) in m.dispatchable_load_pf_rows.iter().enumerate() {
+            if let Some(row) = *row_opt {
+                g[row] = x[m.dl_q_var(k)] - m.dispatchable_load_pf_ratio[k] * x[m.dl_var(k)];
+            }
+        }
+
+        // Zonal reactive-reserve balance:
+        //   g[row] = Σ q_reserve_participant + q_shortfall
+        // Row bound `[requirement_pu, +∞]` is set in constraint_bounds().
+        for (i, zone_row) in self.reactive_reserve_plan.zone_rows.iter().enumerate() {
+            let row = m.zone_q_reserve_balance_row(i);
+            let mut sum = 0.0_f64;
+            for &col in &zone_row.participant_cols {
+                sum += x[col];
+            }
+            sum += x[zone_row.shortfall_var];
+            g[row] = sum;
         }
 
         // Flowgate constraints: FG_flow = Σ_k coeff_k * P_f_k(V, θ)
@@ -737,6 +1291,16 @@ impl NlpProblem for AcOpfProblem<'_> {
                 flow += entry.coeff * pf;
             }
             g[m.iface_con_offset + ii] = flow;
+        }
+
+        // Voltage-magnitude slack constraints:
+        //   High row i: vm[i] - σ_high[i]  (bounded above by vm_max)
+        //   Low  row i: -vm[i] - σ_low[i]  (bounded above by -vm_min)
+        if m.has_voltage_slacks() {
+            for i in 0..m.n_vm_slack {
+                g[m.vm_slack_con_offset + i] = vm[i] - x[m.vm_slack_high_var(i)];
+                g[m.vm_slack_con_offset + m.n_vm_slack + i] = -vm[i] - x[m.vm_slack_low_var(i)];
+            }
         }
 
         // Benders cuts: evaluate α^T Pg for each cut.
@@ -862,6 +1426,12 @@ impl NlpProblem for AcOpfProblem<'_> {
                 values[idx] = -1.0;
                 idx += 1;
             }
+            if m.has_p_bus_balance_slacks() {
+                values[idx] = 1.0;
+                idx += 1;
+                values[idx] = -1.0;
+                idx += 1;
+            }
             // dP/dQg: 0 (skip — but we still have entries in structure)
             // Actually no, we don't add dP/dQg entries in structure.
         }
@@ -924,6 +1494,12 @@ impl NlpProblem for AcOpfProblem<'_> {
                 values[idx] = -1.0;
                 idx += 1;
             }
+            if m.has_q_bus_balance_slacks() {
+                values[idx] = 1.0;
+                idx += 1;
+                values[idx] = -1.0;
+                idx += 1;
+            }
         }
 
         // --- Branch flow Jacobian (from-side, rows 2*n_bus..) ---
@@ -965,6 +1541,11 @@ impl NlpProblem for AcOpfProblem<'_> {
             idx += 1;
             values[idx] = 2.0 * (pf * dpf_dvmt + qf * dqf_dvmt);
             idx += 1;
+            if m.has_thermal_limit_slacks() {
+                let sigma = x[m.thermal_slack_from_var(ci)];
+                values[idx] = -2.0 * (ba.s_max_pu() + sigma);
+                idx += 1;
+            }
         }
 
         // --- Branch flow Jacobian (to-side, rows 2*n_bus + n_br..) ---
@@ -1013,6 +1594,11 @@ impl NlpProblem for AcOpfProblem<'_> {
             idx += 1;
             values[idx] = 2.0 * (pt * dpt_dvmt + qt * dqt_dvmt);
             idx += 1;
+            if m.has_thermal_limit_slacks() {
+                let sigma = x[m.thermal_slack_to_var(ci)];
+                values[idx] = -2.0 * (ba.s_max_pu() + sigma);
+                idx += 1;
+            }
         }
 
         // --- Angle difference Jacobian (rows 2*n_bus + 2*n_br..) ---
@@ -1368,6 +1954,28 @@ impl NlpProblem for AcOpfProblem<'_> {
             }
         }
 
+        // --- HVDC P2P Jacobian values (split-loss) ---
+        //
+        // Matches `build_jacobian_sparsity` → the P2P block in
+        // `src/surge-opf/src/ac/sparsity.rs`. Two entries per link:
+        //   dg[from_bus]/dPg_hvdc[k] = +1 + c_pu * Pg
+        //   dg[to_bus]/dPg_hvdc[k]   = −1 + c_pu * Pg
+        //
+        // Differentiating the bus-balance contribution
+        //   g[from] += Pg + 0.5*c*Pg²   →   d/dPg = 1 + c*Pg
+        //   g[to]   += -Pg + 0.5*c*Pg²  →   d/dPg = -1 + c*Pg
+        //
+        // For a lossless link (c_pu = 0) the entries collapse to +1
+        // and −1, matching the original lossless path byte-for-byte.
+        for k in 0..m.n_hvdc_p2p_links {
+            let p_hvdc = x[m.hvdc_p2p_var(k)];
+            let c_pu = m.hvdc_p2p_loss_c_pu[k];
+            values[idx] = 1.0 + c_pu * p_hvdc;
+            idx += 1;
+            values[idx] = -1.0 + c_pu * p_hvdc;
+            idx += 1;
+        }
+
         // --- Storage Jacobian: dP[bus_s]/d_dis[s] = -1, dP[bus_s]/d_ch[s] = +1 ---
         for _s in 0..m.n_sto {
             values[idx] = -1.0;
@@ -1375,12 +1983,50 @@ impl NlpProblem for AcOpfProblem<'_> {
             values[idx] = 1.0;
             idx += 1;
         }
+        for k in 0..m.n_dl {
+            values[idx] = 1.0;
+            idx += 1;
+            values[idx] = 1.0;
+            idx += 1;
+            if m.dispatchable_load_fixed_power_factor[k] {
+                values[idx] = -m.dispatchable_load_pf_ratio[k];
+                idx += 1;
+                values[idx] = 1.0;
+                idx += 1;
+            }
+        }
 
-        // --- D-curve Jacobian: ∂(Qg - slope·Pg)/∂Pg_j = -slope, ∂/∂Qg_j = +1 ---
-        // Two constant entries per constraint, in the order declared in new().
+        // --- PqConstraint Jacobian (D-curve / linear-link / q-headroom) ---
+        //   ∂(q_dev − slope·p_dev + sign·q_reserve)/∂p_dev = −slope
+        //   ∂(...)/∂q_dev                                   = +1
+        //   ∂(...)/∂q_reserve                               = sign (optional)
+        //
+        // Order MUST match the sparsity declaration in `problem.rs`:
+        // two entries per row unconditionally, plus a 3rd entry when
+        // the row carries a q-reserve coupling term.
         for c in &self.pq_constraints {
             values[idx] = -c.slope;
             idx += 1;
+            values[idx] = 1.0;
+            idx += 1;
+            if c.q_reserve_var.is_some() {
+                values[idx] = c.q_reserve_sign;
+                idx += 1;
+            }
+        }
+
+        // --- Zonal reactive-reserve balance Jacobian ---
+        // Row form: Σ q_reserve_participant + q_shortfall ≥ requirement.
+        // Every participant contributes a constant `+1.0` entry, and
+        // the shortfall slack also contributes `+1.0`. The order MUST
+        // match the sparsity declaration in `problem.rs`: all
+        // participant entries first, then the shortfall entry, per
+        // zone row, in the same order as the `zone_rows` Vec.
+        for zone_row in &self.reactive_reserve_plan.zone_rows {
+            for _ in &zone_row.participant_cols {
+                values[idx] = 1.0;
+                idx += 1;
+            }
             values[idx] = 1.0;
             idx += 1;
         }
@@ -1444,12 +2090,237 @@ impl NlpProblem for AcOpfProblem<'_> {
             }
         }
 
+        // --- Voltage-magnitude slack constraint Jacobian ---
+        // High row i: g = vm[i] - σ_high[i]  →  dg/dVm = +1, dg/dσ_high = -1
+        // Low  row i: g = -vm[i] - σ_low[i]  →  dg/dVm = -1, dg/dσ_low = -1
+        if m.has_voltage_slacks() {
+            for _i in 0..m.n_vm_slack {
+                values[idx] = 1.0; // dg_high/dVm
+                idx += 1;
+                values[idx] = -1.0; // dg_high/dσ_high
+                idx += 1;
+                values[idx] = -1.0; // dg_low/dVm
+                idx += 1;
+                values[idx] = -1.0; // dg_low/dσ_low
+                idx += 1;
+            }
+        }
+
+        // --- Angle-difference slack Jacobian (appended at tail) ---
+        // The base Va_from/Va_to columns were already written in the
+        // angle constraint Jacobian block above; here we only fill the
+        // two extra columns for (σ_high, σ_low).
+        if m.has_angle_slacks() {
+            for _ai in 0..m.n_angle_slack {
+                values[idx] = -1.0; // dg/d(sigma_high)
+                idx += 1;
+                values[idx] = 1.0; // dg/d(sigma_low)
+                idx += 1;
+            }
+        }
+
         debug_assert_eq!(
             idx,
             values.len(),
             "Jacobian fill mismatch: idx={idx}, expected={}",
             values.len()
         );
+
+        // --- Tap/phase Vm/θ derivative corrections ---
+        //
+        // The Y-bus block above computed ∂P/∂Vm and ∂P/∂θ for bus-balance
+        // rows using BASE branch admittances (the values stored in row_ybus.g
+        // / row_ybus.b). For tap-controlled and phase-shifter-controlled
+        // branches, the residual adds a "delta correction" `flow(var) -
+        // flow(base)` so the bus balance reflects the variable's current
+        // value. The Jacobian must include the corresponding ∂/∂Vm and ∂/∂θ
+        // derivatives of that delta — otherwise the linearization Ipopt sees
+        // is wrong everywhere except at x = x_init (where var = base, so the
+        // delta vanishes). Verified via FD check at perturbed points (see
+        // `test_acopf_phase_shifter_fd_check_perturbed` and the analogous
+        // tap test).
+        //
+        // For each controlled branch (fi → ti):
+        //   Δg_ff = g_ff(var) - g_ff(base)   (tap only; phase doesn't change g_ff)
+        //   Δb_ff = b_ff(var) - b_ff(base)
+        //   Δg_ft = g_ft(var) - g_ft(base)
+        //   Δb_ft = b_ft(var) - b_ft(base)
+        //   Δg_tf = g_tf(var) - g_tf(base)
+        //   Δb_tf = b_tf(var) - b_tf(base)
+        //   (g_tt, b_tt do not depend on tap or shift)
+        //
+        // ∂dPf/∂Vm[fi] = 2 Vf Δg_ff + Vt (Δg_ft cos θ + Δb_ft sin θ)
+        // ∂dPf/∂Vm[ti] = Vf (Δg_ft cos θ + Δb_ft sin θ)
+        // ∂dPf/∂θ[fi]  = Vf Vt (-Δg_ft sin θ + Δb_ft cos θ)
+        // ∂dPf/∂θ[ti]  = -∂dPf/∂θ[fi]
+        // (and analogous expressions for dQf, dPt, dQt; θ_tf = -θ_ft)
+        let apply_correction = |row_bal: i32, col: Option<usize>, val: f64, values: &mut [f64]| {
+            if let Some(c) = col
+                && let Some(&jidx) = self.jac_idx_by_pair.get(&(row_bal, c as i32))
+            {
+                values[jidx] += val;
+            }
+        };
+        let apply_branch_correction = |br_idx: usize,
+                                       dg_ff: f64,
+                                       db_ff: f64,
+                                       dg_ft: f64,
+                                       db_ft: f64,
+                                       dg_tf: f64,
+                                       db_tf: f64,
+                                       values: &mut [f64]| {
+            let br = &self.network.branches[br_idx];
+            let fi = self.bus_map[&br.from_bus];
+            let ti = self.bus_map[&br.to_bus];
+            let vf = vm[fi];
+            let vt = vm[ti];
+            let theta_ft = va[fi] - va[ti];
+            let (sin_ft, cos_ft) = theta_ft.sin_cos();
+            // For to-side: theta_tf = -theta_ft
+            let sin_tf = -sin_ft;
+            let cos_tf = cos_ft;
+
+            let off_p_ft = dg_ft * cos_ft + db_ft * sin_ft;
+            let off_q_ft = dg_ft * sin_ft - db_ft * cos_ft;
+            let off_p_tf = dg_tf * cos_tf + db_tf * sin_tf;
+            let off_q_tf = dg_tf * sin_tf - db_tf * cos_tf;
+
+            // dPf/dVm[fi] = 2 Vf Δg_ff + Vt * off_p_ft
+            // dPf/dVm[ti] = Vf * off_p_ft
+            // dPf/dθ[fi]  = Vf Vt * (-Δg_ft sin θ + Δb_ft cos θ) = Vf Vt * dpf_dtheta_ft
+            // dPf/dθ[ti]  = -dPf/dθ[fi]
+            let dpf_dtheta_ft = -dg_ft * sin_ft + db_ft * cos_ft;
+            let dqf_dtheta_ft = dg_ft * cos_ft + db_ft * sin_ft;
+            let dpt_dtheta_tf = -dg_tf * sin_tf + db_tf * cos_tf;
+            let dqt_dtheta_tf = dg_tf * cos_tf + db_tf * sin_tf;
+
+            let row_pf = fi as i32;
+            let row_qf = (m.n_bus + fi) as i32;
+            let row_pt = ti as i32;
+            let row_qt = (m.n_bus + ti) as i32;
+            let vmf_col = Some(m.vm_var(fi));
+            let vmt_col = Some(m.vm_var(ti));
+            let vaf_col = m.va_var(fi);
+            let vat_col = m.va_var(ti);
+
+            // Pf row (fi)
+            apply_correction(row_pf, vmf_col, 2.0 * vf * dg_ff + vt * off_p_ft, values);
+            apply_correction(row_pf, vmt_col, vf * off_p_ft, values);
+            apply_correction(row_pf, vaf_col, vf * vt * dpf_dtheta_ft, values);
+            apply_correction(row_pf, vat_col, -vf * vt * dpf_dtheta_ft, values);
+
+            // Qf row (n_bus + fi). Qf = -Vf² b_ff + Vf Vt (g_ft sin θ - b_ft cos θ)
+            // dQf/dVm[fi] = -2 Vf Δb_ff + Vt * off_q_ft
+            // dQf/dVm[ti] = Vf * off_q_ft
+            // dQf/dθ[fi]  = Vf Vt * (g_ft cos θ + b_ft sin θ)·Δ = Vf Vt * dqf_dtheta_ft
+            apply_correction(row_qf, vmf_col, -2.0 * vf * db_ff + vt * off_q_ft, values);
+            apply_correction(row_qf, vmt_col, vf * off_q_ft, values);
+            apply_correction(row_qf, vaf_col, vf * vt * dqf_dtheta_ft, values);
+            apply_correction(row_qf, vat_col, -vf * vt * dqf_dtheta_ft, values);
+
+            // Pt row (ti). Pt = Vt² g_tt + Vt Vf (g_tf cos θ_tf + b_tf sin θ_tf)
+            // g_tt has no tap/shift dependence → Δg_tt = 0; same for Δb_tt
+            // dPt/dVm[ti] = 0 + Vf * off_p_tf
+            // dPt/dVm[fi] = Vt * off_p_tf
+            // dPt/dθ[ti]  = Vt Vf * dpt_dtheta_tf  (chain: dθ_tf/dθ_ti = +1)
+            // dPt/dθ[fi]  = -dPt/dθ[ti]
+            apply_correction(row_pt, vmt_col, vf * off_p_tf, values);
+            apply_correction(row_pt, vmf_col, vt * off_p_tf, values);
+            apply_correction(row_pt, vat_col, vt * vf * dpt_dtheta_tf, values);
+            apply_correction(row_pt, vaf_col, -vt * vf * dpt_dtheta_tf, values);
+
+            // Qt row (n_bus + ti)
+            apply_correction(row_qt, vmt_col, vf * off_q_tf, values);
+            apply_correction(row_qt, vmf_col, vt * off_q_tf, values);
+            apply_correction(row_qt, vat_col, vt * vf * dqt_dtheta_tf, values);
+            apply_correction(row_qt, vaf_col, -vt * vf * dqt_dtheta_tf, values);
+        };
+
+        // Tap-controlled branch corrections
+        for (k, &(br_idx, _, _)) in m.tap_ctrl_branches.iter().enumerate() {
+            let br = &self.network.branches[br_idx];
+            let z_sq = br.r * br.r + br.x * br.x;
+            let (gs, bs_ser) = if z_sq > 1e-40 {
+                (br.r / z_sq, -br.x / z_sq)
+            } else {
+                (1e6_f64, 0.0_f64)
+            };
+            let bshunt = bs_ser + br.b / 2.0;
+            let shift_rad = br.phase_shift_rad;
+            let cos_s = shift_rad.cos();
+            let sin_s = shift_rad.sin();
+
+            let tau_0 = br.effective_tap();
+            let tau_var = x[m.tap_var(k)];
+            let tau0_sq = tau_0 * tau_0;
+            let tau_sq = tau_var * tau_var;
+
+            // Base admittances
+            let g_ff0 = gs / tau0_sq;
+            let b_ff0 = bshunt / tau0_sq;
+            let g_ft0 = -(gs * cos_s - bs_ser * sin_s) / tau_0;
+            let b_ft0 = -(gs * sin_s + bs_ser * cos_s) / tau_0;
+            let g_tf0 = -(gs * cos_s + bs_ser * sin_s) / tau_0;
+            let b_tf0 = (gs * sin_s - bs_ser * cos_s) / tau_0;
+            // Variable admittances
+            let g_ff_v = gs / tau_sq;
+            let b_ff_v = bshunt / tau_sq;
+            let g_ft_v = -(gs * cos_s - bs_ser * sin_s) / tau_var;
+            let b_ft_v = -(gs * sin_s + bs_ser * cos_s) / tau_var;
+            let g_tf_v = -(gs * cos_s + bs_ser * sin_s) / tau_var;
+            let b_tf_v = (gs * sin_s - bs_ser * cos_s) / tau_var;
+
+            apply_branch_correction(
+                br_idx,
+                g_ff_v - g_ff0,
+                b_ff_v - b_ff0,
+                g_ft_v - g_ft0,
+                b_ft_v - b_ft0,
+                g_tf_v - g_tf0,
+                b_tf_v - b_tf0,
+                values,
+            );
+        }
+
+        // Phase-shifter-controlled branch corrections
+        for (k, &(br_idx, _, _)) in m.ps_ctrl_branches.iter().enumerate() {
+            let br = &self.network.branches[br_idx];
+            let z_sq = br.r * br.r + br.x * br.x;
+            let (gs, bs_ser) = if z_sq > 1e-40 {
+                (br.r / z_sq, -br.x / z_sq)
+            } else {
+                (1e6_f64, 0.0_f64)
+            };
+            let tau = br.effective_tap();
+            let shift0_rad = br.phase_shift_rad;
+            let shift_var_rad = x[m.ps_var(k)];
+            let cos_s0 = shift0_rad.cos();
+            let sin_s0 = shift0_rad.sin();
+            let cos_sv = shift_var_rad.cos();
+            let sin_sv = shift_var_rad.sin();
+
+            // Base admittances (g_ff, b_ff don't depend on shift)
+            let g_ft0 = -(gs * cos_s0 - bs_ser * sin_s0) / tau;
+            let b_ft0 = -(gs * sin_s0 + bs_ser * cos_s0) / tau;
+            let g_tf0 = -(gs * cos_s0 + bs_ser * sin_s0) / tau;
+            let b_tf0 = (gs * sin_s0 - bs_ser * cos_s0) / tau;
+            // Variable admittances
+            let g_ft_v = -(gs * cos_sv - bs_ser * sin_sv) / tau;
+            let b_ft_v = -(gs * sin_sv + bs_ser * cos_sv) / tau;
+            let g_tf_v = -(gs * cos_sv + bs_ser * sin_sv) / tau;
+            let b_tf_v = (gs * sin_sv - bs_ser * cos_sv) / tau;
+
+            apply_branch_correction(
+                br_idx,
+                0.0,
+                0.0, // Δg_ff = 0, Δb_ff = 0 for phase shifter
+                g_ft_v - g_ft0,
+                b_ft_v - b_ft0,
+                g_tf_v - g_tf0,
+                b_tf_v - b_tf0,
+                values,
+            );
+        }
     }
 
     fn has_hessian(&self) -> bool {
@@ -1488,6 +2359,7 @@ impl NlpProblem for AcOpfProblem<'_> {
 
         let hidx = &self.hess_idx;
         let base_sq = self.base_mva * self.base_mva;
+        let dt = self.dt_hours;
 
         // --- Objective Hessian: d²f/dPg_j² (direct-indexed) ---
         for (j, &gi) in m.gen_indices.iter().enumerate() {
@@ -1498,7 +2370,53 @@ impl NlpProblem for AcOpfProblem<'_> {
                 .as_ref()
                 .expect("generator cost validated in AcOpfProblem::new")
                 .second_derivative(p_mw);
-            values[hidx.pg_diag[j]] += obj_factor * d2cost * base_sq;
+            values[hidx.pg_diag[j]] += obj_factor * d2cost * base_sq * dt;
+            if let Some(target_p_mw) = self.generator_target_tracking_mw[j] {
+                let pair = self.generator_target_tracking_coefficients[j];
+                if !pair.is_zero() {
+                    // One-sided quadratic Hessian:
+                    //   delta > 0 → 2 * α_up
+                    //   delta < 0 → 2 * α_down
+                    //   delta == 0 → max(α_up, α_down) is used so the
+                    //                Hessian is a valid upper bound on
+                    //                the subdifferential at the kink.
+                    let delta_mw = p_mw - target_p_mw;
+                    let penalty = if delta_mw > 0.0 {
+                        pair.upward_per_mw2
+                    } else if delta_mw < 0.0 {
+                        pair.downward_per_mw2
+                    } else {
+                        pair.upward_per_mw2.max(pair.downward_per_mw2)
+                    };
+                    if penalty > 0.0 {
+                        values[hidx.pg_diag[j]] += obj_factor * 2.0 * penalty * base_sq * dt;
+                    }
+                }
+            }
+        }
+        for (k, &dl_idx) in self.dispatchable_load_indices.iter().enumerate() {
+            let dl = &self.network.market_data.dispatchable_loads[dl_idx];
+            let diag = hidx.dl_diag[k];
+            if diag != HESS_SKIP {
+                values[diag] += obj_factor * dl.cost_model.d2_obj_d_p2(self.base_mva) * dt;
+                if let Some(target_p_mw) = self.dispatchable_load_target_tracking_mw[k] {
+                    let pair = self.dispatchable_load_target_tracking_coefficients[k];
+                    if !pair.is_zero() {
+                        let p_served_mw = x[m.dl_var(k)] * self.base_mva;
+                        let delta_mw = p_served_mw - target_p_mw;
+                        let penalty = if delta_mw > 0.0 {
+                            pair.upward_per_mw2
+                        } else if delta_mw < 0.0 {
+                            pair.downward_per_mw2
+                        } else {
+                            pair.upward_per_mw2.max(pair.downward_per_mw2)
+                        };
+                        if penalty > 0.0 {
+                            values[diag] += obj_factor * 2.0 * penalty * base_sq * dt;
+                        }
+                    }
+                }
+            }
         }
 
         // --- Power balance Hessian (direct-indexed) ---
@@ -1573,6 +2491,203 @@ impl NlpProblem for AcOpfProblem<'_> {
             }
         }
 
+        // --- Tap/phase Vm/θ Hessian corrections ---
+        //
+        // The Y-bus bus-balance Hessian above uses BASE admittances. For
+        // tap-controlled and phase-shifter-controlled branches, the
+        // residual adds `flow(var) - flow(base)` to bus balance. The
+        // Hessian must include the SAME second-derivative correction in the
+        // Vm/θ Hessian entries — otherwise Ipopt's Newton step uses a
+        // wrong curvature for any iterate where var ≠ base. Mirrors the
+        // Jacobian Vm/θ correction added in eval_jacobian and the per-edge
+        // Y-bus formulas above.
+        //
+        // For each controlled branch (fi, ti) the corrections to add are
+        // identical in structure to the per-edge formulas above, but with
+        // (Δg_ft, Δb_ft) for the (fi, ti) direction and (Δg_tf, Δb_tf) for
+        // the (ti, fi) direction. The (Vm_fi, Vm_fi) diagonal also picks
+        // up `2 λ_p Δg_ff − 2 λ_q Δb_ff` (tap only — Δg_ff = Δb_ff = 0
+        // for phase shifters since g_ff/b_ff don't depend on shift).
+        let hm_corr = &self.hess_map;
+        let mut add_corr = |r: usize, c: usize, val: f64| {
+            let (r, c) = if r >= c { (r, c) } else { (c, r) };
+            if let Some(&pos) = hm_corr.get(&(r, c)) {
+                values[pos] += val;
+            }
+        };
+        let mut apply_branch_hess_delta = |fi: usize,
+                                           ti: usize,
+                                           d_g_ff: f64,
+                                           d_b_ff: f64,
+                                           d_g_ft: f64,
+                                           d_b_ft: f64,
+                                           d_g_tf: f64,
+                                           d_b_tf: f64| {
+            let lp_f = lambda[fi];
+            let lq_f = lambda[m.n_bus + fi];
+            let lp_t = lambda[ti];
+            let lq_t = lambda[m.n_bus + ti];
+
+            let _vf = vm[fi];
+            let _vt = vm[ti];
+            let vmf = m.vm_var(fi);
+            let vmt = m.vm_var(ti);
+            let vaf_opt = m.va_var(fi);
+            let vat_opt = m.va_var(ti);
+
+            // (Vm_fi, Vm_fi) diagonal — only nonzero when Δg_ff/Δb_ff != 0 (tap case).
+            if d_g_ff.abs() > 0.0 || d_b_ff.abs() > 0.0 {
+                add_corr(vmf, vmf, lp_f * 2.0 * d_g_ff + lq_f * (-2.0 * d_b_ff));
+            }
+            // (Vm_ti, Vm_ti) diagonal: g_tt, b_tt do not depend on tap or shift,
+            // so no correction needed.
+
+            // Helper that mirrors the per-edge Y-bus formulas with (Δg, Δb)
+            // playing the role of (g_ij, b_ij). i is the "row" bus, j is
+            // its neighbor; the bus-balance row P_i / Q_i picks up the
+            // contributions with multipliers λ_p[i], λ_q[i].
+            let mut apply_edge = |i: usize, j: usize, dg: f64, db: f64| {
+                let lp = lambda[i];
+                let lq = lambda[m.n_bus + i];
+                if lp.abs() < 1e-30 && lq.abs() < 1e-30 {
+                    return;
+                }
+                let vi = vm[i];
+                let vj = vm[j];
+                let theta = va[i] - va[j];
+                let (sin_t, cos_t) = theta.sin_cos();
+                let aij = dg * cos_t + db * sin_t;
+                let dij = dg * sin_t - db * cos_t;
+                let vivj = vi * vj;
+
+                let vm_i = m.vm_var(i);
+                let vm_j = m.vm_var(j);
+                let va_i_opt = m.va_var(i);
+                let va_j_opt = m.va_var(j);
+
+                let combined_neg = -lp * vivj * aij - lq * vivj * dij;
+
+                // [0] (Va_j, Va_j): += combined_neg
+                if let Some(va_j) = va_j_opt {
+                    add_corr(va_j, va_j, combined_neg);
+                }
+                // [1] (Va_i, Va_j): -= combined_neg
+                if let (Some(va_i), Some(va_j)) = (va_i_opt, va_j_opt) {
+                    add_corr(va_i, va_j, -combined_neg);
+                }
+                // [2] (Va_i, Va_i): += combined_neg
+                if let Some(va_i) = va_i_opt {
+                    add_corr(va_i, va_i, combined_neg);
+                }
+                // [3] (Vm_i, Va_j): lp*vj*dij + lq*(-vj*aij)
+                if let Some(va_j) = va_j_opt {
+                    add_corr(vm_i, va_j, lp * (vj * dij) + lq * (-vj * aij));
+                }
+                // [4] (Vm_j, Va_j): lp*vi*dij + lq*(-vi*aij)
+                if let Some(va_j) = va_j_opt {
+                    add_corr(vm_j, va_j, lp * (vi * dij) + lq * (-vi * aij));
+                }
+                // [5] (Vm_j, Va_i): lp*(-vi*dij) + lq*(vi*aij)
+                if let Some(va_i) = va_i_opt {
+                    add_corr(vm_j, va_i, lp * (-vi * dij) + lq * (vi * aij));
+                }
+                // [6] (Vm_i, Va_i): lp*(-vj*dij) + lq*(vj*aij)
+                if let Some(va_i) = va_i_opt {
+                    add_corr(vm_i, va_i, lp * (-vj * dij) + lq * (vj * aij));
+                }
+                // [7] (Vm_i, Vm_j): lp*aij + lq*dij
+                add_corr(vm_i, vm_j, lp * aij + lq * dij);
+            };
+
+            apply_edge(fi, ti, d_g_ft, d_b_ft);
+            apply_edge(ti, fi, d_g_tf, d_b_tf);
+
+            let _ = (vmf, vmt, vaf_opt, vat_opt, lp_f, lq_f, lp_t, lq_t);
+        };
+
+        // Tap-controlled branch Hessian corrections
+        for (k, &(br_idx, _, _)) in m.tap_ctrl_branches.iter().enumerate() {
+            let br = &self.network.branches[br_idx];
+            let fi = self.bus_map[&br.from_bus];
+            let ti = self.bus_map[&br.to_bus];
+
+            let z_sq = br.r * br.r + br.x * br.x;
+            let (gs, bs_ser) = if z_sq > 1e-40 {
+                (br.r / z_sq, -br.x / z_sq)
+            } else {
+                (1e6_f64, 0.0_f64)
+            };
+            let bshunt = bs_ser + br.b / 2.0;
+            let shift_rad = br.phase_shift_rad;
+            let cos_s = shift_rad.cos();
+            let sin_s = shift_rad.sin();
+            let tau_0 = br.effective_tap();
+            let tau_var = x[m.tap_var(k)];
+            let tau0_sq = tau_0 * tau_0;
+            let tau_sq = tau_var * tau_var;
+            let g_ff0 = gs / tau0_sq;
+            let b_ff0 = bshunt / tau0_sq;
+            let g_ft0 = -(gs * cos_s - bs_ser * sin_s) / tau_0;
+            let b_ft0 = -(gs * sin_s + bs_ser * cos_s) / tau_0;
+            let g_tf0 = -(gs * cos_s + bs_ser * sin_s) / tau_0;
+            let b_tf0 = (gs * sin_s - bs_ser * cos_s) / tau_0;
+            let g_ff_v = gs / tau_sq;
+            let b_ff_v = bshunt / tau_sq;
+            let g_ft_v = -(gs * cos_s - bs_ser * sin_s) / tau_var;
+            let b_ft_v = -(gs * sin_s + bs_ser * cos_s) / tau_var;
+            let g_tf_v = -(gs * cos_s + bs_ser * sin_s) / tau_var;
+            let b_tf_v = (gs * sin_s - bs_ser * cos_s) / tau_var;
+            apply_branch_hess_delta(
+                fi,
+                ti,
+                g_ff_v - g_ff0,
+                b_ff_v - b_ff0,
+                g_ft_v - g_ft0,
+                b_ft_v - b_ft0,
+                g_tf_v - g_tf0,
+                b_tf_v - b_tf0,
+            );
+        }
+
+        // Phase-shifter-controlled branch Hessian corrections
+        for (k, &(br_idx, _, _)) in m.ps_ctrl_branches.iter().enumerate() {
+            let br = &self.network.branches[br_idx];
+            let fi = self.bus_map[&br.from_bus];
+            let ti = self.bus_map[&br.to_bus];
+
+            let z_sq = br.r * br.r + br.x * br.x;
+            let (gs, bs_ser) = if z_sq > 1e-40 {
+                (br.r / z_sq, -br.x / z_sq)
+            } else {
+                (1e6_f64, 0.0_f64)
+            };
+            let tau = br.effective_tap();
+            let shift0_rad = br.phase_shift_rad;
+            let shift_var_rad = x[m.ps_var(k)];
+            let cos_s0 = shift0_rad.cos();
+            let sin_s0 = shift0_rad.sin();
+            let cos_sv = shift_var_rad.cos();
+            let sin_sv = shift_var_rad.sin();
+            let g_ft0 = -(gs * cos_s0 - bs_ser * sin_s0) / tau;
+            let b_ft0 = -(gs * sin_s0 + bs_ser * cos_s0) / tau;
+            let g_tf0 = -(gs * cos_s0 + bs_ser * sin_s0) / tau;
+            let b_tf0 = (gs * sin_s0 - bs_ser * cos_s0) / tau;
+            let g_ft_v = -(gs * cos_sv - bs_ser * sin_sv) / tau;
+            let b_ft_v = -(gs * sin_sv + bs_ser * cos_sv) / tau;
+            let g_tf_v = -(gs * cos_sv + bs_ser * sin_sv) / tau;
+            let b_tf_v = (gs * sin_sv - bs_ser * cos_sv) / tau;
+            apply_branch_hess_delta(
+                fi,
+                ti,
+                0.0,
+                0.0, // Δg_ff = Δb_ff = 0 for phase shifter
+                g_ft_v - g_ft0,
+                b_ft_v - b_ft0,
+                g_tf_v - g_tf0,
+                b_tf_v - b_tf0,
+            );
+        }
+
         // --- Branch flow Hessian (from-side) ---
         // g_k = Pf² + Qf², ∇²g_k = 2*(∇Pf⊗∇Pf + ∇Qf⊗∇Qf + Pf·∇²Pf + Qf·∇²Qf)
         for (ci, ba) in self.branch_admittances.iter().enumerate() {
@@ -1635,6 +2750,12 @@ impl NlpProblem for AcOpfProblem<'_> {
                         values[pos[flat]] += h_val;
                     }
                     flat += 1;
+                }
+            }
+            if m.has_thermal_limit_slacks() {
+                let sigma_pos = hidx.branch_from_slack_diag[ci];
+                if sigma_pos != HESS_SKIP {
+                    values[sigma_pos] += -2.0 * mu;
                 }
             }
         }
@@ -1715,6 +2836,12 @@ impl NlpProblem for AcOpfProblem<'_> {
                         values[pos[flat]] += h_val;
                     }
                     flat += 1;
+                }
+            }
+            if m.has_thermal_limit_slacks() {
+                let sigma_pos = hidx.branch_to_slack_diag[ci];
+                if sigma_pos != HESS_SKIP {
+                    values[sigma_pos] += -2.0 * mu;
                 }
             }
         }
@@ -2343,6 +3470,33 @@ impl NlpProblem for AcOpfProblem<'_> {
                 add(vmf, vmf, scale * 2.0 * ba.g_ff);
                 add(vmf, vmt, scale * c_val);
             }
+        }
+
+        // --- HVDC P2P Hessian (split-loss quadratic) ---
+        //
+        // The bus-balance contribution at each terminal is
+        //   g[from] += Pg + 0.5*c*Pg²   (row = from-bus P balance)
+        //   g[to]   += -Pg + 0.5*c*Pg²  (row = to-bus   P balance)
+        // so the second derivative with respect to the HVDC P variable
+        // on each row is `d²g/dPg² = c_pu`. The Lagrangian Hessian
+        // contribution at the `(hvdc_var, hvdc_var)` diagonal slot is
+        // the sum of both rows' multipliers times `c_pu`:
+        //
+        //   ∂²L/∂Pg² = c_pu * (λ[from_row] + λ[to_row])
+        //
+        // Lossless links have `c_pu = 0` and contribute nothing —
+        // skip them so the `hess_map` lookup doesn't need a diagonal
+        // entry that was never created during sparsity build.
+        for k in 0..m.n_hvdc_p2p_links {
+            let c_pu = m.hvdc_p2p_loss_c_pu[k];
+            if c_pu.abs() < 1e-20 {
+                continue;
+            }
+            let from_row = m.hvdc_p2p_from_bus_idx[k];
+            let to_row = m.hvdc_p2p_to_bus_idx[k];
+            let lam = lambda[from_row] + lambda[to_row];
+            let v = m.hvdc_p2p_var(k);
+            add(v, v, c_pu * lam);
         }
     }
 }

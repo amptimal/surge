@@ -689,6 +689,7 @@ mod impl_ {
                 objective: objval,
                 status,
                 iterations,
+                mip_trace: None,
             })
         }
     }

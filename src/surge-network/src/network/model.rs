@@ -1239,7 +1239,7 @@ impl Network {
         let regulating_targets: HashMap<u32, usize> = self
             .generators
             .iter()
-            .filter(|generator| generator.in_service && generator.voltage_regulated)
+            .filter(|generator| generator.can_voltage_regulate())
             .fold(HashMap::new(), |mut counts, generator| {
                 let target_bus = generator.reg_bus.unwrap_or(generator.bus);
                 *counts.entry(target_bus).or_insert(0) += 1;
@@ -1918,7 +1918,7 @@ impl Network {
         let regulating_targets: HashSet<u32> = self
             .generators
             .iter()
-            .filter(|generator| generator.in_service && generator.voltage_regulated)
+            .filter(|generator| generator.can_voltage_regulate())
             .map(|generator| generator.reg_bus.unwrap_or(generator.bus))
             .collect();
 
@@ -2845,7 +2845,7 @@ mod tests {
     fn test_validate_rejects_invalid_storage_parameters() {
         let mut net = make_3bus_network();
         net.generators[0].storage = Some(StorageParams {
-            efficiency: 1.2,
+            charge_efficiency: 1.2,
             ..StorageParams::with_energy_capacity_mwh(50.0)
         });
 
@@ -3440,6 +3440,7 @@ mod tests {
         net.market_data
             .combined_cycle_plants
             .push(CombinedCyclePlant {
+                id: String::new(),
                 name: "CC_A".into(),
                 configs: Vec::new(),
                 transitions: Vec::new(),
@@ -3784,6 +3785,8 @@ mod tests {
             limit_mw_schedule: vec![],
             limit_reverse_mw_schedule: vec![],
             hvdc_coefficients: vec![],
+            hvdc_band_coefficients: vec![],
+            limit_mw_active_period: None,
         });
 
         let err = net.validate_structure().unwrap_err();
@@ -3809,6 +3812,8 @@ mod tests {
             limit_mw_schedule: vec![],
             limit_reverse_mw_schedule: vec![],
             hvdc_coefficients: vec![],
+            hvdc_band_coefficients: vec![],
+            limit_mw_active_period: None,
         });
 
         let err = net.validate_structure().unwrap_err();

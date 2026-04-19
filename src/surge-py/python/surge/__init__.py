@@ -36,7 +36,7 @@ _NATIVE_PUBLIC_EXPORTS = (
     "TopologyRebuildResult", "Substation", "VoltageLevel", "Bay",
     "ConnectivityNode", "BusbarSection", "TerminalConnection", "TopologySwitch",
     # Results
-    "AcPfResult", "DcPfResult", "OpfResult", "BindingContingency",
+    "AcPfResult", "DcPfResult", "DispatchResult", "OpfResult", "BindingContingency",
     "ContingencyViolation", "FailedContingencyEvaluation",
     "ScopfScreeningStats", "ContingencyAnalysis",
     "HvdcLccDetail", "HvdcStationSolution", "HvdcDcBusSolution", "HvdcResult",
@@ -46,7 +46,7 @@ _NATIVE_PUBLIC_EXPORTS = (
     "version", "init_logging", "set_max_threads", "get_max_threads",
     "analyze_n1_branch", "analyze_n2_branch", "analyze_n1_generator",
     "analyze_contingencies", "solve_hvdc",
-    "case9", "case14", "case30", "case57", "case118", "case300",
+    "case9", "case14", "case30", "market30", "case57", "case118", "case300",
 )
 
 # All native exports the package depends on.  The source-tree bootstrap
@@ -54,9 +54,12 @@ _NATIVE_PUBLIC_EXPORTS = (
 # accepting it.  This is the **single source of truth** — every name used
 # by a submodule via ``_native.<name>`` must appear here.
 _REQUIRED_NATIVE_EXPORTS = frozenset(_NATIVE_PUBLIC_EXPORTS) | frozenset((
+    "ActivsgTimeSeries", "read_tamu_activsg_time_series",
     # Solvers routed through the Python opf / powerflow layers
     "load", "save", "solve_ac_pf", "solve_dc_pf", "solve_fdpf",
-    "solve_dc_opf_full", "solve_ac_opf", "solve_scopf",
+    "solve_dc_opf_full", "solve_ac_opf", "solve_ac_opf_subproblem",
+    "AcOpfBendersSubproblemResult", "solve_scopf", "solve_dispatch",
+    "assess_dispatch_violations",
     # DC sensitivity namespace
     "PreparedDcStudy", "PtdfResult", "LodfResult", "LodfMatrixResult",
     "N2LodfResult", "N2LodfBatchResult", "OtdfResult",
@@ -94,6 +97,10 @@ _REQUIRED_NATIVE_EXPORTS = frozenset(_NATIVE_PUBLIC_EXPORTS) | frozenset((
     "_io_psse_dyr_load", "_io_psse_dyr_loads",
     "_io_psse_dyr_save", "_io_psse_dyr_dumps",
     "_losses_compute_factors", "_units_ohm_to_pu",
+    # Market workflow (canonical multi-stage) + GO C3 adapter
+    "solve_market_workflow_py",
+    "go_c3_load_problem", "go_c3_build_network", "go_c3_build_request",
+    "go_c3_build_workflow", "go_c3_export_solution", "go_c3_save_solution",
 ))
 
 
@@ -123,14 +130,22 @@ def _source_tree_native_candidate() -> Path | None:
         return None
 
     target_root = Path(os.environ["CARGO_TARGET_DIR"]) if os.environ.get("CARGO_TARGET_DIR") else repo_root / "target"
-    target_dir = target_root / "release"
-    for candidate in (
-        target_dir / "lib_surge.so",
-        target_dir / "lib_surge.dylib",
-        target_dir / "_surge.pyd",
-    ):
-        if candidate.exists():
-            return candidate
+
+    # Profile search order. Override with SURGE_NATIVE_PROFILE=<dir> to pin one.
+    # Cargo's "dev" profile writes to target/debug/ — list it first so iteration
+    # builds are picked up automatically.
+    env_profile = os.environ.get("SURGE_NATIVE_PROFILE")
+    profile_dirs = [env_profile] if env_profile else ["debug", "release-dev", "release"]
+
+    for profile in profile_dirs:
+        target_dir = target_root / profile
+        for candidate in (
+            target_dir / "lib_surge.so",
+            target_dir / "lib_surge.dylib",
+            target_dir / "_surge.pyd",
+        ):
+            if candidate.exists():
+                return candidate
     return None
 
 
@@ -196,11 +211,16 @@ def _load_native_from_path(path: Path):
 
 def _import_native():
     is_source_tree, repo_root = _is_source_tree_package()
-    candidate = _source_tree_native_candidate() if is_source_tree else _packaged_native_candidate()
+    # Prefer the packaged artifact (maturin develop drops _surge.cpython-*.so
+    # next to __init__.py). Honors whatever profile maturin last built with.
+    candidate = _packaged_native_candidate()
+    if candidate is None and is_source_tree:
+        # Fall back to a raw `cargo build` artifact under target/<profile>/.
+        candidate = _source_tree_native_candidate()
     if candidate is None:
         location = (
-            f"source-tree build artifact under {repo_root / 'target' / 'release'} "
-            "(build with `maturin develop --release`)"
+            f"source-tree build artifact under {repo_root / 'target'} "
+            "(build with `maturin develop` from src/surge-py/)"
             if is_source_tree and repo_root is not None
             else f"packaged extension in {Path(__file__).resolve().parent}"
         )
@@ -255,9 +275,13 @@ from .opf import (  # noqa: F401
     ScopfScreeningPolicy,
     ThermalRating,
     solve_ac_opf,
+    solve_ac_opf_subproblem,
     solve_dc_opf,
     solve_scopf,
 )
+AcOpfBendersSubproblemResult = _native.AcOpfBendersSubproblemResult  # re-export native class
+from .dispatch import solve_dispatch  # noqa: F401
+from .dispatch_request import DispatchRequest  # noqa: F401
 from .powerflow import AcPfOptions, DcPfOptions, solve_ac_pf, solve_dc_pf  # noqa: F401
 
 
@@ -304,7 +328,11 @@ _PYTHON_PUBLIC_EXPORTS = (
     "solve_ac_pf",
     "solve_dc_pf",
     "solve_ac_opf",
+    "solve_ac_opf_subproblem",
+    "AcOpfBendersSubproblemResult",
     "solve_dc_opf",
+    "solve_dispatch",
+    "DispatchRequest",
     "solve_scopf",
 )
 
@@ -316,8 +344,10 @@ _LAZY_MODULES = {
     "contingency": "surge.contingency",
     "contingency_io": "surge.contingency_io",
     "dc": "surge.dc",
+    "dispatch": "surge.dispatch",
     "io": "surge.io",
     "losses": "surge.losses",
+    "market": "surge.market",
     "opf": "surge.opf",
     "powerflow": "surge.powerflow",
     "subsystem": "surge.subsystem",

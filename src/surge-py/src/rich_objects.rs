@@ -618,7 +618,9 @@ impl Branch {
 #[derive(Clone)]
 pub struct StorageParams {
     #[pyo3(get, set)]
-    pub efficiency: f64,
+    pub charge_efficiency: f64,
+    #[pyo3(get, set)]
+    pub discharge_efficiency: f64,
     #[pyo3(get, set)]
     pub energy_capacity_mwh: f64,
     #[pyo3(get, set)]
@@ -645,12 +647,17 @@ pub struct StorageParams {
     pub max_c_rate_discharge: Option<f64>,
     #[pyo3(get, set)]
     pub chemistry: Option<String>,
+    #[pyo3(get, set)]
+    pub discharge_foldback_soc_mwh: Option<f64>,
+    #[pyo3(get, set)]
+    pub charge_foldback_soc_mwh: Option<f64>,
 }
 
 impl StorageParams {
     pub fn from_core(storage: &CoreStorageParams) -> Self {
         Self {
-            efficiency: storage.efficiency,
+            charge_efficiency: storage.charge_efficiency,
+            discharge_efficiency: storage.discharge_efficiency,
             energy_capacity_mwh: storage.energy_capacity_mwh,
             soc_initial_mwh: storage.soc_initial_mwh,
             soc_min_mwh: storage.soc_min_mwh,
@@ -664,12 +671,15 @@ impl StorageParams {
             max_c_rate_charge: storage.max_c_rate_charge,
             max_c_rate_discharge: storage.max_c_rate_discharge,
             chemistry: storage.chemistry.clone(),
+            discharge_foldback_soc_mwh: storage.discharge_foldback_soc_mwh,
+            charge_foldback_soc_mwh: storage.charge_foldback_soc_mwh,
         }
     }
 
     pub fn to_core(&self) -> PyResult<CoreStorageParams> {
         Ok(CoreStorageParams {
-            efficiency: self.efficiency,
+            charge_efficiency: self.charge_efficiency,
+            discharge_efficiency: self.discharge_efficiency,
             energy_capacity_mwh: self.energy_capacity_mwh,
             soc_initial_mwh: self.soc_initial_mwh,
             soc_min_mwh: self.soc_min_mwh,
@@ -683,6 +693,8 @@ impl StorageParams {
             max_c_rate_charge: self.max_c_rate_charge,
             max_c_rate_discharge: self.max_c_rate_discharge,
             chemistry: self.chemistry.clone(),
+            discharge_foldback_soc_mwh: self.discharge_foldback_soc_mwh,
+            charge_foldback_soc_mwh: self.charge_foldback_soc_mwh,
         })
     }
 }
@@ -690,10 +702,12 @@ impl StorageParams {
 #[pymethods]
 impl StorageParams {
     #[new]
-    #[pyo3(signature = (energy_capacity_mwh, efficiency=0.9, soc_initial_mwh=None, soc_min_mwh=0.0, soc_max_mwh=None, variable_cost_per_mwh=0.0, degradation_cost_per_mwh=0.0, dispatch_mode="cost_minimization".to_string(), self_schedule_mw=0.0, discharge_offer=None, charge_bid=None, max_c_rate_charge=None, max_c_rate_discharge=None, chemistry=None))]
+    #[pyo3(signature = (energy_capacity_mwh, charge_efficiency=None, discharge_efficiency=None, efficiency=None, soc_initial_mwh=None, soc_min_mwh=0.0, soc_max_mwh=None, variable_cost_per_mwh=0.0, degradation_cost_per_mwh=0.0, dispatch_mode="cost_minimization".to_string(), self_schedule_mw=0.0, discharge_offer=None, charge_bid=None, max_c_rate_charge=None, max_c_rate_discharge=None, chemistry=None, discharge_foldback_soc_mwh=None, charge_foldback_soc_mwh=None))]
     fn new(
         energy_capacity_mwh: f64,
-        efficiency: f64,
+        charge_efficiency: Option<f64>,
+        discharge_efficiency: Option<f64>,
+        efficiency: Option<f64>,
         soc_initial_mwh: Option<f64>,
         soc_min_mwh: f64,
         soc_max_mwh: Option<f64>,
@@ -706,9 +720,28 @@ impl StorageParams {
         max_c_rate_charge: Option<f64>,
         max_c_rate_discharge: Option<f64>,
         chemistry: Option<String>,
+        discharge_foldback_soc_mwh: Option<f64>,
+        charge_foldback_soc_mwh: Option<f64>,
     ) -> PyResult<Self> {
+        // Efficiency resolution:
+        //   * If charge_efficiency / discharge_efficiency are provided, use
+        //     them directly.
+        //   * Else if a legacy `efficiency` (round-trip) scalar is given,
+        //     split it symmetrically as sqrt(eta) per leg.
+        //   * Else default to 0.90 charge / 0.98 discharge.
+        let (eta_ch, eta_dis) = match (charge_efficiency, discharge_efficiency, efficiency) {
+            (Some(c), Some(d), _) => (c, d),
+            (Some(c), None, _) => (c, 0.98),
+            (None, Some(d), _) => (0.90, d),
+            (None, None, Some(rt)) => {
+                let leg = rt.max(0.0).sqrt();
+                (leg, leg)
+            }
+            (None, None, None) => (0.90, 0.98),
+        };
         let storage = Self {
-            efficiency,
+            charge_efficiency: eta_ch,
+            discharge_efficiency: eta_dis,
             energy_capacity_mwh,
             soc_initial_mwh: soc_initial_mwh.unwrap_or(0.5 * energy_capacity_mwh),
             soc_min_mwh,
@@ -722,15 +755,26 @@ impl StorageParams {
             max_c_rate_charge,
             max_c_rate_discharge,
             chemistry,
+            discharge_foldback_soc_mwh,
+            charge_foldback_soc_mwh,
         };
         let _ = storage.to_core()?;
         Ok(storage)
     }
 
+    /// Round-trip efficiency implied by the charge/discharge pair. Read-only
+    /// convenience for inspection and logging.
+    #[getter]
+    fn round_trip_efficiency(&self) -> f64 {
+        self.charge_efficiency * self.discharge_efficiency
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "<StorageParams E={:.1}MWh SoC=[{:.1},{:.1},{:.1}] mode={}>",
+            "<StorageParams E={:.1}MWh η={:.2}/{:.2} SoC=[{:.1},{:.1},{:.1}] mode={}>",
             self.energy_capacity_mwh,
+            self.charge_efficiency,
+            self.discharge_efficiency,
             self.soc_min_mwh,
             self.soc_initial_mwh,
             self.soc_max_mwh,
@@ -831,6 +875,27 @@ pub struct Generator {
     /// Minimum down time (hours). None if unspecified.
     #[pyo3(get, set)]
     pub min_down_time_hr: Option<f64>,
+    /// Maximum up time (hours). None if unspecified.
+    #[pyo3(get, set)]
+    pub max_up_time_hr: Option<f64>,
+    /// Minimum soak time at pmin after sync (hours). None if unspecified.
+    #[pyo3(get, set)]
+    pub min_run_at_pmin_hr: Option<f64>,
+    /// Maximum startup events in a rolling 24-hour window. None if unspecified.
+    #[pyo3(get, set)]
+    pub max_starts_per_day: Option<u32>,
+    /// Maximum startup events in a rolling 168-hour window. None if unspecified.
+    #[pyo3(get, set)]
+    pub max_starts_per_week: Option<u32>,
+    /// Maximum energy in a rolling 24-hour window (MWh). None if unspecified.
+    #[pyo3(get, set)]
+    pub max_energy_mwh_per_day: Option<f64>,
+    /// Maximum startup output ramp (MW/min). None if unspecified.
+    #[pyo3(get, set)]
+    pub startup_ramp_mw_per_min: Option<f64>,
+    /// Maximum shutdown output ramp (MW/min). None if unspecified.
+    #[pyo3(get, set)]
+    pub shutdown_ramp_mw_per_min: Option<f64>,
     /// Startup cost tiers: [(max_offline_hours, cost_$, sync_time_min), ...].
     /// Sourced from energy_offer.submitted.startup_tiers if present,
     /// falling back to legacy startup_cost_tiers (with sync_time=0).
@@ -961,6 +1026,19 @@ impl Generator {
             ),
             min_up_time_hr: g.commitment.as_ref().and_then(|c| c.min_up_time_hr),
             min_down_time_hr: g.commitment.as_ref().and_then(|c| c.min_down_time_hr),
+            max_up_time_hr: g.commitment.as_ref().and_then(|c| c.max_up_time_hr),
+            min_run_at_pmin_hr: g.commitment.as_ref().and_then(|c| c.min_run_at_pmin_hr),
+            max_starts_per_day: g.commitment.as_ref().and_then(|c| c.max_starts_per_day),
+            max_starts_per_week: g.commitment.as_ref().and_then(|c| c.max_starts_per_week),
+            max_energy_mwh_per_day: g.commitment.as_ref().and_then(|c| c.max_energy_mwh_per_day),
+            startup_ramp_mw_per_min: g
+                .commitment
+                .as_ref()
+                .and_then(|c| c.startup_ramp_mw_per_min),
+            shutdown_ramp_mw_per_min: g
+                .commitment
+                .as_ref()
+                .and_then(|c| c.shutdown_ramp_mw_per_min),
             startup_cost_tiers: g
                 .market
                 .as_ref()
@@ -1054,6 +1132,13 @@ impl Generator {
             commitment_status: "Market".to_string(),
             min_up_time_hr: None,
             min_down_time_hr: None,
+            max_up_time_hr: None,
+            min_run_at_pmin_hr: None,
+            max_starts_per_day: None,
+            max_starts_per_week: None,
+            max_energy_mwh_per_day: None,
+            startup_ramp_mw_per_min: None,
+            shutdown_ramp_mw_per_min: None,
             startup_cost_tiers: Vec::new(),
             quick_start: false,
             storage: None,
@@ -1078,6 +1163,20 @@ impl Generator {
             cost_breakpoints_mw: Vec::new(),
             cost_breakpoints_usd: Vec::new(),
         }
+    }
+
+    /// Canonical resource identifier used in dispatch requests.
+    ///
+    /// Semantic alias for ``id``. A freshly-added generator via
+    /// :meth:`Network.add_generator` always has a canonical id of the
+    /// form ``gen_{bus}_{ordinal}``; loaders that deserialise from
+    /// MATPOWER / PSS/E / GO C3 canonicalise at load time. Use this
+    /// when you're writing a ``resource_id`` into an offer schedule,
+    /// commitment initial condition, or any other per-resource entry
+    /// of a ``DispatchRequest`` — the name signals intent.
+    #[getter]
+    fn resource_id(&self) -> &str {
+        &self.id
     }
 
     /// True if this generator has a cost curve.
@@ -2749,7 +2848,7 @@ pub fn branches_dc_solved(flows_mw: &[f64], net: &CoreNetwork) -> Vec<BranchDcSo
 /// Build GenSolved objects (generator + solved Qg).
 pub fn generators_solved(pf: &CorePfSolution, net: &CoreNetwork) -> Vec<GenSolved> {
     // Compute per-generator solved Qg using the same logic as AcPfResult::gen_q_mvar.
-    // reactive_power_injection_pu (pu) → Qg_bus (MVAr): Qg = reactive_power_injection_pu * base + Qd - Bs * Vm² * base
+    // reactive_power_injection_pu (pu) → Qg_bus (MVAr): Qg = reactive_power_injection_pu * base + Qd - Bs * Vm²
     // Multiple generators at the same bus are apportioned by their (Qmax - Qmin) range.
     let base = net.base_mva;
     let bus_map = net.bus_index_map();
@@ -2762,7 +2861,7 @@ pub fn generators_solved(pf: &CorePfSolution, net: &CoreNetwork) -> Vec<GenSolve
             let vm = pf.voltage_magnitude_pu[idx];
             let qd = load_q.get(bus_idx).copied().unwrap_or(0.0);
             let qg_bus = pf.reactive_power_injection_pu[idx] * base + qd
-                - bus.shunt_susceptance_mvar * vm * vm * base;
+                - bus.shunt_susceptance_mvar * vm * vm;
             bus_qg.insert(bus.number, qg_bus);
         }
     }
@@ -3320,6 +3419,13 @@ pub struct DcLine {
     /// True if the link is in service (mode != Blocked).
     #[pyo3(get, set)]
     pub in_service: bool,
+    /// Minimum DC power for joint AC-DC OPF (MW). When `p_dc_min_mw <
+    /// p_dc_max_mw` the link's P becomes an NLP decision variable.
+    #[pyo3(get, set)]
+    pub p_dc_min_mw: f64,
+    /// Maximum DC power for joint AC-DC OPF (MW).
+    #[pyo3(get, set)]
+    pub p_dc_max_mw: f64,
 }
 
 impl DcLine {
@@ -3333,6 +3439,8 @@ impl DcLine {
             rectifier_bus: dc.rectifier.bus,
             inverter_bus: dc.inverter.bus,
             in_service: !matches!(dc.mode, LccHvdcControlMode::Blocked),
+            p_dc_min_mw: dc.p_dc_min_mw,
+            p_dc_max_mw: dc.p_dc_max_mw,
         }
     }
 }
@@ -3340,7 +3448,7 @@ impl DcLine {
 #[pymethods]
 impl DcLine {
     #[new]
-    #[pyo3(signature = (name, rectifier_bus, inverter_bus, scheduled_setpoint=0.0, scheduled_voltage_kv=500.0, resistance_ohm=0.0, in_service=true))]
+    #[pyo3(signature = (name, rectifier_bus, inverter_bus, scheduled_setpoint=0.0, scheduled_voltage_kv=500.0, resistance_ohm=0.0, in_service=true, p_dc_min_mw=0.0, p_dc_max_mw=0.0))]
     fn new(
         name: &str,
         rectifier_bus: u32,
@@ -3349,6 +3457,8 @@ impl DcLine {
         scheduled_voltage_kv: f64,
         resistance_ohm: f64,
         in_service: bool,
+        p_dc_min_mw: f64,
+        p_dc_max_mw: f64,
     ) -> Self {
         Self {
             name: name.to_string(),
@@ -3358,6 +3468,8 @@ impl DcLine {
             rectifier_bus,
             inverter_bus,
             in_service,
+            p_dc_min_mw,
+            p_dc_max_mw,
         }
     }
 
@@ -3367,13 +3479,26 @@ impl DcLine {
         self.scheduled_setpoint
     }
 
+    /// True when the joint AC-DC OPF should treat this link's DC power
+    /// as an NLP decision variable (`p_dc_min_mw < p_dc_max_mw`).
+    #[getter]
+    fn has_variable_p_dc(&self) -> bool {
+        self.p_dc_min_mw < self.p_dc_max_mw
+    }
+
     fn __repr__(&self) -> String {
+        let p_range = if self.p_dc_min_mw < self.p_dc_max_mw {
+            format!(" P∈[{:.1},{:.1}]", self.p_dc_min_mw, self.p_dc_max_mw)
+        } else {
+            String::new()
+        };
         format!(
-            "<LccHvdcLink '{}' rect={} inv={} P={:.1}MW Vdc={:.0}kV{}>",
+            "<LccHvdcLink '{}' rect={} inv={} P={:.1}MW{} Vdc={:.0}kV{}>",
             self.name,
             self.rectifier_bus,
             self.inverter_bus,
             self.scheduled_setpoint,
+            p_range,
             self.scheduled_voltage_kv,
             if self.in_service { "" } else { " BLOCKED" }
         )
@@ -5015,9 +5140,10 @@ impl OutageEntry {
 pub struct ReserveZone {
     #[pyo3(get)]
     pub name: String,
-    /// Zonal requirements: list of (zone_id, product_id, requirement_mw).
+    /// Zonal requirements: list of
+    /// (zone_id, product_id, requirement_mw, participant_bus_numbers).
     #[pyo3(get, set)]
-    pub zonal_requirements: Vec<(usize, String, f64)>,
+    pub zonal_requirements: Vec<(usize, String, f64, Option<Vec<u32>>)>,
 }
 
 impl ReserveZone {
@@ -5027,7 +5153,14 @@ impl ReserveZone {
             zonal_requirements: z
                 .zonal_requirements
                 .iter()
-                .map(|r| (r.zone_id, r.product_id.clone(), r.requirement_mw))
+                .map(|r| {
+                    (
+                        r.zone_id,
+                        r.product_id.clone(),
+                        r.requirement_mw,
+                        r.participant_bus_numbers.clone(),
+                    )
+                })
                 .collect(),
         }
     }
@@ -5037,7 +5170,10 @@ impl ReserveZone {
 impl ReserveZone {
     #[new]
     #[pyo3(signature = (name, zonal_requirements=None))]
-    fn new(name: &str, zonal_requirements: Option<Vec<(usize, String, f64)>>) -> Self {
+    fn new(
+        name: &str,
+        zonal_requirements: Option<Vec<(usize, String, f64, Option<Vec<u32>>)>>,
+    ) -> Self {
         Self {
             name: name.to_string(),
             zonal_requirements: zonal_requirements.unwrap_or_default(),

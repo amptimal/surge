@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GO C3 · Surge Dashboard</title>
+<link rel="icon" type="image/svg+xml" href="static/favicon.svg?v=20260418">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="static/dashboard.css">
+</head>
+<body>
+
+<nav class="top-nav">
+  <a class="nav-logo" href="/">
+    <svg width="22" height="22" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <circle cx="256" cy="256" r="180" fill="none" stroke="#a78bfa" stroke-width="32"/>
+      <path d="M 60 380 Q 140 380, 200 200 Q 256 80, 312 200 Q 372 380, 452 380" fill="none" stroke="#a78bfa" stroke-width="32" stroke-linecap="round"/>
+    </svg>
+    <span class="nav-logo-name">AMPTIMAL</span>
+  </a>
+  <div class="nav-section-label">GO C3 Benchmarks</div>
+  <div class="nav-right">
+    <span id="build-badge" class="build-badge offline" title="loading…">
+      <span class="dot"></span>SURGE offline
+    </span>
+  </div>
+</nav>
+
+<div class="shell">
+
+  <aside id="sidebar">
+    <h2>Cases</h2>
+    <div id="case-list"></div>
+  </aside>
+
+  <main id="main">
+
+    <div id="no-case">Select a case from the sidebar</div>
+
+    <div id="case-view" style="display:none">
+
+      <div class="case-header">
+        <div>
+          <div id="case-title"></div>
+          <div id="case-objective" class="empty">—</div>
+        </div>
+        <div class="case-actions">
+          <button class="action-btn" id="btn-archives">Archives</button>
+          <button class="action-btn" id="btn-resolve">Re-solve</button>
+          <button class="action-btn" id="btn-revalidate">Re-validate</button>
+        </div>
+      </div>
+
+      <div class="info-panels">
+        <div class="info-panel" id="panel-case-info"><h3>Case</h3></div>
+        <div class="info-panel" id="panel-dc-stats"><h3>DC SCUC</h3></div>
+        <div class="info-panel" id="panel-ac-stats"><h3>AC SCED</h3></div>
+      </div>
+
+      <div class="period-ctrl" id="global-period-ctrl">
+        <label>Period</label>
+        <input type="number" id="period-num" value="0" min="0">
+        <input type="range" id="period-slider" value="0" min="0">
+      </div>
+
+      <div class="tabs" id="tab-bar">
+        <div class="tab active" data-tab="score">Scores</div>
+        <div class="tab" data-tab="objective">Objective</div>
+        <div class="tab" data-tab="grid">Grid</div>
+        <div class="tab" data-tab="generators">Generators</div>
+        <div class="tab" data-tab="loads">Loads</div>
+        <div class="tab" data-tab="hvdc">HVDC</div>
+        <div class="tab" data-tab="buses">Buses</div>
+        <div class="tab" data-tab="branches">Branches</div>
+        <div class="tab" data-tab="reserves">AS Awards</div>
+        <div class="tab" data-tab="reserve-system">AS System</div>
+        <div class="tab" data-tab="contingencies">Contingencies</div>
+        <div class="tab" data-tab="violations">Violations</div>
+        <div class="tab" data-tab="log">Log</div>
+      </div>
+
+      <div class="panel active" id="panel-score">
+        <div id="score-content"></div>
+      </div>
+      <div class="panel" id="panel-objective">
+        <div id="objective-content"></div>
+      </div>
+      <div class="panel" id="panel-grid">
+        <div class="grid-controls">
+          <div class="color-mode-group" id="color-mode-group">
+            <button class="mode-btn active" data-mode="voltage">Voltage</button>
+            <button class="mode-btn" data-mode="dc_lmp">DC LMP</button>
+            <button class="mode-btn" data-mode="ac_lmp">AC LMP</button>
+            <button class="mode-btn" data-mode="net_p">Net P-Inj</button>
+          </div>
+          <div class="layer-toggles">
+            <label class="layer-toggle"><input type="checkbox" id="grid-show-labels" checked> Labels</label>
+            <label class="layer-toggle"><input type="checkbox" id="grid-show-assets" checked> Asset glyphs</label>
+          </div>
+          <div class="grid-legend" id="grid-legend"></div>
+        </div>
+        <div class="grid-canvas-wrap">
+          <svg id="grid-svg" xmlns="http://www.w3.org/2000/svg"></svg>
+          <div id="grid-tooltip" class="grid-tooltip hidden"></div>
+        </div>
+      </div>
+      <div class="panel" id="panel-generators">
+        <div class="scroll-table"><table id="gen-table"><thead></thead><tbody></tbody></table></div>
+      </div>
+      <div class="panel" id="panel-loads">
+        <div class="scroll-table"><table id="load-table"><thead></thead><tbody></tbody></table></div>
+      </div>
+      <div class="panel" id="panel-hvdc">
+        <div class="scroll-table"><table id="hvdc-table"><thead></thead><tbody></tbody></table></div>
+      </div>
+      <div class="panel" id="panel-buses">
+        <div class="scroll-table"><table id="bus-table"><thead></thead><tbody></tbody></table></div>
+      </div>
+      <div class="panel" id="panel-branches">
+        <div class="scroll-table"><table id="branch-table"><thead></thead><tbody></tbody></table></div>
+      </div>
+      <div class="panel" id="panel-reserves">
+        <div class="scroll-table"><table id="reserves-table"><thead></thead><tbody></tbody></table></div>
+      </div>
+      <div class="panel" id="panel-reserve-system">
+        <div class="scroll-table"><table id="reserve-system-table"><thead></thead><tbody></tbody></table></div>
+      </div>
+      <div class="panel" id="panel-contingencies">
+        <div class="scroll-table"><table id="ctg-table"><thead></thead><tbody></tbody></table></div>
+      </div>
+      <div class="panel" id="panel-violations">
+        <div class="scroll-table"><table id="viol-table"><thead></thead><tbody></tbody></table></div>
+      </div>
+      <div class="panel" id="panel-log">
+        <pre id="log-content"></pre>
+      </div>
+
+    </div>
+  </main>
+
+</div>
+
+<div id="modal-overlay" onclick="if(event.target===this)closeModal()">
+  <div id="modal"><span class="close" onclick="closeModal()">&times;</span><h3 id="modal-title"></h3><div id="modal-body"></div></div>
+</div>
+
+<!-- Job progress drawer — slides up from the bottom while a job runs. -->
+<div id="job-drawer" class="job-drawer hidden">
+  <div class="job-drawer-hdr">
+    <div class="job-drawer-title">
+      <span id="job-kind-label">SOLVE</span>
+      <span id="job-case-label" class="job-case"></span>
+      <span id="job-status-label" class="job-status">queued</span>
+    </div>
+    <div class="job-drawer-actions">
+      <button class="action-btn" id="btn-job-close">Close</button>
+    </div>
+  </div>
+  <pre id="job-log-stream"></pre>
+</div>
+
+<script src="static/dashboard.js"></script>
+</body>
+</html>

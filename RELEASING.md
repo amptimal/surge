@@ -28,7 +28,7 @@ cargo check -p surge-py
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --workspace --exclude surge-py
 cargo build --release --workspace --exclude surge-py
-pip install maturin pytest pandas scipy pyyaml jupyter nbconvert
+pip install maturin pytest pandas scipy pyyaml matplotlib jupyter nbconvert
 cd src/surge-py
 COPT_HOME=/path/to/copt80 SURGE_PY_REQUIRE_COPT_NLP_SHIM=1 maturin develop --release
 cd ../..
@@ -59,7 +59,8 @@ Manually verify:
 - publish these crates to crates.io in dependency order:
   `surge-sparse`, `surge-network`, `surge-solution`, `surge-topology`,
   `surge-ac`, `surge-dc`, `surge-io`, `surge-hvdc`, `surge-opf`,
-  `surge-contingency`, `surge-transfer`, and `surge-bindings`
+  `surge-contingency`, `surge-transfer`, `surge-dispatch`, `surge-market`,
+  and `surge-bindings`
 - after each dependency layer is live on crates.io, run
   `cargo package -p <crate> --allow-dirty --no-verify` for the next crate
   before publishing it

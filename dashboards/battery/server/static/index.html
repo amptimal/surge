@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Battery · Surge Dashboard</title>
+<link rel="icon" type="image/svg+xml" href="static/favicon.svg?v=20260418">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="static/dashboard.css">
+</head>
+<body>
+
+<nav class="top-nav">
+  <a class="nav-logo" href="/">
+    <svg width="22" height="22" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <circle cx="256" cy="256" r="180" fill="none" stroke="#a78bfa" stroke-width="32"/>
+      <path d="M 60 380 Q 140 380, 200 200 Q 256 80, 312 200 Q 372 380, 452 380" fill="none" stroke="#a78bfa" stroke-width="32" stroke-linecap="round"/>
+    </svg>
+    <span class="nav-logo-name">AMPTIMAL</span>
+  </a>
+  <div class="nav-section-label">🔋 Battery Operator</div>
+  <div class="nav-right">
+    <a class="nav-link" href="/">← All dashboards</a>
+  </div>
+</nav>
+
+<div class="solve-bar">
+  <div class="mode-group">
+    <label>Dispatch</label>
+    <select id="sel-dispatch-mode">
+      <option value="optimal_foresight">Optimal Foresight</option>
+      <option value="pwl_offers">PWL Offers</option>
+    </select>
+  </div>
+  <div class="mode-group">
+    <label>Coupling</label>
+    <select id="sel-period-coupling">
+      <option value="coupled">Coupled</option>
+      <option value="sequential">Sequential</option>
+    </select>
+  </div>
+  <div class="mode-hint" id="mode-hint"></div>
+  <div class="solve-bar-right">
+    <div id="solve-status" class="solve-status">ready</div>
+    <div class="mc-group" title="Monte Carlo over per-period price distributions">
+      <label>Runs</label>
+      <input type="number" id="inp-mc-n" min="2" max="500" step="1" value="10">
+      <button id="btn-mc" class="ghost-btn-sm" type="button">🎲 Run</button>
+    </div>
+    <div class="net-rev-wrap">
+      <div class="net-rev-label" id="net-rev-label">Net revenue</div>
+      <div id="net-rev" class="net-rev">—</div>
+      <div class="net-rev-sub" id="net-rev-sub"></div>
+    </div>
+    <button id="btn-solve" class="solve-btn">▶ Solve</button>
+  </div>
+</div>
+
+<div id="error-banner" class="error-banner" role="alert" aria-live="polite">
+  <span class="error-banner-icon">⚠</span>
+  <span id="error-banner-text"></span>
+  <button id="error-banner-close" class="error-banner-close" aria-label="Dismiss">×</button>
+</div>
+
+<main class="shell">
+
+  <!-- LEFT SIDEBAR — config ────────────────────────────────────── -->
+  <aside id="sidebar" class="sidebar">
+    <button class="sidebar-toggle" id="sidebar-toggle" title="Collapse sidebar" aria-label="Toggle configuration sidebar">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="15 18 9 12 15 6"></polyline>
+      </svg>
+    </button>
+    <div class="sidebar-collapsed-label">CONFIG</div>
+    <div class="sidebar-content">
+      <div class="sidebar-head">
+        <h2>Configure</h2>
+        <div class="panel-note" id="periods-display">—</div>
+      </div>
+      <div class="sidebar-body">
+
+        <div class="config-section">
+          <div class="section-label">BESS Asset</div>
+          <div class="field-stack">
+            <label class="field-row"><span class="field-label">Charge <em>MW</em></span><input type="number" id="inp-charge-mw" min="0" step="0.1"></label>
+            <label class="field-row"><span class="field-label">Discharge <em>MW</em></span><input type="number" id="inp-discharge-mw" min="0" step="0.1"></label>
+            <label class="field-row"><span class="field-label">Energy <em>MWh</em></span><input type="number" id="inp-energy" min="0" step="0.1"></label>
+            <label class="field-row"><span class="field-label">Charge efficiency</span><input type="number" id="inp-eff-charge" min="0.1" max="1.0" step="0.01"></label>
+            <label class="field-row"><span class="field-label">Discharge efficiency</span><input type="number" id="inp-eff-discharge" min="0.1" max="1.0" step="0.01"></label>
+            <label class="field-row"><span class="field-label">Degradation <em>$/MWh</em></span><input type="number" id="inp-deg" min="0" step="0.1"></label>
+            <label class="field-row"><span class="field-label">SOC min</span><input type="number" id="inp-soc-min" min="0" max="1" step="0.01"></label>
+            <label class="field-row"><span class="field-label">SOC max</span><input type="number" id="inp-soc-max" min="0" max="1" step="0.01"></label>
+            <label class="field-row"><span class="field-label">Discharge foldback <em>SOC</em></span><input type="number" id="inp-foldback-dis" min="0" max="1" step="0.01" placeholder="off"></label>
+            <label class="field-row"><span class="field-label">Charge foldback <em>SOC</em></span><input type="number" id="inp-foldback-ch" min="0" max="1" step="0.01" placeholder="off"></label>
+            <label class="field-row"><span class="field-label">SOC initial <em>MWh</em></span><input type="number" id="inp-soc-init" min="0" step="0.1"></label>
+          </div>
+        </div>
+
+        <div class="config-section">
+          <div class="section-label">Time Axis</div>
+          <div class="field-stack">
+            <label class="field-row"><span class="field-label">Start</span><input type="datetime-local" id="inp-start" step="60"></label>
+            <label class="field-row"><span class="field-label">Horizon <em>hours</em></span><input type="number" id="inp-horizon" min="1" step="1"></label>
+            <label class="field-row"><span class="field-label">Resolution <em>min</em></span>
+              <select id="sel-resolution">
+                <option value="1">1</option><option value="5">5</option>
+                <option value="10">10</option><option value="15">15</option>
+                <option value="30">30</option><option value="60">60</option>
+              </select>
+            </label>
+          </div>
+        </div>
+
+        <div class="config-section">
+          <div class="section-label">Price CSV</div>
+          <div class="csv-upload">
+            <input type="file" id="inp-csv" accept=".csv,text/csv" hidden>
+            <button type="button" class="ghost-btn-sm csv-upload-btn" id="btn-csv-upload">Upload CSV</button>
+            <button type="button" class="ghost-btn-sm csv-upload-clear" id="btn-csv-clear" title="Restore defaults" hidden>↺</button>
+          </div>
+          <div class="csv-help">
+            Columns: <code>lmp</code>, <code>reg_up</code>, <code>reg_down</code>, <code>syn</code>…<br>
+            One row per period. Header row required.
+          </div>
+          <div class="csv-status" id="csv-status"></div>
+        </div>
+
+        <div class="config-section" id="pwl-section" style="display:none">
+          <div class="section-label">PWL Offer Curves</div>
+          <div class="pwl-block">
+            <div class="pwl-block-head">
+              <span class="pwl-block-label"><span class="pwl-block-dot discharge"></span>Discharge offer</span>
+              <span class="pwl-block-hint">dispatch when LMP ≥ price</span>
+            </div>
+            <div class="pwl-seg-header"><span>up to MW</span><span>$ / MWh</span><span></span></div>
+            <div class="pwl-segments" id="pwl-discharge-segments"></div>
+            <button type="button" class="pwl-seg-add ghost-btn-sm" data-direction="discharge">+ add band</button>
+          </div>
+          <div class="pwl-block">
+            <div class="pwl-block-head">
+              <span class="pwl-block-label"><span class="pwl-block-dot charge"></span>Charge bid</span>
+              <span class="pwl-block-hint">charge when LMP ≤ price</span>
+            </div>
+            <div class="pwl-seg-header"><span>up to MW</span><span>$ / MWh</span><span></span></div>
+            <div class="pwl-segments" id="pwl-charge-segments"></div>
+            <button type="button" class="pwl-seg-add ghost-btn-sm" data-direction="charge">+ add band</button>
+          </div>
+          <div class="pwl-block">
+            <div class="pwl-block-label">AS bid prices</div>
+            <div class="pwl-as-stack field-stack" id="pwl-as-grid"></div>
+          </div>
+          <div class="pwl-sidebar-hint" id="pwl-sidebar-hint">
+            Click a segment pill above the price chart, then drag its line to customize bids per period. Sequential coupling applies the overrides.
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </aside>
+
+  <!-- MAIN AREA — price chart above, results below ─────────────── -->
+  <div class="main-area">
+
+    <div class="panel price-panel">
+      <div class="panel-head">
+        <div class="price-tabs" id="price-tabs"></div>
+        <div class="panel-actions">
+          <div class="price-presets" id="price-presets">
+            <button class="ghost-btn-sm" data-preset="duck">Duck</button>
+            <button class="ghost-btn-sm" data-preset="flat">Flat</button>
+            <button class="ghost-btn-sm" data-preset="peak">Peak</button>
+          </div>
+          <div class="as-actions" id="as-actions">
+            <button class="ghost-btn-sm" id="btn-as-zero" title="Set every period to $0">Zero</button>
+          </div>
+          <div class="dist-controls" id="price-dist-controls"></div>
+        </div>
+      </div>
+      <div id="pwl-editor-bar" class="pwl-editor-bar" style="display:none">
+        <span class="pwl-editor-label">Edit per-period bid:</span>
+        <div class="pwl-pill-group" id="pwl-pill-group"></div>
+        <button class="pwl-editor-reset" id="pwl-editor-reset" type="button" title="Clear per-period overrides">reset all</button>
+        <span class="pwl-editor-note" id="pwl-editor-note"></span>
+      </div>
+      <div class="panel-body">
+        <div id="chart-price" class="chart-editable"></div>
+      </div>
+    </div>
+
+    <!-- RESULTS ROW ──────────────────────────────────────────────── -->
+  <section class="results-row">
+
+    <div class="panel revenue-panel">
+      <div class="panel-head">
+        <h2>Revenue</h2>
+        <div class="panel-note" id="results-note">—</div>
+      </div>
+      <div class="panel-body">
+        <div class="rev-row"><span>Energy</span><span id="rev-energy">—</span></div>
+        <div class="rev-row"><span>AS</span><span id="rev-as">—</span></div>
+        <div class="rev-row"><span>Degradation</span><span id="rev-deg">—</span></div>
+        <div class="rev-row total"><span>Net</span><span id="rev-net">—</span></div>
+        <div class="rev-row sub"><span>Charge</span><span id="rev-charge-mwh">—</span></div>
+        <div class="rev-row sub"><span>Discharge</span><span id="rev-discharge-mwh">—</span></div>
+        <div class="rev-row sub"><span>Cycles (FEC)</span><span id="rev-cycles">—</span></div>
+      </div>
+    </div>
+
+    <div class="panel dispatch-panel">
+      <div class="panel-head">
+        <h2>Dispatch <span class="panel-sub">MW · energy + AS, bounds dashed</span></h2>
+        <div class="chart-legend" id="dispatch-legend"></div>
+      </div>
+      <div class="panel-body"><div id="chart-dispatch" class="chart-readonly"></div></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h2>SOC <span class="panel-sub">MWh</span></h2></div>
+      <div class="panel-body"><div id="chart-soc" class="chart-readonly"></div></div>
+    </div>
+
+    </section>
+
+  </div>
+
+</main>
+
+<script src="static/dashboard.js"></script>
+</body>
+</html>

@@ -9,8 +9,8 @@ use crate::exceptions::{
 };
 use crate::network::Network;
 use crate::solutions::{
-    AcOpfHvdcResult, BindingContingency, ContingencyViolation, DcOpfResult,
-    FailedContingencyEvaluation, OpfSolution, ScopfResult, ScopfScreeningStats,
+    AcOpfBendersSubproblemResult, AcOpfHvdcResult, BindingContingency, ContingencyViolation,
+    DcOpfResult, FailedContingencyEvaluation, OpfSolution, ScopfResult, ScopfScreeningStats,
 };
 
 // ── Private helpers ───────────────────────────────────────────────────────────
@@ -193,15 +193,19 @@ fn build_dc_opf_request(
 }
 
 fn build_ac_opf_request(
+    network: &surge_network::Network,
     tolerance: f64,
     max_iterations: u32,
     exact_hessian: bool,
     nlp_solver: Option<&str>,
     print_level: i32,
     enforce_thermal_limits: bool,
+    thermal_limit_slack_penalty_per_mva: f64,
     min_rate_a: f64,
     enforce_angle_limits: bool,
     warm_start: Option<&OpfSolution>,
+    warm_start_vm_pu: Option<Vec<f64>>,
+    warm_start_va_rad: Option<Vec<f64>>,
     use_dc_opf_warm_start: Option<bool>,
     optimize_switched_shunts: bool,
     optimize_taps: bool,
@@ -236,6 +240,11 @@ fn build_ac_opf_request(
         exact_hessian,
         print_level,
         enforce_thermal_limits,
+        thermal_limit_slack_penalty_per_mva,
+        bus_active_power_balance_slack_penalty_per_mw: 0.0,
+        bus_reactive_power_balance_slack_penalty_per_mvar: 0.0,
+        voltage_magnitude_slack_penalty_per_pu: 0.0,
+        angle_difference_slack_penalty_per_rad: 0.0,
         min_rate_a,
         enforce_angle_limits,
         optimize_switched_shunts,
@@ -251,14 +260,59 @@ fn build_ac_opf_request(
         constraint_screening_min_buses,
         screening_fallback_enabled,
         enforce_capability_curves,
+        enforce_regulated_bus_vm_targets: true,
         discrete_mode: dm,
+        discrete_polish: true,
     };
     let mut runtime = surge_opf::AcOpfRuntime::default();
     if let Some(solver) = solver {
         runtime = runtime.with_nlp_solver(solver);
     }
-    if let Some(warm_start) = warm_start {
-        runtime = runtime.with_warm_start(surge_opf::WarmStart::from_opf(&warm_start.inner));
+    let expected_buses = network.buses.len();
+    if let Some(ref voltage_magnitudes) = warm_start_vm_pu
+        && voltage_magnitudes.len() != expected_buses
+    {
+        return Err(PyValueError::new_err(format!(
+            "warm_start_vm_pu length {} does not match network bus count {}",
+            voltage_magnitudes.len(),
+            expected_buses
+        )));
+    }
+    if let Some(ref voltage_angles) = warm_start_va_rad
+        && voltage_angles.len() != expected_buses
+    {
+        return Err(PyValueError::new_err(format!(
+            "warm_start_va_rad length {} does not match network bus count {}",
+            voltage_angles.len(),
+            expected_buses
+        )));
+    }
+    if warm_start.is_some() || warm_start_vm_pu.is_some() || warm_start_va_rad.is_some() {
+        let mut seed = warm_start
+            .map(|prior| surge_opf::WarmStart::from_opf(&prior.inner))
+            .unwrap_or_else(|| surge_opf::WarmStart {
+                voltage_magnitude_pu: network
+                    .buses
+                    .iter()
+                    .map(|bus| bus.voltage_magnitude_pu)
+                    .collect(),
+                voltage_angle_rad: network
+                    .buses
+                    .iter()
+                    .map(|bus| bus.voltage_angle_rad)
+                    .collect(),
+                pg: Vec::new(),
+                qg: Vec::new(),
+                dispatchable_load_p: Vec::new(),
+                dispatchable_load_q: Vec::new(),
+            });
+        if let Some(voltage_magnitudes) = warm_start_vm_pu {
+            seed.voltage_magnitude_pu = voltage_magnitudes;
+        }
+        if let Some(voltage_angles) = warm_start_va_rad {
+            seed.voltage_angle_rad = voltage_angles;
+        }
+        runtime = runtime.with_warm_start(seed);
     }
     if let Some(enabled) = use_dc_opf_warm_start {
         runtime = runtime.with_dc_opf_warm_start(enabled);
@@ -349,9 +403,12 @@ fn solve_ac_opf_impl(
     nlp_solver: Option<&str>,
     print_level: i32,
     enforce_thermal_limits: bool,
+    thermal_limit_slack_penalty_per_mva: f64,
     min_rate_a: f64,
     enforce_angle_limits: bool,
     warm_start: Option<&OpfSolution>,
+    warm_start_vm_pu: Option<Vec<f64>>,
+    warm_start_va_rad: Option<Vec<f64>>,
     use_dc_opf_warm_start: Option<bool>,
     optimize_switched_shunts: bool,
     optimize_taps: bool,
@@ -375,15 +432,19 @@ fn solve_ac_opf_impl(
     }
     network.validate()?;
     let (opts, runtime) = build_ac_opf_request(
+        network.inner.as_ref(),
         tolerance,
         max_iterations,
         exact_hessian,
         nlp_solver,
         print_level,
         enforce_thermal_limits,
+        thermal_limit_slack_penalty_per_mva,
         min_rate_a,
         enforce_angle_limits,
         warm_start,
+        warm_start_vm_pu,
+        warm_start_va_rad,
         use_dc_opf_warm_start,
         optimize_switched_shunts,
         optimize_taps,
@@ -426,8 +487,11 @@ fn solve_ac_opf_impl(
 /// Solve AC Optimal Power Flow with HVDC result reporting.
 #[pyfunction]
 #[pyo3(signature = (network, tolerance=1e-8, max_iterations=0, exact_hessian=true, nlp_solver=None,
-                    print_level=0, enforce_thermal_limits=true, min_rate_a=1.0,
-                    enforce_angle_limits=false, warm_start=None, use_dc_opf_warm_start=None,
+                    print_level=0, enforce_thermal_limits=true,
+                    thermal_limit_slack_penalty_per_mva=0.0, min_rate_a=1.0,
+                    enforce_angle_limits=false, warm_start=None,
+                    warm_start_vm_pu=None, warm_start_va_rad=None,
+                    use_dc_opf_warm_start=None,
                     optimize_switched_shunts=false, optimize_taps=false,
                     optimize_phase_shifters=false, include_hvdc=None,
                     enforce_capability_curves=true, discrete_mode="continuous",
@@ -444,9 +508,12 @@ pub fn solve_ac_opf(
     nlp_solver: Option<&str>,
     print_level: i32,
     enforce_thermal_limits: bool,
+    thermal_limit_slack_penalty_per_mva: f64,
     min_rate_a: f64,
     enforce_angle_limits: bool,
     warm_start: Option<&OpfSolution>,
+    warm_start_vm_pu: Option<Vec<f64>>,
+    warm_start_va_rad: Option<Vec<f64>>,
     use_dc_opf_warm_start: Option<bool>,
     optimize_switched_shunts: bool,
     optimize_taps: bool,
@@ -472,9 +539,12 @@ pub fn solve_ac_opf(
         nlp_solver,
         print_level,
         enforce_thermal_limits,
+        thermal_limit_slack_penalty_per_mva,
         min_rate_a,
         enforce_angle_limits,
         warm_start,
+        warm_start_vm_pu,
+        warm_start_va_rad,
         use_dc_opf_warm_start,
         optimize_switched_shunts,
         optimize_taps,
@@ -491,6 +561,200 @@ pub fn solve_ac_opf(
         screening_fallback_enabled,
         storage_soc_override,
     )
+}
+
+// ── SCED-AC Benders subproblem ───────────────────────────────────────────────
+
+/// Solve an AC Optimal Power Flow with the active-power dispatch of selected
+/// generators **fixed** to caller-supplied target values, and return the
+/// structured result required for a SCED-AC Benders master cut.
+///
+/// This is the AC subproblem half of the SCED-AC Benders decomposition: the
+/// master is a DC SCED LP augmented with an epigraph variable ``η[t]`` and
+/// accumulating linear cuts, and the subproblem is this function which
+/// supplies fresh cuts of the form
+///
+///     η[t] ≥ slack_cost(P̃g) + Σ_g λ_g · (Pg[g,t] − P̃g_g)
+///
+/// where ``P̃g`` is the master's current dispatch proposal and ``λ_g`` is
+/// ``slack_marginal_by_id[g]``.
+///
+/// Args:
+///     network:             Power system network with generator cost curves.
+///     fixed_p_mw:          Map keyed by **generator resource_id (string)**,
+///                          giving the MW dispatch at which each generator
+///                          should be pinned. Out-of-service generators are
+///                          silently skipped. Targets outside a generator's
+///                          ``[pmin, pmax]`` envelope are clipped to the
+///                          envelope before the NLP sees them.
+///     tolerance:           NLP convergence tolerance (default 1e-8).
+///     max_iterations:      NLP max iterations (default 0 = backend default).
+///     nlp_solver:          NLP backend ("ipopt", "copt", "gurobi", or None
+///                          for the default runtime).
+///     print_level:         NLP print level (default 0).
+///     enforce_thermal_limits:     Enforce branch thermal limits.
+///     thermal_limit_slack_penalty_per_mva: Slack penalty coefficient. When
+///         this is > 0 (default 1e4 for Benders), the AC OPF can absorb
+///         thermal overloads into a slack variable priced at this rate,
+///         which keeps the subproblem feasible even when the DC dispatch
+///         proposes a schedule the AC network cannot physically deliver.
+///     bus_active_power_balance_slack_penalty_per_mw:
+///         Bus-balance P slack penalty ($/MW). Default 1e4 gives the
+///         subproblem a graceful fallback when the master proposes an
+///         infeasible dispatch.
+///     bus_reactive_power_balance_slack_penalty_per_mvar:
+///         Bus-balance Q slack penalty ($/MVAr). Default 1e4.
+///     enforce_angle_limits:       Enforce branch angle limits.
+///     enforce_capability_curves:  Enforce Q capability curves.
+///     include_hvdc:        HVDC policy (None = auto).
+///     dt_hours:            Period length in hours (default 1.0).
+///
+/// Returns:
+///     AcOpfBendersSubproblemResult with:
+///       - ``opf``                         — full AC-OPF solution at the fix,
+///       - ``slack_cost_dollars_per_hour`` — aggregate soft-penalty cost,
+///       - ``slack_marginal_by_id``        — per-gen Benders cut coefficients.
+#[pyfunction]
+#[pyo3(signature = (network, fixed_p_mw, tolerance=1e-8, max_iterations=0,
+                    exact_hessian=true, nlp_solver=None, print_level=0,
+                    enforce_thermal_limits=true,
+                    thermal_limit_slack_penalty_per_mva=1.0e4,
+                    bus_active_power_balance_slack_penalty_per_mw=1.0e4,
+                    bus_reactive_power_balance_slack_penalty_per_mvar=1.0e4,
+                    min_rate_a=1.0,
+                    enforce_angle_limits=false,
+                    enforce_capability_curves=true,
+                    include_hvdc=None, dt_hours=1.0))]
+#[allow(clippy::too_many_arguments)]
+pub fn solve_ac_opf_subproblem(
+    py: Python<'_>,
+    network: &Network,
+    fixed_p_mw: std::collections::HashMap<String, f64>,
+    tolerance: f64,
+    max_iterations: u32,
+    exact_hessian: bool,
+    nlp_solver: Option<&str>,
+    print_level: i32,
+    enforce_thermal_limits: bool,
+    thermal_limit_slack_penalty_per_mva: f64,
+    bus_active_power_balance_slack_penalty_per_mw: f64,
+    bus_reactive_power_balance_slack_penalty_per_mvar: f64,
+    min_rate_a: f64,
+    enforce_angle_limits: bool,
+    enforce_capability_curves: bool,
+    include_hvdc: Option<bool>,
+    dt_hours: f64,
+) -> PyResult<AcOpfBendersSubproblemResult> {
+    if !tolerance.is_finite() || tolerance <= 0.0 {
+        return Err(PyValueError::new_err(format!(
+            "tolerance must be a finite positive number, got {tolerance}"
+        )));
+    }
+    network.validate()?;
+
+    // Translate the resource_id → MW map into the global-index map that
+    // `solve_ac_opf_subproblem` expects. We rely on `network.inner.generators`
+    // being index-stable within a single solve call.
+    let mut id_to_global: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::with_capacity(network.inner.generators.len());
+    for (i, g) in network.inner.generators.iter().enumerate() {
+        id_to_global.insert(g.id.as_str(), i);
+    }
+    let mut fixed_by_index: std::collections::HashMap<usize, f64> =
+        std::collections::HashMap::with_capacity(fixed_p_mw.len());
+    for (resource_id, p_mw) in fixed_p_mw.iter() {
+        if !p_mw.is_finite() {
+            return Err(PyValueError::new_err(format!(
+                "fixed_p_mw[{resource_id}] is not finite: {p_mw}"
+            )));
+        }
+        match id_to_global.get(resource_id.as_str()) {
+            Some(&gi) => {
+                fixed_by_index.insert(gi, *p_mw);
+            }
+            None => {
+                return Err(PyValueError::new_err(format!(
+                    "fixed_p_mw key '{resource_id}' does not match any generator id in the network"
+                )));
+            }
+        }
+    }
+
+    let (mut opts, runtime) = build_ac_opf_request(
+        network.inner.as_ref(),
+        tolerance,
+        max_iterations,
+        exact_hessian,
+        nlp_solver,
+        print_level,
+        enforce_thermal_limits,
+        thermal_limit_slack_penalty_per_mva,
+        min_rate_a,
+        enforce_angle_limits,
+        /* warm_start */ None,
+        /* warm_start_vm_pu */ None,
+        /* warm_start_va_rad */ None,
+        /* use_dc_opf_warm_start */ None,
+        /* optimize_switched_shunts */ false,
+        /* optimize_taps */ false,
+        /* optimize_phase_shifters */ false,
+        include_hvdc,
+        enforce_capability_curves,
+        "continuous",
+        /* optimize_svc */ false,
+        /* optimize_tcsc */ false,
+        dt_hours,
+        /* enforce_flowgates */ false,
+        /* constraint_screening_threshold */ None,
+        /* constraint_screening_min_buses */ 1000,
+        /* screening_fallback_enabled */ false,
+        /* storage_soc_override */ None,
+    )?;
+    // `build_ac_opf_request` hard-codes both bus-balance slack penalties to
+    // zero, which makes the AC OPF infeasible whenever the master's fixed
+    // Pg proposal violates Kirchhoff's Q law (common on the first iteration
+    // of a Benders loop). Override them here so the subproblem is always
+    // feasible and the slack cost captures the infeasibility magnitude.
+    opts.bus_active_power_balance_slack_penalty_per_mw =
+        bus_active_power_balance_slack_penalty_per_mw;
+    opts.bus_reactive_power_balance_slack_penalty_per_mvar =
+        bus_reactive_power_balance_slack_penalty_per_mvar;
+
+    let net = Arc::clone(&network.inner);
+    let subproblem = py
+        .detach(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                surge_opf::ac::solve_ac_opf_subproblem(&net, &opts, &runtime, &fixed_by_index)
+            }))
+            .map_err(|e| {
+                surge_opf::ac::types::AcOpfError::SolverError(format!(
+                    "solve_ac_opf_subproblem failed: {}",
+                    extract_panic_msg(e)
+                ))
+            })
+            .and_then(|r| r)
+        })
+        .map_err(|e| to_ac_opf_pyerr(&e))?;
+
+    // Re-key the marginal map from global index → resource id so Python users
+    // can correlate against their own resource tables without touching the
+    // network generator vector.
+    let mut slack_marginal_by_id: std::collections::HashMap<String, f64> =
+        std::collections::HashMap::with_capacity(
+            subproblem.slack_marginal_dollars_per_mw_per_hour.len(),
+        );
+    for (gi, marginal) in subproblem.slack_marginal_dollars_per_mw_per_hour.iter() {
+        if let Some(generator) = network.inner.generators.get(*gi) {
+            slack_marginal_by_id.insert(generator.id.clone(), *marginal);
+        }
+    }
+
+    Ok(AcOpfBendersSubproblemResult {
+        opf: OpfSolution::from_core(subproblem.solution, Arc::clone(&network.inner)),
+        slack_cost_dollars_per_hour: subproblem.slack_cost_dollars_per_hour,
+        slack_marginal_by_id,
+        converged: subproblem.converged,
+    })
 }
 
 // ── SCOPF ─────────────────────────────────────────────────────────────────────

@@ -1,0 +1,249 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "go_c3_event4_73_d1_303_sw0",
+      "description": "73-bus D1 SW0 public GO C3 case. Non-uniform full horizon plus interval-0 derivative.",
+      "dataset": "event4_73",
+      "division": "D1",
+      "network_model": "C3E4N00073D1",
+      "scenario_id": 303,
+      "switching_mode": "SW0",
+      "variants": [
+        "full",
+        "t00"
+      ],
+      "tier": "core",
+      "track_examples": true,
+      "notes": "Core non-uniform horizon parent."
+    },
+    {
+      "name": "go_c3_event4_73_d2_911_sw0",
+      "description": "73-bus D2 SW0 public GO C3 case. Feature-rich pilot with HVDC, reserves, and contingencies.",
+      "dataset": "event4_73",
+      "division": "D2",
+      "network_model": "C3E4N00073D2",
+      "scenario_id": 911,
+      "switching_mode": "SW0",
+      "variants": [
+        "full",
+        "t00"
+      ],
+      "tier": "core",
+      "track_examples": true,
+      "notes": "Primary interval-0 replay and validator-parity pilot."
+    },
+    {
+      "name": "go_c3_event4_73_d3_303_sw0",
+      "description": "73-bus D3 SW0 public GO C3 case. Uniform 42-period parent plus interval-0 derivative.",
+      "dataset": "event4_73",
+      "division": "D3",
+      "network_model": "C3E4N00073D3",
+      "scenario_id": 303,
+      "switching_mode": "SW0",
+      "variants": [
+        "full",
+        "t00"
+      ],
+      "tier": "core",
+      "track_examples": true,
+      "notes": "Core long-horizon uniform parent."
+    },
+    {
+      "name": "go_c3_event4_73_d1_315_sw0",
+      "description": "73-bus D1 SW0 public GO C3 case. High demand, low renewables; 18-period non-uniform horizon.",
+      "dataset": "event4_73",
+      "division": "D1",
+      "network_model": "C3E4N00073D1",
+      "scenario_id": 315,
+      "switching_mode": "SW0",
+      "variants": [
+        "full"
+      ],
+      "tier": "core",
+      "track_examples": true,
+      "notes": "HIGH demand + ren1 (scarce renewables) - contingency-binding stress case."
+    },
+    {
+      "name": "go_c3_event4_73_d1_345_sw0",
+      "description": "73-bus D1 SW0 public GO C3 case. Balanced demand and renewables; 18-period non-uniform horizon.",
+      "dataset": "event4_73",
+      "division": "D1",
+      "network_model": "C3E4N00073D1",
+      "scenario_id": 345,
+      "switching_mode": "SW0",
+      "variants": [
+        "full"
+      ],
+      "tier": "core",
+      "track_examples": true,
+      "notes": "MED demand + ren3 - realistic operating point with both commitment and dispatch churn."
+    },
+    {
+      "name": "go_c3_event4_73_d1_357_sw0",
+      "description": "73-bus D1 SW0 public GO C3 case. Low demand, high renewables; 18-period non-uniform horizon.",
+      "dataset": "event4_73",
+      "division": "D1",
+      "network_model": "C3E4N00073D1",
+      "scenario_id": 357,
+      "switching_mode": "SW0",
+      "variants": [
+        "full"
+      ],
+      "tier": "core",
+      "track_examples": true,
+      "notes": "LOW demand + ren4 (~2.3x gen-to-load ratio) - curtailment and export regime."
+    },
+    {
+      "name": "go_c3_event4_73_d1_369_sw0",
+      "description": "73-bus D1 SW0 public GO C3 case. High demand, high renewables; 18-period non-uniform horizon.",
+      "dataset": "event4_73",
+      "division": "D1",
+      "network_model": "C3E4N00073D1",
+      "scenario_id": 369,
+      "switching_mode": "SW0",
+      "variants": [
+        "full"
+      ],
+      "tier": "core",
+      "track_examples": true,
+      "notes": "HIGH demand + ren4 - richest optimization regime (contingency and energy arbitrage both active)."
+    },
+    {
+      "name": "go_c3_event4_73_d2_309_sw0",
+      "description": "73-bus D2 SW0 public GO C3 case. Day-ahead 48-period horizon, medium demand and low renewables.",
+      "dataset": "event4_73",
+      "division": "D2",
+      "network_model": "C3E4N00073D2",
+      "scenario_id": 309,
+      "switching_mode": "SW0",
+      "variants": [
+        "full"
+      ],
+      "tier": "core",
+      "track_examples": true,
+      "notes": "MED demand + ren1 - day-ahead time-coupled SCUC example (48 periods)."
+    },
+    {
+      "name": "go_c3_event4_617_d1_921_sw0",
+      "description": "617-bus D1 SW0 medium-scale GO C3 case using the true 617-bus scenario_921 parent.",
+      "dataset": "event4_617",
+      "division": "D1",
+      "network_model": "C3E4N00617D1",
+      "scenario_id": 921,
+      "switching_mode": "SW0",
+      "variants": [
+        "full",
+        "t00"
+      ],
+      "tier": "medium",
+      "track_examples": true,
+      "notes": "Tracked medium-scale native GO C3 example; avoids the mixed-archive 73-bus D2 scenario_921."
+    },
+    {
+      "name": "go_c3_event4_1576_d1_003_sw0",
+      "description": "1576-bus D1 SW0 medium-scale GO C3 case with HVDC.",
+      "dataset": "event4_1576",
+      "division": "D1",
+      "network_model": "C3E4N01576D1",
+      "scenario_id": 3,
+      "switching_mode": "SW0",
+      "variants": [
+        "full",
+        "t00"
+      ],
+      "tier": "medium",
+      "track_examples": false
+    },
+    {
+      "name": "go_c3_event4_2000_d1_003_sw0",
+      "description": "2000-bus D1 SW0 medium-scale GO C3 case with dense contingency set.",
+      "dataset": "event4_2000",
+      "division": "D1",
+      "network_model": "C3E4N02000D1",
+      "scenario_id": 3,
+      "switching_mode": "SW0",
+      "variants": [
+        "full",
+        "t00"
+      ],
+      "tier": "medium",
+      "track_examples": false
+    },
+    {
+      "name": "go_c3_event4_4224_d1_002_sw0",
+      "description": "4224-bus D1 SW0 large GO C3 case for manual or scheduled packaging.",
+      "dataset": "event4_4224",
+      "division": "D1",
+      "network_model": "C3E4N04224D1",
+      "scenario_id": 2,
+      "switching_mode": "SW0",
+      "variants": [
+        "full",
+        "t00"
+      ],
+      "tier": "large",
+      "track_examples": false
+    },
+    {
+      "name": "go_c3_event4_6049_d1_003_sw0",
+      "description": "6049-bus D1 SW0 large GO C3 case for manual or scheduled packaging.",
+      "dataset": "event4_6049",
+      "division": "D1",
+      "network_model": "C3E4N06049D1",
+      "scenario_id": 3,
+      "switching_mode": "SW0",
+      "variants": [
+        "full",
+        "t00"
+      ],
+      "tier": "large",
+      "track_examples": false
+    },
+    {
+      "name": "go_c3_event4_6717_d1_038_sw0",
+      "description": "6717-bus D1 SW0 large GO C3 case for manual or scheduled packaging.",
+      "dataset": "event4_6717",
+      "division": "D1",
+      "network_model": "C3E4N06717D1",
+      "scenario_id": 38,
+      "switching_mode": "SW0",
+      "variants": [
+        "full",
+        "t00"
+      ],
+      "tier": "large",
+      "track_examples": false
+    },
+    {
+      "name": "go_c3_event4_8316_d2_103_sw0",
+      "description": "8316-bus D2 SW0 xlarge GO C3 case for manual packaging.",
+      "dataset": "event4_8316_d2",
+      "division": "D2",
+      "network_model": "C3E4N08316D2",
+      "scenario_id": 103,
+      "switching_mode": "SW0",
+      "variants": [
+        "full",
+        "t00"
+      ],
+      "tier": "xlarge_manual",
+      "track_examples": false
+    },
+    {
+      "name": "go_c3_event4_23643_d1_003_sw0",
+      "description": "23643-bus D1 SW0 xlarge GO C3 case for manual packaging.",
+      "dataset": "event4_23643",
+      "division": "D1",
+      "network_model": "C3E4N23643D1",
+      "scenario_id": 3,
+      "switching_mode": "SW0",
+      "variants": [
+        "full",
+        "t00"
+      ],
+      "tier": "xlarge_manual",
+      "track_examples": false
+    }
+  ]
+}

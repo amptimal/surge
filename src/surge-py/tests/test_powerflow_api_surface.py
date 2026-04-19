@@ -12,14 +12,15 @@ TEST_DATA = Path(__file__).resolve().parent / "data" / "profiles"
 
 def test_powerflow_namespace_is_canonical():
     assert hasattr(surge, "powerflow")
+    assert hasattr(surge, "dispatch")
     assert hasattr(surge, "io")
     assert hasattr(surge.io, "profiles")
     assert not hasattr(surge, "solve_timeseries")
     assert not hasattr(surge, "solve_fdpf")
     assert not hasattr(surge, "plot")
     assert hasattr(surge.powerflow, "solve_fdpf")
-    assert not hasattr(surge, "solve_dispatch")
-    assert not hasattr(surge, "dispatch")
+    assert hasattr(surge, "solve_dispatch")
+    assert hasattr(surge.dispatch, "solve_dispatch")
     assert not hasattr(surge.powerflow, "replay_dispatch")
 
 
@@ -35,6 +36,13 @@ def test_powerflow_solver_surface():
     assert dc.solve_time_secs > 0
     assert ac.converged
     assert fdpf.converged
+
+
+def test_ac_pf_options_defaults_match_runtime_surface():
+    opts = surge.AcPfOptions()
+
+    assert opts.distributed_slack is True
+    assert opts.startup_policy == "adaptive"
 
 
 def test_profile_io_csv_readers():

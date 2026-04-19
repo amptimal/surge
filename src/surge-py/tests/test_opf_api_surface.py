@@ -66,6 +66,32 @@ def test_ac_opf_exposes_feasible_for_surface_symmetry():
     assert result.feasible is True
 
 
+def test_ac_opf_accepts_thermal_limit_slack_penalty_option():
+    net = surge.load(CASE9)
+    result = surge.solve_ac_opf(
+        net,
+        options=surge.AcOpfOptions(thermal_limit_slack_penalty_per_mva=1.0),
+    )
+
+    assert result.feasible is True
+
+
+def test_ac_opf_runtime_accepts_explicit_bus_voltage_warm_start():
+    net = surge.load(CASE9)
+    vm = [bus.vm_pu for bus in net.buses]
+    va = [bus.va_deg * 3.141592653589793 / 180.0 for bus in net.buses]
+
+    runtime = surge.AcOpfRuntime(warm_start_vm_pu=vm, warm_start_va_rad=va)
+    kwargs = runtime.to_native_kwargs(net)
+
+    assert kwargs["warm_start_vm_pu"] == vm
+    assert kwargs["warm_start_va_rad"] == va
+
+    result = surge.solve_ac_opf(net, runtime=runtime)
+
+    assert result.feasible is True
+
+
 def test_batch_violations_reads_branch_loading_property():
     net = surge.load(CASE9)
     results = surge.batch.batch_solve([net], solver="acpf", parallel=False)

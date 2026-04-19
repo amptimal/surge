@@ -11,7 +11,41 @@ use surge_ac::matrix::ybus::YBus;
 use surge_network::Network;
 
 use super::mapping::AcOpfMapping;
-use super::types::{BranchAdmittance, WarmStart};
+use super::types::{BranchAdmittance, WarmStart, branch_flow_from, branch_flow_to};
+
+fn re_reference_warm_start_angles(
+    network: &Network,
+    mapping: &AcOpfMapping,
+    angles_rad: &[f64],
+) -> Vec<f64> {
+    let mut referenced_angles: Vec<f64> = network
+        .buses
+        .iter()
+        .enumerate()
+        .map(|(bus_idx, bus)| {
+            angles_rad
+                .get(bus_idx)
+                .copied()
+                .unwrap_or(bus.voltage_angle_rad)
+        })
+        .collect();
+
+    let reference_bus_idx = (0..mapping.n_bus)
+        .find(|&bus_idx| {
+            mapping.va_var(bus_idx).is_none()
+                && network.buses[bus_idx].bus_type == surge_network::network::BusType::Slack
+        })
+        .or_else(|| (0..mapping.n_bus).find(|&bus_idx| mapping.va_var(bus_idx).is_none()));
+    let Some(reference_bus_idx) = reference_bus_idx else {
+        return referenced_angles;
+    };
+
+    let reference_angle_rad = referenced_angles[reference_bus_idx];
+    for angle_rad in &mut referenced_angles {
+        *angle_rad -= reference_angle_rad;
+    }
+    referenced_angles
+}
 
 // ---------------------------------------------------------------------------
 // Jacobian sparsity structure
@@ -24,6 +58,7 @@ pub(super) fn build_jacobian_sparsity(
     bus_map: &HashMap<u32, usize>,
     branch_admittances: &[BranchAdmittance],
     hvdc: Option<&super::hvdc::HvdcNlpData>,
+    hvdc_p2p: Option<&super::hvdc::HvdcP2PNlpData>,
 ) -> (Vec<i32>, Vec<i32>) {
     let m = mapping;
     let mut rows = Vec::new();
@@ -67,6 +102,12 @@ pub(super) fn build_jacobian_sparsity(
             rows.push(row);
             cols.push(m.pg_var(lj) as i32);
         }
+        if m.has_p_bus_balance_slacks() {
+            rows.push(row);
+            cols.push(m.p_balance_slack_pos_var(i) as i32);
+            rows.push(row);
+            cols.push(m.p_balance_slack_neg_var(i) as i32);
+        }
     }
 
     // --- Q-balance rows (n_bus..2*n_bus) ---
@@ -107,6 +148,12 @@ pub(super) fn build_jacobian_sparsity(
             rows.push(row);
             cols.push(m.qg_var(lj) as i32);
         }
+        if m.has_q_bus_balance_slacks() {
+            rows.push(row);
+            cols.push(m.q_balance_slack_pos_var(i) as i32);
+            rows.push(row);
+            cols.push(m.q_balance_slack_neg_var(i) as i32);
+        }
     }
 
     // --- Branch flow rows (from-side): rows 2*n_bus.. ---
@@ -125,6 +172,10 @@ pub(super) fn build_jacobian_sparsity(
         cols.push(m.vm_var(ba.from) as i32);
         rows.push(row);
         cols.push(m.vm_var(ba.to) as i32);
+        if m.has_thermal_limit_slacks() {
+            rows.push(row);
+            cols.push(m.thermal_slack_from_var(ci) as i32);
+        }
     }
 
     // --- Branch flow rows (to-side): rows 2*n_bus + n_br.. ---
@@ -143,6 +194,10 @@ pub(super) fn build_jacobian_sparsity(
         cols.push(m.vm_var(ba.from) as i32);
         rows.push(row);
         cols.push(m.vm_var(ba.to) as i32);
+        if m.has_thermal_limit_slacks() {
+            rows.push(row);
+            cols.push(m.thermal_slack_to_var(ci) as i32);
+        }
     }
 
     // --- Angle difference constraint rows: rows 2*n_bus + 2*n_br.. ---
@@ -342,6 +397,25 @@ pub(super) fn build_jacobian_sparsity(
         }
     }
 
+    // --- HVDC point-to-point P Jacobian sparsity (lossless path) ---
+    //
+    // Each link contributes two entries:
+    //   dP[from_bus]/dPg_hvdc[k] = +1   (withdrawal at the from-terminal)
+    //   dP[to_bus]/dPg_hvdc[k]   = -1   (injection at the to-terminal)
+    //
+    // Order matters: `eval_jacobian` must emit values in the exact same
+    // order these entries are pushed here. We walk links in `k` order and
+    // emit `(from, to)` pairs consistently.
+    if let Some(p2p) = hvdc_p2p {
+        for k in 0..p2p.links.len() {
+            let col = m.hvdc_p2p_var(k) as i32;
+            rows.push(m.hvdc_p2p_from_bus_idx[k] as i32);
+            cols.push(col);
+            rows.push(m.hvdc_p2p_to_bus_idx[k] as i32);
+            cols.push(col);
+        }
+    }
+
     // --- Storage Jacobian: dP[bus_s]/d_dis[s] = -1, dP[bus_s]/d_ch[s] = +1 ---
     // Both dis[s] and ch[s] appear linearly in P-balance row bus_s only.
     for s in 0..m.n_sto {
@@ -350,6 +424,21 @@ pub(super) fn build_jacobian_sparsity(
         cols.push(m.discharge_var(s) as i32);
         rows.push(bus as i32);
         cols.push(m.charge_var(s) as i32);
+    }
+
+    // --- Dispatchable-load Jacobian ---
+    for k in 0..m.n_dl {
+        let bus = m.dispatchable_load_bus_idx[k];
+        rows.push(bus as i32);
+        cols.push(m.dl_var(k) as i32);
+        rows.push((m.n_bus + bus) as i32);
+        cols.push(m.dl_q_var(k) as i32);
+        if let Some(row) = m.dispatchable_load_pf_rows[k] {
+            rows.push(row as i32);
+            cols.push(m.dl_var(k) as i32);
+            rows.push(row as i32);
+            cols.push(m.dl_q_var(k) as i32);
+        }
     }
 
     (rows, cols)
@@ -366,6 +455,7 @@ pub(super) fn build_hessian_sparsity(
     ybus: &YBus,
     branch_admittances: &[BranchAdmittance],
     hvdc: Option<&super::hvdc::HvdcNlpData>,
+    hvdc_p2p: Option<&super::hvdc::HvdcP2PNlpData>,
 ) -> (Vec<i32>, Vec<i32>, HashMap<(usize, usize), usize>) {
     let m = mapping;
     let nnz_ybus: usize = (0..m.n_bus).map(|i| ybus.row(i).col_idx.len()).sum();
@@ -441,6 +531,13 @@ pub(super) fn build_hessian_sparsity(
                     add_entry(vmi, a);
                 }
             }
+        }
+    }
+
+    if m.has_thermal_limit_slacks() {
+        for ci in 0..branch_admittances.len() {
+            add_entry(m.thermal_slack_from_var(ci), m.thermal_slack_from_var(ci));
+            add_entry(m.thermal_slack_to_var(ci), m.thermal_slack_to_var(ci));
         }
     }
 
@@ -589,6 +686,23 @@ pub(super) fn build_hessian_sparsity(
                 }
             }
         }
+
+        // HVDC point-to-point Hessian entries: the split-loss bus
+        // balance contribution `g[from] += Pg + 0.5*c*Pg²` and
+        // `g[to] += -Pg + 0.5*c*Pg²` has a nonzero second derivative
+        // `d²/dPg² = c_pu` on each constraint row. The Lagrangian
+        // Hessian contribution at `(hvdc_var, hvdc_var)` is
+        // `c_pu * (λ_from + λ_to)`. Only add the diagonal entry when
+        // at least one link is lossy (`c_pu > 0`); lossless links
+        // contribute nothing.
+        if let Some(p2p) = hvdc_p2p {
+            for (k, link) in p2p.links.iter().enumerate() {
+                if link.loss_c_pu.abs() > 1e-20 {
+                    let v = m.hvdc_p2p_var(k);
+                    add_entry(v, v);
+                }
+            }
+        }
     }
 
     (rows, cols, index_map)
@@ -601,9 +715,13 @@ pub(super) fn build_hessian_sparsity(
 pub(super) fn build_initial_point(
     network: &Network,
     mapping: &AcOpfMapping,
+    branch_admittances: &[BranchAdmittance],
+    regulated_bus_vm_targets: &[Option<f64>],
+    enforce_regulated_bus_vm_targets: bool,
     warm_start: Option<&WarmStart>,
     dc_opf_angles: Option<&[f64]>,
     hvdc: Option<&super::hvdc::HvdcNlpData>,
+    hvdc_p2p: Option<&super::hvdc::HvdcP2PNlpData>,
 ) -> Vec<f64> {
     let m = mapping;
     let base = network.base_mva;
@@ -611,37 +729,83 @@ pub(super) fn build_initial_point(
 
     if let Some(prior) = warm_start {
         // Warm-start: initialise from a prior AC operating point.
+        let prior_voltage_angles_rad =
+            re_reference_warm_start_angles(network, mapping, &prior.voltage_angle_rad);
+
         // Va for non-slack buses
+        #[allow(clippy::needless_range_loop)]
         for i in 0..m.n_bus {
-            if let Some(idx) = m.va_var(i).filter(|_| i < prior.voltage_angle_rad.len()) {
-                x0[idx] = prior.voltage_angle_rad[i];
+            if let Some(idx) = m.va_var(i) {
+                x0[idx] = prior_voltage_angles_rad[i];
             }
         }
         // Vm for all buses
         for i in 0..m.n_bus {
-            if i < prior.voltage_magnitude_pu.len() {
-                x0[m.vm_var(i)] = prior.voltage_magnitude_pu[i];
+            let vm_seed = if i < prior.voltage_magnitude_pu.len() {
+                prior.voltage_magnitude_pu[i]
             } else {
-                x0[m.vm_var(i)] = 1.0;
-            }
+                1.0
+            };
+            let bus = &network.buses[i];
+            let regulated_target = regulated_bus_vm_targets.get(i).copied().flatten();
+            let vm_init = if enforce_regulated_bus_vm_targets {
+                if let Some(target_vm) = regulated_target {
+                    vm_seed.clamp(target_vm, target_vm)
+                } else {
+                    vm_seed.clamp(bus.voltage_min_pu, bus.voltage_max_pu)
+                }
+            } else {
+                vm_seed.clamp(bus.voltage_min_pu, bus.voltage_max_pu)
+            };
+            x0[m.vm_var(i)] = vm_init;
         }
         // Pg from prior dispatch, clamped to bounds
         for (j, &gi) in m.gen_indices.iter().enumerate() {
             let g = &network.generators[gi];
-            if j < prior.pg.len() {
-                let pg_pu = prior.pg[j].clamp(g.pmin / base, g.pmax / base);
-                x0[m.pg_var(j)] = pg_pu;
-            }
+            let pg_seed_pu = if j < prior.pg.len() {
+                prior.pg[j]
+            } else {
+                g.p / base
+            };
+            let pg_pu = if g.is_storage() {
+                0.0
+            } else {
+                pg_seed_pu.clamp(g.pmin / base, g.pmax / base)
+            };
+            x0[m.pg_var(j)] = pg_pu;
         }
         // Qg from prior dispatch, clamped to bounds
         for (j, &gi) in m.gen_indices.iter().enumerate() {
             let g = &network.generators[gi];
-            if j < prior.qg.len() {
-                let qmin = if g.qmin.abs() > 1e10 { -9999.0 } else { g.qmin };
-                let qmax = if g.qmax.abs() > 1e10 { 9999.0 } else { g.qmax };
-                let qg_pu = prior.qg[j].clamp(qmin / base, qmax / base);
-                x0[m.qg_var(j)] = qg_pu;
-            }
+            let qmin = if g.qmin.abs() > 1e10 { -9999.0 } else { g.qmin };
+            let qmax = if g.qmax.abs() > 1e10 { 9999.0 } else { g.qmax };
+            let qg_seed_pu = if j < prior.qg.len() {
+                prior.qg[j]
+            } else {
+                g.q / base
+            };
+            let qg_pu = qg_seed_pu.clamp(qmin / base, qmax / base);
+            x0[m.qg_var(j)] = qg_pu;
+        }
+        for (k, dl) in network
+            .market_data
+            .dispatchable_loads
+            .iter()
+            .filter(|dl| dl.in_service)
+            .enumerate()
+        {
+            let p_seed_pu = prior
+                .dispatchable_load_p
+                .get(k)
+                .copied()
+                .unwrap_or(dl.p_sched_pu);
+            let q_seed_pu = prior
+                .dispatchable_load_q
+                .get(k)
+                .copied()
+                .unwrap_or(dl.q_sched_pu);
+            x0[m.dl_var(k)] = p_seed_pu.clamp(dl.p_min_pu, dl.p_max_pu);
+            x0[m.dl_q_var(k)] = q_seed_pu.clamp(dl.q_min_pu, dl.q_max_pu);
         }
     } else {
         // Default: DC warm-start for angles, case data for Vm/Pg/Qg.
@@ -685,13 +849,29 @@ pub(super) fn build_initial_point(
             }
         }
         for i in 0..m.n_bus {
-            x0[m.vm_var(i)] = vm_init[i];
+            let bus = &network.buses[i];
+            let value = vm_init[i];
+            let regulated_target = regulated_bus_vm_targets.get(i).copied().flatten();
+            let vm_bounded = if enforce_regulated_bus_vm_targets {
+                if let Some(target_vm) = regulated_target {
+                    value.clamp(target_vm, target_vm)
+                } else {
+                    value.clamp(bus.voltage_min_pu, bus.voltage_max_pu)
+                }
+            } else {
+                value.clamp(bus.voltage_min_pu, bus.voltage_max_pu)
+            };
+            x0[m.vm_var(i)] = vm_bounded;
         }
 
         // Pg from case data, clamped to bounds
         for (j, &gi) in m.gen_indices.iter().enumerate() {
             let g = &network.generators[gi];
-            let pg_pu = (g.p / base).clamp(g.pmin / base, g.pmax / base);
+            let pg_pu = if g.is_storage() {
+                0.0
+            } else {
+                (g.p / base).clamp(g.pmin / base, g.pmax / base)
+            };
             x0[m.pg_var(j)] = pg_pu;
         }
 
@@ -776,5 +956,311 @@ pub(super) fn build_initial_point(
         }
     }
 
+    // HVDC point-to-point initial values (seeded from `p_warm_start_pu`
+    // which the builder clamped to `[p_min_pu, p_max_pu]` at construction
+    // time). The warm start source is `scheduled_setpoint` on each link,
+    // which in turn is populated from the DC SCED target before the AC
+    // OPF call.
+    if let Some(p2p) = hvdc_p2p {
+        for (k, link) in p2p.links.iter().enumerate() {
+            x0[m.hvdc_p2p_var(k)] = link.p_warm_start_pu;
+        }
+    }
+
+    if warm_start.is_none() {
+        for (k, dl) in network
+            .market_data
+            .dispatchable_loads
+            .iter()
+            .filter(|dl| dl.in_service)
+            .enumerate()
+        {
+            x0[m.dl_var(k)] = dl.p_sched_pu.clamp(dl.p_min_pu, dl.p_max_pu);
+            x0[m.dl_q_var(k)] = dl.q_sched_pu.clamp(dl.q_min_pu, dl.q_max_pu);
+        }
+    }
+
+    if m.has_p_bus_balance_slacks() {
+        for i in 0..m.n_bus {
+            x0[m.p_balance_slack_pos_var(i)] = 0.0;
+            x0[m.p_balance_slack_neg_var(i)] = 0.0;
+        }
+    }
+    if m.has_q_bus_balance_slacks() {
+        for i in 0..m.n_bus {
+            x0[m.q_balance_slack_pos_var(i)] = 0.0;
+            x0[m.q_balance_slack_neg_var(i)] = 0.0;
+        }
+    }
+    if m.has_thermal_limit_slacks() {
+        let (va, vm, _, _) = m.extract_voltages_and_dispatch(&x0);
+        let vm = vm.to_vec();
+        for (ci, ba) in branch_admittances.iter().enumerate() {
+            let (pf, qf) = branch_flow_from(ba, &vm, &va);
+            let overflow_from = (pf.hypot(qf) - ba.s_max_pu()).max(0.0);
+            x0[m.thermal_slack_from_var(ci)] = overflow_from;
+
+            let (pt, qt) = branch_flow_to(ba, &vm, &va);
+            let overflow_to = (pt.hypot(qt) - ba.s_max_pu()).max(0.0);
+            x0[m.thermal_slack_to_var(ci)] = overflow_to;
+        }
+    }
+
     x0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ac::mapping::AcOpfMapping;
+    use crate::common::context::OpfNetworkContext;
+    use surge_network::Network;
+    use surge_network::market::CostCurve;
+    use surge_network::network::{Branch, Bus, BusType, Generator, Load};
+
+    #[test]
+    fn build_initial_point_references_warm_start_angles_to_current_slack() {
+        let mut net = Network::new("warm-start-reference");
+        net.buses.push(Bus::new(1, BusType::PQ, 138.0));
+        net.buses.push(Bus::new(2, BusType::Slack, 138.0));
+        net.buses.push(Bus::new(3, BusType::PQ, 138.0));
+        net.branches.push(Branch::new_line(1, 2, 0.01, 0.1, 0.0));
+        net.branches.push(Branch::new_line(2, 3, 0.01, 0.1, 0.0));
+        net.loads.push(Load::new(1, 20.0, 5.0));
+        net.loads.push(Load::new(3, 25.0, 8.0));
+
+        let mut slack_gen = Generator::new(2, 50.0, 1.01);
+        slack_gen.pmax = 100.0;
+        slack_gen.qmin = -50.0;
+        slack_gen.qmax = 50.0;
+        slack_gen.cost = Some(CostCurve::Polynomial {
+            startup: 0.0,
+            shutdown: 0.0,
+            coeffs: vec![0.0, 1.0, 0.0],
+        });
+        net.generators.push(slack_gen);
+
+        let context = OpfNetworkContext::for_ac(&net).expect("AC context");
+        let mapping = AcOpfMapping::new(
+            &context,
+            vec![],
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .expect("mapping");
+
+        let warm_start = WarmStart {
+            voltage_magnitude_pu: vec![1.0, 1.01, 0.99],
+            voltage_angle_rad: vec![0.12, 0.27, -0.08],
+            pg: vec![0.5],
+            qg: vec![0.1],
+            dispatchable_load_p: vec![],
+            dispatchable_load_q: vec![],
+        };
+
+        let x0 = build_initial_point(
+            &net,
+            &mapping,
+            &[],
+            &[],
+            true,
+            Some(&warm_start),
+            None,
+            None,
+            None,
+        );
+        let bus1_va = x0[mapping.va_var(0).expect("bus 1 should have a Va variable")];
+        let bus3_va = x0[mapping.va_var(2).expect("bus 3 should have a Va variable")];
+
+        assert!((bus1_va - (0.12 - 0.27)).abs() <= 1e-12);
+        assert!((bus3_va - (-0.08 - 0.27)).abs() <= 1e-12);
+        assert!(
+            mapping.va_var(1).is_none(),
+            "slack bus should have no Va variable"
+        );
+    }
+
+    #[test]
+    fn build_initial_point_seeds_thermal_slacks_from_overload() {
+        let mut net = Network::new("thermal-slack-seed");
+        net.base_mva = 100.0;
+        net.buses.push(Bus::new(1, BusType::Slack, 138.0));
+        net.buses.push(Bus::new(2, BusType::PQ, 138.0));
+
+        let mut branch = Branch::new_line(1, 2, 0.01, 0.1, 0.0);
+        branch.rating_a_mva = 10.0;
+        net.branches.push(branch);
+
+        let mut slack_gen = Generator::new(1, 50.0, 1.0);
+        slack_gen.pmax = 200.0;
+        slack_gen.qmin = -200.0;
+        slack_gen.qmax = 200.0;
+        slack_gen.cost = Some(CostCurve::Polynomial {
+            startup: 0.0,
+            shutdown: 0.0,
+            coeffs: vec![0.0, 1.0, 0.0],
+        });
+        net.generators.push(slack_gen);
+        net.loads.push(Load::new(2, 40.0, 0.0));
+
+        let context = OpfNetworkContext::for_ac(&net).expect("AC context");
+        let mapping = AcOpfMapping::new(
+            &context,
+            vec![0],
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+        )
+        .expect("mapping");
+        let bus_map = net.bus_index_map();
+        let branch_admittances =
+            super::super::types::build_branch_admittances(&net, &[0], &bus_map);
+
+        let x0 = build_initial_point(
+            &net,
+            &mapping,
+            &branch_admittances,
+            &[],
+            true,
+            None,
+            None,
+            None,
+            None,
+        );
+        let (va, vm, _, _) = mapping.extract_voltages_and_dispatch(&x0);
+        let (pf, qf) = branch_flow_from(&branch_admittances[0], vm, &va);
+        let (pt, qt) = branch_flow_to(&branch_admittances[0], vm, &va);
+        let expected_from = (pf.hypot(qf) - branch_admittances[0].s_max_pu()).max(0.0);
+        let expected_to = (pt.hypot(qt) - branch_admittances[0].s_max_pu()).max(0.0);
+
+        assert!(
+            (x0[mapping.thermal_slack_from_var(0)] - expected_from).abs() <= 1e-12,
+            "from-side thermal slack should seed to the overload amount"
+        );
+        assert!(
+            (x0[mapping.thermal_slack_to_var(0)] - expected_to).abs() <= 1e-12,
+            "to-side thermal slack should seed to the overload amount"
+        );
+    }
+
+    #[test]
+    fn build_initial_point_clamps_regulated_bus_vm_to_target() {
+        let mut net = Network::new("regulated-vm-seed");
+        net.buses.push(Bus::new(1, BusType::Slack, 138.0));
+        net.buses.push(Bus::new(2, BusType::PQ, 138.0));
+        net.branches.push(Branch::new_line(1, 2, 0.01, 0.1, 0.0));
+        net.loads.push(Load::new(2, 20.0, 5.0));
+
+        let mut slack_gen = Generator::new(1, 30.0, 1.02);
+        slack_gen.pmax = 100.0;
+        slack_gen.qmin = -50.0;
+        slack_gen.qmax = 50.0;
+        slack_gen.cost = Some(CostCurve::Polynomial {
+            startup: 0.0,
+            shutdown: 0.0,
+            coeffs: vec![0.0, 1.0, 0.0],
+        });
+        net.generators.push(slack_gen);
+
+        let context = OpfNetworkContext::for_ac(&net).expect("AC context");
+        let mapping = AcOpfMapping::new(
+            &context,
+            vec![],
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .expect("mapping");
+        let regulated_targets = vec![Some(1.02), None];
+        let warm_start = WarmStart {
+            voltage_magnitude_pu: vec![0.95, 0.99],
+            voltage_angle_rad: vec![0.15, -0.02],
+            pg: vec![0.3],
+            qg: vec![0.0],
+            dispatchable_load_p: vec![],
+            dispatchable_load_q: vec![],
+        };
+
+        let x0 = build_initial_point(
+            &net,
+            &mapping,
+            &[],
+            &regulated_targets,
+            true,
+            Some(&warm_start),
+            None,
+            None,
+            None,
+        );
+
+        assert!((x0[mapping.vm_var(0)] - 1.02).abs() <= 1e-12);
+        assert!((x0[mapping.vm_var(1)] - 0.99).abs() <= 1e-12);
+
+        // When `enforce_regulated_bus_vm_targets = false`, the regulated bus
+        // keeps its `[vmin, vmax]` bounds and the warm-start vm is honored
+        // (clamped to those bounds), instead of being overwritten by the
+        // regulator setpoint.
+        let x0_relaxed = build_initial_point(
+            &net,
+            &mapping,
+            &[],
+            &regulated_targets,
+            false,
+            Some(&warm_start),
+            None,
+            None,
+            None,
+        );
+        assert!((x0_relaxed[mapping.vm_var(0)] - 0.95).abs() <= 1e-12);
+        assert!((x0_relaxed[mapping.vm_var(1)] - 0.99).abs() <= 1e-12);
+    }
 }

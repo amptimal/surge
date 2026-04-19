@@ -314,6 +314,199 @@ pub(crate) fn build_hvdc_nlp_data(network: &Network) -> Result<Option<HvdcNlpDat
 }
 
 // ---------------------------------------------------------------------------
+// Point-to-point HVDC as NLP variables (lossless)
+// ---------------------------------------------------------------------------
+
+/// One point-to-point HVDC link prepared for the joint AC-DC NLP.
+///
+/// Each in-service link contributes one decision variable `Pg_hvdc[k]` (in
+/// per-unit) to the AC OPF, representing DC power flowing from the rectifier
+/// (from_bus) to the inverter (to_bus). Positive values mean rectification
+/// at the from-bus and inversion at the to-bus.
+///
+/// The bus P balance at each terminal picks up the HVDC variable via a
+/// **split-loss** formulation, which keeps the Jacobian and Hessian smooth
+/// across the P = 0 direction flip:
+///
+/// ```text
+///   g[from_bus] += Pg_hvdc[k] + 0.5 * c_pu * Pg_hvdc[k]²
+///   g[to_bus]   -= Pg_hvdc[k] - 0.5 * c_pu * Pg_hvdc[k]²
+/// ```
+///
+/// Half the quadratic loss is attributed to each terminal. The total loss
+/// per link is `c_pu * Pg²`, which the AC OPF's generation has to cover
+/// when summed over all buses. Loss is `0` for the lossless path (c_pu=0).
+///
+/// `c_pu` is derived from the LCC's DC resistance: `R_ohm × base_mva /
+/// scheduled_voltage_kv²`. This is the standard per-unit conversion of a
+/// DC line's series resistance on the system MVA base.
+#[derive(Clone, Debug)]
+pub(crate) struct HvdcP2PLinkNlp {
+    /// Human-readable link name (for diagnostics).
+    #[allow(dead_code)]
+    pub name: String,
+    /// AC bus internal index of the rectifier terminal (from_bus).
+    pub from_bus_idx: usize,
+    /// AC bus internal index of the inverter terminal (to_bus).
+    pub to_bus_idx: usize,
+    /// Lower bound on DC power in pu on the system MVA base.
+    pub p_min_pu: f64,
+    /// Upper bound on DC power in pu on the system MVA base.
+    pub p_max_pu: f64,
+    /// Warm-start value in pu (clamped to `[p_min_pu, p_max_pu]`).
+    pub p_warm_start_pu: f64,
+    /// Quadratic loss coefficient in pu: total loss = `c_pu * Pg²`.
+    /// Zero when the link has no DC resistance (lossless).
+    pub loss_c_pu: f64,
+}
+
+/// Collection of point-to-point HVDC links exposed to the AC-OPF NLP.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HvdcP2PNlpData {
+    pub links: Vec<HvdcP2PLinkNlp>,
+}
+
+#[allow(dead_code)]
+impl HvdcP2PNlpData {
+    /// Number of HVDC P decision variables contributed by this block.
+    #[inline]
+    pub fn n_links(&self) -> usize {
+        self.links.len()
+    }
+
+    /// True if this block has at least one link.
+    #[inline]
+    pub fn has_any(&self) -> bool {
+        !self.links.is_empty()
+    }
+}
+
+/// Build point-to-point HVDC NLP data from `network.hvdc.links`.
+///
+/// Returns `Ok(None)` when no in-service link declares a variable P range
+/// (`p_dc_min_mw < p_dc_max_mw`). When at least one link opts in, every
+/// in-service LCC/VSC link with a variable-P range is emitted as a single
+/// NLP variable bounded by its `[p_dc_min_mw, p_dc_max_mw]` envelope.
+///
+/// LCC links with `resistance_ohm != 0.0` or any VSC link with any nonzero
+/// loss coefficient are rejected with `SolverError` — the lossless path is
+/// the only one wired today. This fails fast rather than silently pretending
+/// a lossy link is lossless.
+///
+/// Links that do NOT opt in (both P bounds at 0.0, the default) are left
+/// out of the NLP block and handled by the sequential AC-DC fallback loop
+/// exactly as before. This preserves byte-for-byte behavior for callers
+/// that haven't populated P bounds yet.
+pub(crate) fn build_hvdc_p2p_nlp_data(
+    network: &Network,
+) -> Result<Option<HvdcP2PNlpData>, AcOpfError> {
+    if network.hvdc.links.is_empty() {
+        return Ok(None);
+    }
+
+    let base_mva = network.base_mva;
+    if base_mva <= 0.0 {
+        return Err(AcOpfError::InvalidNetwork(format!(
+            "network.base_mva must be > 0 to build HVDC P2P NLP data, got {base_mva}"
+        )));
+    }
+
+    let ac_bus_map = network.bus_index_map();
+    let mut links: Vec<HvdcP2PLinkNlp> = Vec::new();
+
+    // Use surge-network's HvdcLink helper methods (`as_lcc` / `as_vsc`)
+    // instead of pattern-matching — the `surge_hvdc::HvdcLink` import at
+    // the top of this file would shadow the match pattern otherwise.
+    for link in network.hvdc.links.iter() {
+        if let Some(lcc) = link.as_lcc() {
+            use surge_network::network::LccHvdcControlMode;
+            if matches!(lcc.mode, LccHvdcControlMode::Blocked) {
+                continue;
+            }
+            if !lcc.rectifier.in_service || !lcc.inverter.in_service {
+                continue;
+            }
+            // Opt-in: only links with a non-degenerate P range participate.
+            if !lcc.has_variable_p_dc() {
+                continue;
+            }
+
+            let from_bus = lcc.rectifier.bus;
+            let to_bus = lcc.inverter.bus;
+            let from_idx = *ac_bus_map.get(&from_bus).ok_or_else(|| {
+                AcOpfError::InvalidNetwork(format!(
+                    "LCC HVDC link '{}' references unknown rectifier bus {}",
+                    lcc.name, from_bus
+                ))
+            })?;
+            let to_idx = *ac_bus_map.get(&to_bus).ok_or_else(|| {
+                AcOpfError::InvalidNetwork(format!(
+                    "LCC HVDC link '{}' references unknown inverter bus {}",
+                    lcc.name, to_bus
+                ))
+            })?;
+
+            let p_min_pu = lcc.p_dc_min_mw / base_mva;
+            let p_max_pu = lcc.p_dc_max_mw / base_mva;
+            let p_warm_start_pu = (lcc.scheduled_setpoint / base_mva).clamp(p_min_pu, p_max_pu);
+
+            // Quadratic DC-line loss coefficient in per-unit:
+            //   total loss (pu) = c_pu * Pg²
+            // derived from the LCC's DC resistance and scheduled DC
+            // voltage. For V_dc = scheduled_voltage_kv and base_mva
+            // the system base, the per-unit resistance is
+            //   r_pu = R_ohm * base_mva / V_dc_kv²
+            // and at the sender we have P_pu = V_pu * I_pu ≈ I_pu
+            // (V_pu ≈ 1 in the DC voltage base), so I_pu² ≈ P_pu² and
+            // the loss is r_pu * P_pu². Zero resistance → lossless
+            // path, same behavior as before (no Hessian contribution,
+            // Jacobian entries are constant ±1).
+            let v_dc_kv = lcc.scheduled_voltage_kv;
+            let loss_c_pu = if lcc.resistance_ohm.abs() > 1e-12 && v_dc_kv > 1e-6 {
+                lcc.resistance_ohm * base_mva / (v_dc_kv * v_dc_kv)
+            } else {
+                0.0
+            };
+
+            links.push(HvdcP2PLinkNlp {
+                name: lcc.name.clone(),
+                from_bus_idx: from_idx,
+                to_bus_idx: to_idx,
+                p_min_pu,
+                p_max_pu,
+                p_warm_start_pu,
+                loss_c_pu,
+            });
+            continue;
+        }
+
+        if let Some(vsc) = link.as_vsc() {
+            // Surge's network-side `VscHvdcLink` does not currently carry
+            // explicit variable-P bounds the way `LccHvdcLink` does. Until
+            // that schema gains a `[p_dc_min_mw, p_dc_max_mw]` pair, VSC
+            // point-to-point links cannot opt into the joint AC-DC NLP
+            // path. They stay on the sequential AC-DC iteration regardless
+            // of loss coefficients — including lossy VSCs that the
+            // existing test suite relies on.
+            let _ = vsc;
+            continue;
+        }
+    }
+
+    if links.is_empty() {
+        return Ok(None);
+    }
+
+    info!(
+        n_links = links.len(),
+        "HVDC point-to-point NLP data: {} links exposed to joint AC-DC OPF",
+        links.len()
+    );
+
+    Ok(Some(HvdcP2PNlpData { links }))
+}
+
+// ---------------------------------------------------------------------------
 // Sequential fallback for point-to-point HVDC links.
 // ---------------------------------------------------------------------------
 
@@ -341,6 +534,14 @@ pub(crate) fn solve_ac_opf_with_hvdc_context(
     options: &AcOpfOptions,
     context: &AcOpfRunContext,
 ) -> Result<AcOpfHvdcResult, AcOpfError> {
+    // NOTE: when any point-to-point link declares a variable-P range
+    // (`p_dc_min_mw < p_dc_max_mw` on the `LccHvdcLink`), the caller
+    // (`solve_ac_opf_with_context`) routes directly to the joint AC-DC
+    // NLP path without landing here. This function only runs for
+    // networks whose HVDC links are either all fixed-P LCC or legacy
+    // VSC — both of which are handled by the sequential outer fixed-
+    // point loop below.
+
     let links = links_from_network(network);
     if links.is_empty() {
         if network.hvdc.has_explicit_dc_topology() {
@@ -1376,5 +1577,273 @@ mod tests {
         let r = result.unwrap();
         assert_eq!(r.hvdc_p_dc_mw.len(), 0);
         assert_eq!(r.hvdc_iterations, 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // HVDC P2P NLP variable: FD Jacobian and Hessian sanity tests
+    // ---------------------------------------------------------------------
+
+    /// Build the 3-bus network with one variable-P LCC HVDC link attached
+    /// between buses 1 (rectifier) and 3 (inverter). `resistance_ohm`
+    /// controls whether the link is lossless (0.0) or lossy (>0).
+    fn three_bus_network_with_variable_p_lcc(resistance_ohm: f64) -> Network {
+        use surge_network::network::{LccConverterTerminal, LccHvdcControlMode, LccHvdcLink};
+        let mut net = three_bus_network();
+        let mut link = LccHvdcLink {
+            name: "dcl_test".to_string(),
+            mode: LccHvdcControlMode::PowerControl,
+            resistance_ohm,
+            scheduled_setpoint: 20.0,
+            scheduled_voltage_kv: 500.0,
+            // Variable P range around the setpoint — opt the link into
+            // the joint AC-DC NLP path.
+            p_dc_min_mw: -50.0,
+            p_dc_max_mw: 50.0,
+            ..Default::default()
+        };
+        link.rectifier = LccConverterTerminal {
+            bus: 1,
+            ..Default::default()
+        };
+        link.inverter = LccConverterTerminal {
+            bus: 3,
+            ..Default::default()
+        };
+        net.hvdc.push_lcc_link(link);
+        net
+    }
+
+    /// Construct an `AcOpfProblem` and a "reasonable" `x0` at which to
+    /// evaluate finite differences. Uses the NLP's own `initial_point`
+    /// (bounds-respecting) and overwrites the HVDC P variable with a
+    /// strictly-interior value so the quadratic loss derivative has a
+    /// nontrivial `c*Pg` term.
+    fn build_hvdc_problem_and_x0(
+        net: &'static Network,
+    ) -> (crate::ac::problem::AcOpfProblem<'static>, Vec<f64>) {
+        use crate::nlp::NlpProblem;
+        let opts = AcOpfOptions {
+            include_hvdc: Some(true),
+            enforce_capability_curves: false,
+            enforce_flowgates: false,
+            enforce_angle_limits: false,
+            bus_active_power_balance_slack_penalty_per_mw: 0.0,
+            bus_reactive_power_balance_slack_penalty_per_mvar: 0.0,
+            voltage_magnitude_slack_penalty_per_pu: 0.0,
+            thermal_limit_slack_penalty_per_mva: 0.0,
+            angle_difference_slack_penalty_per_rad: 0.0,
+            ..AcOpfOptions::default()
+        };
+        let context = AcOpfRunContext::from_runtime(&AcOpfRuntime::default());
+        let problem = crate::ac::problem::AcOpfProblem::new(net, &opts, &context, None, None)
+            .expect("problem build");
+        let mut x = problem.initial_point();
+        let hvdc_var = problem.mapping.hvdc_p2p_var(0);
+        // Place Pg strictly inside [-0.5, 0.5] so both the linear (±1)
+        // and quadratic (`c*Pg`) Jacobian contributions are nonzero.
+        x[hvdc_var] = 0.35;
+        (problem, x)
+    }
+
+    #[test]
+    fn test_hvdc_p2p_jacobian_fd_lossless() {
+        use crate::nlp::NlpProblem;
+        // Leak the network so the problem's `'_` lifetime becomes
+        // `'static` for the duration of the test.
+        let net: &'static Network = Box::leak(Box::new(three_bus_network_with_variable_p_lcc(0.0)));
+        let (problem, x) = build_hvdc_problem_and_x0(net);
+        let m = &problem.mapping;
+        assert_eq!(m.n_hvdc_p2p_links, 1);
+        assert!(
+            (m.hvdc_p2p_loss_c_pu[0]).abs() < 1e-20,
+            "lossless c_pu == 0"
+        );
+
+        let (jac_rows, jac_cols) = problem.jacobian_structure();
+        let mut jac_analytical = vec![0.0_f64; jac_rows.len()];
+        problem.eval_jacobian(&x, &mut jac_analytical);
+
+        // FD: perturb only the HVDC P variable and observe how every
+        // constraint row changes.
+        let hvdc_var = m.hvdc_p2p_var(0);
+        let eps = 1e-6;
+        let n_con = problem.n_constraints();
+        let mut g0 = vec![0.0_f64; n_con];
+        problem.eval_constraints(&x, &mut g0);
+        let mut x_pert = x.clone();
+        x_pert[hvdc_var] += eps;
+        let mut g1 = vec![0.0_f64; n_con];
+        problem.eval_constraints(&x_pert, &mut g1);
+
+        // Compare analytical Jacobian entries whose column is hvdc_var
+        // against the finite-difference column.
+        let from_row = m.hvdc_p2p_from_bus_idx[0];
+        let to_row = m.hvdc_p2p_to_bus_idx[0];
+        let mut checked = 0usize;
+        for (i, (&row, &col)) in jac_rows.iter().zip(jac_cols.iter()).enumerate() {
+            if col as usize != hvdc_var {
+                continue;
+            }
+            let row = row as usize;
+            let fd = (g1[row] - g0[row]) / eps;
+            let analytical = jac_analytical[i];
+            assert!(
+                (analytical - fd).abs() < 1e-4,
+                "Jac FD mismatch at row {row}: analytical={analytical} fd={fd}"
+            );
+            // Lossless: ±1 exactly.
+            let expected = if row == from_row {
+                1.0
+            } else if row == to_row {
+                -1.0
+            } else {
+                0.0
+            };
+            assert!(
+                (analytical - expected).abs() < 1e-12,
+                "lossless analytical at row {row}: {analytical} vs {expected}"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 2, "expected 2 HVDC P2P Jacobian entries");
+    }
+
+    #[test]
+    fn test_hvdc_p2p_jacobian_fd_lossy() {
+        use crate::nlp::NlpProblem;
+        // 5 Ω on a 500 kV link, 100 MVA base → c_pu = 5 * 100 / 500² = 0.002.
+        let net: &'static Network = Box::leak(Box::new(three_bus_network_with_variable_p_lcc(5.0)));
+        let (problem, x) = build_hvdc_problem_and_x0(net);
+        let m = &problem.mapping;
+        let c_pu = m.hvdc_p2p_loss_c_pu[0];
+        assert!((c_pu - 0.002).abs() < 1e-12, "c_pu = {c_pu}");
+
+        let (jac_rows, jac_cols) = problem.jacobian_structure();
+        let mut jac_analytical = vec![0.0_f64; jac_rows.len()];
+        problem.eval_jacobian(&x, &mut jac_analytical);
+
+        let hvdc_var = m.hvdc_p2p_var(0);
+        let p_hvdc = x[hvdc_var];
+        let eps = 1e-6;
+        let n_con = problem.n_constraints();
+        let mut g0 = vec![0.0_f64; n_con];
+        problem.eval_constraints(&x, &mut g0);
+        let mut x_pert = x.clone();
+        x_pert[hvdc_var] += eps;
+        let mut g1 = vec![0.0_f64; n_con];
+        problem.eval_constraints(&x_pert, &mut g1);
+
+        let from_row = m.hvdc_p2p_from_bus_idx[0];
+        let to_row = m.hvdc_p2p_to_bus_idx[0];
+        let expected_from = 1.0 + c_pu * p_hvdc;
+        let expected_to = -1.0 + c_pu * p_hvdc;
+
+        let mut seen_from = false;
+        let mut seen_to = false;
+        for (i, (&row, &col)) in jac_rows.iter().zip(jac_cols.iter()).enumerate() {
+            if col as usize != hvdc_var {
+                continue;
+            }
+            let row = row as usize;
+            let fd = (g1[row] - g0[row]) / eps;
+            let analytical = jac_analytical[i];
+            assert!(
+                (analytical - fd).abs() < 1e-4,
+                "Jac FD mismatch at row {row}: analytical={analytical} fd={fd}"
+            );
+            if row == from_row {
+                assert!(
+                    (analytical - expected_from).abs() < 1e-9,
+                    "from-row analytical {analytical} vs expected {expected_from}"
+                );
+                seen_from = true;
+            } else if row == to_row {
+                assert!(
+                    (analytical - expected_to).abs() < 1e-9,
+                    "to-row analytical {analytical} vs expected {expected_to}"
+                );
+                seen_to = true;
+            }
+        }
+        assert!(
+            seen_from && seen_to,
+            "both from and to rows must be checked"
+        );
+
+        // Finite-difference the split-loss quadratic contribution
+        // against the bus balance residual directly. The delta
+        // `g(x+ε) - g(x)` at the to-bus row should equal
+        // `ε * (−1 + c*Pg) + O(ε²)`. Cross-check.
+        let fd_from = (g1[from_row] - g0[from_row]) / eps;
+        let fd_to = (g1[to_row] - g0[to_row]) / eps;
+        assert!(
+            (fd_from - expected_from).abs() < 1e-4,
+            "FD from-row {fd_from} vs {expected_from}"
+        );
+        assert!(
+            (fd_to - expected_to).abs() < 1e-4,
+            "FD to-row {fd_to} vs {expected_to}"
+        );
+    }
+
+    #[test]
+    fn test_hvdc_p2p_hessian_lossless_has_no_entry() {
+        use crate::nlp::NlpProblem;
+        let net: &'static Network = Box::leak(Box::new(three_bus_network_with_variable_p_lcc(0.0)));
+        let (problem, _x) = build_hvdc_problem_and_x0(net);
+        let m = &problem.mapping;
+        let hvdc_var = m.hvdc_p2p_var(0);
+        let (hess_rows, hess_cols) = problem.hessian_structure();
+        // The sparsity builder must not emit a diagonal entry for a
+        // lossless link (`loss_c_pu = 0`). A zero-valued entry would be
+        // fine numerically but wastes nonzero slots.
+        for (&r, &c) in hess_rows.iter().zip(hess_cols.iter()) {
+            assert!(
+                !(r as usize == hvdc_var && c as usize == hvdc_var),
+                "lossless link must not emit an (hvdc_var, hvdc_var) Hessian slot"
+            );
+        }
+    }
+
+    #[test]
+    fn test_hvdc_p2p_hessian_lossy_matches_c_pu_lambda_sum() {
+        use crate::nlp::NlpProblem;
+        let net: &'static Network = Box::leak(Box::new(three_bus_network_with_variable_p_lcc(5.0)));
+        let (problem, x) = build_hvdc_problem_and_x0(net);
+        let m = &problem.mapping;
+        let c_pu = m.hvdc_p2p_loss_c_pu[0];
+        assert!(c_pu > 0.0);
+
+        // Pick a lambda with distinct non-trivial values at the two
+        // HVDC terminal bus-P balance rows; only the sum matters for
+        // the HVDC contribution. Every other entry is zero to isolate
+        // the HVDC Hessian block from other Hessian terms.
+        let n_con = problem.n_constraints();
+        let mut lambda = vec![0.0_f64; n_con];
+        let from_row = m.hvdc_p2p_from_bus_idx[0];
+        let to_row = m.hvdc_p2p_to_bus_idx[0];
+        lambda[from_row] = 1.3;
+        lambda[to_row] = -0.7;
+
+        let (hess_rows, hess_cols) = problem.hessian_structure();
+        let mut hess = vec![0.0_f64; hess_rows.len()];
+        problem.eval_hessian(&x, 0.0, &lambda, &mut hess);
+
+        let hvdc_var = m.hvdc_p2p_var(0);
+        let mut found = false;
+        for (i, (&r, &c)) in hess_rows.iter().zip(hess_cols.iter()).enumerate() {
+            if r as usize == hvdc_var && c as usize == hvdc_var {
+                let expected = c_pu * (lambda[from_row] + lambda[to_row]);
+                assert!(
+                    (hess[i] - expected).abs() < 1e-12,
+                    "HVDC Hessian = {}, expected {}",
+                    hess[i],
+                    expected
+                );
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "lossy link must have an (hvdc,hvdc) Hessian slot");
     }
 }

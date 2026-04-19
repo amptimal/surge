@@ -9,7 +9,7 @@ use std::path::Path;
 
 use surge_network::Network;
 use surge_network::market::CostCurve;
-use surge_network::network::BusType;
+use surge_network::network::{BusType, Generator, GeneratorTechnology};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -226,6 +226,50 @@ pub fn to_string(network: &Network) -> Result<String, MatpowerWriteError> {
         writeln!(out, "];")?;
     }
 
+    let has_gentype = network
+        .generators
+        .iter()
+        .any(|g| g.source_technology_code.is_some() || g.technology.is_some());
+    if has_gentype {
+        writeln!(out)?;
+        writeln!(out, "mpc.gentype = {{")?;
+        for g in &network.generators {
+            let code = matpower_gentype_for_generator(g);
+            writeln!(out, "\t'{}';", escape_matpower_string(&code))?;
+        }
+        for inj in &network.power_injections {
+            if inj.in_service {
+                writeln!(out, "\t'OT';")?;
+            }
+        }
+        writeln!(out, "}};")?;
+    }
+
+    let has_genfuel = network.generators.iter().any(|g| {
+        g.fuel
+            .as_ref()
+            .and_then(|f| f.fuel_type.as_deref())
+            .is_some()
+    });
+    if has_genfuel {
+        writeln!(out)?;
+        writeln!(out, "mpc.genfuel = {{")?;
+        for g in &network.generators {
+            let fuel = g
+                .fuel
+                .as_ref()
+                .and_then(|f| f.fuel_type.as_deref())
+                .unwrap_or("other");
+            writeln!(out, "\t'{}';", escape_matpower_string(fuel))?;
+        }
+        for inj in &network.power_injections {
+            if inj.in_service {
+                writeln!(out, "\t'other';")?;
+            }
+        }
+        writeln!(out, "}};")?;
+    }
+
     // --- DC network sections (only when DC buses exist) ---
     if network.hvdc.has_explicit_dc_topology() {
         writeln!(out)?;
@@ -360,6 +404,48 @@ fn clamp_for_matpower(v: f64, fallback: f64) -> f64 {
     }
 }
 
+fn matpower_gentype_for_generator(generator: &Generator) -> String {
+    if let Some(raw) = &generator.source_technology_code
+        && !raw.trim().is_empty()
+    {
+        return raw.clone();
+    }
+    match generator.technology {
+        Some(GeneratorTechnology::SteamTurbine) => "ST",
+        Some(GeneratorTechnology::CombustionTurbine) => "GT",
+        Some(GeneratorTechnology::CombinedCycle) => "CC",
+        Some(GeneratorTechnology::InternalCombustion) => "IC",
+        Some(GeneratorTechnology::Hydro) => "HY",
+        Some(GeneratorTechnology::PumpedStorage) => "PS",
+        Some(GeneratorTechnology::Hydrokinetic) => "HK",
+        Some(GeneratorTechnology::Nuclear) => "NU",
+        Some(GeneratorTechnology::Geothermal) => "GE",
+        Some(GeneratorTechnology::Wind) => "WT",
+        Some(GeneratorTechnology::SolarPv) => "PV",
+        Some(GeneratorTechnology::SolarThermal) => "CP",
+        Some(GeneratorTechnology::BatteryStorage) => "BA",
+        Some(GeneratorTechnology::CompressedAirStorage) => "CE",
+        Some(GeneratorTechnology::FlywheelStorage) => "FW",
+        Some(GeneratorTechnology::FuelCell) => "FC",
+        Some(GeneratorTechnology::SynchronousCondenser) => "SC",
+        Some(GeneratorTechnology::StaticVarCompensator) => "SV",
+        Some(GeneratorTechnology::DispatchableLoad) => "DL",
+        Some(GeneratorTechnology::DcTie) => "DC",
+        Some(GeneratorTechnology::Thermal)
+        | Some(GeneratorTechnology::Solar)
+        | Some(GeneratorTechnology::Wave)
+        | Some(GeneratorTechnology::Storage)
+        | Some(GeneratorTechnology::Motor)
+        | Some(GeneratorTechnology::Other)
+        | None => "OT",
+    }
+    .to_string()
+}
+
+fn escape_matpower_string(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
 /// Sanitize a string to be a valid MATLAB function name.
 fn sanitize_name(name: &str) -> String {
     let s: String = name
@@ -388,7 +474,8 @@ mod tests {
     use surge_network::Network;
     use surge_network::market::CostCurve;
     use surge_network::network::{
-        Branch, Bus, BusType, DcBranch, DcBus, DcConverterStation, Generator, Load,
+        Branch, Bus, BusType, DcBranch, DcBus, DcConverterStation, Generator, GeneratorTechnology,
+        Load,
     };
 
     fn simple_network() -> Network {
@@ -537,6 +624,27 @@ mod tests {
 
         assert_eq!(gen_count, 2);
         assert_eq!(gencost_count, 2);
+    }
+
+    #[test]
+    fn test_generator_classification_sections_written() {
+        let mut net = simple_network();
+        let generator = net
+            .generators
+            .first_mut()
+            .expect("simple network should have one generator");
+        generator.technology = Some(GeneratorTechnology::SolarPv);
+        generator.source_technology_code = Some("PV".to_string());
+        generator
+            .fuel
+            .get_or_insert_with(Default::default)
+            .fuel_type = Some("solar".to_string());
+
+        let s = to_string(&net).expect("writer should succeed");
+        assert!(s.contains("mpc.gentype = {"));
+        assert!(s.contains("\t'PV';"));
+        assert!(s.contains("mpc.genfuel = {"));
+        assert!(s.contains("\t'solar';"));
     }
 
     fn dc_network() -> Network {

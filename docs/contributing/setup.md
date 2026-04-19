@@ -83,7 +83,7 @@ Use a virtual environment:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install maturin pytest pandas scipy pyyaml numpy
+pip install maturin pytest pandas scipy pyyaml numpy matplotlib
 ```
 
 Build and install in development mode:

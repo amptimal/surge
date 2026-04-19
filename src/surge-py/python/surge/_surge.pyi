@@ -539,7 +539,9 @@ class StorageParams:
     def __init__(
         self,
         energy_capacity_mwh: float,
-        efficiency: float = 0.9,
+        charge_efficiency: Optional[float] = None,
+        discharge_efficiency: Optional[float] = None,
+        efficiency: Optional[float] = None,
         soc_initial_mwh: Optional[float] = None,
         soc_min_mwh: float = 0.0,
         soc_max_mwh: Optional[float] = None,
@@ -552,12 +554,20 @@ class StorageParams:
         max_c_rate_charge: Optional[float] = None,
         max_c_rate_discharge: Optional[float] = None,
         chemistry: Optional[str] = None,
+        discharge_foldback_soc_mwh: Optional[float] = None,
+        charge_foldback_soc_mwh: Optional[float] = None,
     ) -> None: ...
 
     @property
-    def efficiency(self) -> float: ...
-    @efficiency.setter
-    def efficiency(self, value: float) -> None: ...
+    def charge_efficiency(self) -> float: ...
+    @charge_efficiency.setter
+    def charge_efficiency(self, value: float) -> None: ...
+    @property
+    def discharge_efficiency(self) -> float: ...
+    @discharge_efficiency.setter
+    def discharge_efficiency(self, value: float) -> None: ...
+    @property
+    def round_trip_efficiency(self) -> float: ...
     @property
     def energy_capacity_mwh(self) -> float: ...
     @energy_capacity_mwh.setter
@@ -610,6 +620,14 @@ class StorageParams:
     def chemistry(self) -> Optional[str]: ...
     @chemistry.setter
     def chemistry(self, value: Optional[str]) -> None: ...
+    @property
+    def discharge_foldback_soc_mwh(self) -> Optional[float]: ...
+    @discharge_foldback_soc_mwh.setter
+    def discharge_foldback_soc_mwh(self, value: Optional[float]) -> None: ...
+    @property
+    def charge_foldback_soc_mwh(self) -> Optional[float]: ...
+    @charge_foldback_soc_mwh.setter
+    def charge_foldback_soc_mwh(self, value: Optional[float]) -> None: ...
 
     def __repr__(self) -> str: ...
 
@@ -2363,6 +2381,9 @@ class Network:
     def set_bus_type(self, bus: int, bus_type: str) -> None:
         """Set bus type. bus_type: 'PQ' | 'PV' | 'Slack' | 'Isolated'."""
         ...
+    def canonicalize_runtime_identities(self) -> None:
+        """Canonicalize runtime identities after topology/service edits."""
+        ...
     def set_bus_load(self, bus: int, pd_mw: float, qd_mvar: float = 0.0) -> None:
         """Set active and reactive load at a bus (MW, MVAr)."""
         ...
@@ -2537,6 +2558,49 @@ class Network:
             NetworkError: if the branch is not found.
         """
         ...
+    def set_branch_additional_shunt(
+        self,
+        from_bus: int,
+        to_bus: int,
+        g_from_pu: float,
+        b_from_pu: float,
+        g_to_pu: float,
+        b_to_pu: float,
+        circuit: int | str = "1",
+    ) -> None:
+        """Set the per-side (asymmetric) shunt admittance additions for a branch.
+
+        GO Competition Challenge 3 §4.8 eqs (148)-(151) allow AC lines and
+        transformers to carry distinct shunt-to-ground components at each
+        terminal. The four values are additions on top of the symmetric
+        ``b/2`` / ``g_pi/2`` split stored in ``Branch::b`` / ``Branch::g_pi``.
+        Default 0.0 preserves the symmetric pi-model.
+
+        Raises:
+            NetworkError: if the branch is not found.
+        """
+        ...
+    def set_branch_transition_costs(
+        self,
+        from_bus: int,
+        to_bus: int,
+        startup: float,
+        shutdown: float,
+        circuit: int | str = "1",
+    ) -> None:
+        """Set branch switching transition costs (``c^su_j``, ``c^sd_j``).
+
+        GO Competition Challenge 3 §4.4.6 eqs (62)-(63) price branch
+        startup/shutdown indicators at a fixed cost per transition. The
+        GO C3 data format surfaces these as ``connection_cost`` and
+        ``disconnection_cost`` on AC line and transformer records.
+
+        Only consulted by SCUC when ``allow_branch_switching = true``.
+
+        Raises:
+            NetworkError: if the branch is not found.
+        """
+        ...
     def set_branch_impedance(
         self,
         from_bus: int,
@@ -2618,6 +2682,12 @@ class Network:
         ...
     def set_generator_setpoint(self, id: str, vs_pu: float) -> None:
         """Set generator voltage setpoint (p.u.)."""
+        ...
+    def set_generator_voltage_regulated(self, id: str, voltage_regulated: bool) -> None:
+        """Set whether a generator participates in AC voltage regulation."""
+        ...
+    def set_generator_regulated_bus(self, id: str, regulated_bus: int | None) -> None:
+        """Set the bus regulated by a generator. ``None`` restores local regulation."""
         ...
     def set_generator_cost(self, id: str, coeffs: list[float]) -> None:
         """Set polynomial cost curve for a generator.
@@ -3048,23 +3118,34 @@ class Network:
     # ── DC lines ────────────────────────────────────────────────────────────
     def add_lcc_dc_line(
         self,
-        rectifier_bus: int,
-        inverter_bus: int,
+        name: str,
+        rect_bus: int,
+        inv_bus: int,
         setvl_mw: float,
         vschd_kv: float = 500.0,
-        rdc_ohm: float = 0.0,
+        rdc: float = 0.0,
+        p_dc_min_mw: float = 0.0,
+        p_dc_max_mw: float = 0.0,
     ) -> None:
         """Add an LCC (classical) HVDC line.
 
+        When ``p_dc_min_mw < p_dc_max_mw`` the joint AC-DC OPF treats this
+        link's DC power as an NLP decision variable bounded by the range;
+        otherwise the link is pinned at ``setvl_mw`` and the sequential
+        AC-DC iteration handles it.
+
         Args:
-            rectifier_bus: Rectifier (sending) bus number.
-            inverter_bus: Inverter (receiving) bus number.
+            name: Unique name for the DC link.
+            rect_bus: Rectifier (sending) bus number.
+            inv_bus: Inverter (receiving) bus number.
             setvl_mw: Scheduled DC power flow (MW).
             vschd_kv: Scheduled DC voltage (kV, default 500).
-            rdc_ohm: DC resistance (ohm, default 0).
+            rdc: DC resistance (ohm, default 0).
+            p_dc_min_mw: Minimum DC power for joint AC-DC OPF (MW, default 0).
+            p_dc_max_mw: Maximum DC power for joint AC-DC OPF (MW, default 0).
 
         Raises:
-            NetworkError: if either bus does not exist.
+            NetworkError: if either bus does not exist, or p_dc_min_mw > p_dc_max_mw.
         """
         ...
     def remove_lcc_dc_line(
@@ -4114,6 +4195,30 @@ class ReconfigResult:
         Empty when no virtual bids were submitted.
         """
         ...
+    def __repr__(self) -> str: ...
+
+
+class DispatchResult:
+    @property
+    def study(self) -> dict[str, Any]: ...
+    @property
+    def resources(self) -> list[dict[str, Any]]: ...
+    @property
+    def buses(self) -> list[dict[str, Any]]: ...
+    @property
+    def summary(self) -> dict[str, Any]: ...
+    @property
+    def diagnostics(self) -> dict[str, Any]: ...
+    @property
+    def periods(self) -> list[dict[str, Any]]: ...
+    @property
+    def resource_summaries(self) -> list[dict[str, Any]]: ...
+    @property
+    def combined_cycle_results(self) -> list[dict[str, Any]]: ...
+    def to_json(self) -> str: ...
+    @staticmethod
+    def from_json(s: str) -> "DispatchResult": ...
+    def to_dict(self) -> dict[str, Any]: ...
     def __repr__(self) -> str: ...
 
 
@@ -6487,7 +6592,7 @@ def solve_ac_pf(
     oltc: bool = True,
     switched_shunts: bool = True,
     oltc_max_iter: int = 20,
-    distributed_slack: bool = False,
+    distributed_slack: bool = True,
     slack_participation: dict[int, float] | None = None,
     enforce_interchange: bool = False,
     interchange_max_iter: int = 10,
@@ -6495,7 +6600,7 @@ def solve_ac_pf(
     enforce_gen_p_limits: bool = True,
     merge_zero_impedance: bool = False,
     dc_warm_start: bool = True,
-    startup_policy: str = "single",
+    startup_policy: str = "adaptive",
     q_sharing: str = "capability",
     warm_start: AcPfResult | None = None,
     line_search: bool = True,
@@ -6536,7 +6641,7 @@ def solve_ac_pf(
         merge_zero_impedance: If True, merge zero-impedance buses before solving.
         dc_warm_start: When True (default) and flat_start=True, initialise
             voltage angles from a DC power flow solve.
-        startup_policy: ``"single"`` (default) or ``"parallel_warm_and_flat"``.
+        startup_policy: ``"adaptive"`` (default), ``"single"``, or ``"parallel_warm_and_flat"``.
         q_sharing: ``"capability"`` (default), ``"mbase"``, or ``"equal"``.
         warm_start: Prior AcPfResult to warm-start from. Overrides
             flat_start and dc_warm_start when provided.
@@ -7226,9 +7331,12 @@ def solve_ac_opf(
     nlp_solver: Optional[str] = None,
     print_level: int = 0,
     enforce_thermal_limits: bool = True,
+    thermal_limit_slack_penalty_per_mva: float = 0.0,
     min_rate_a: float = 1.0,
     enforce_angle_limits: bool = False,
     warm_start: Optional[OpfResult] = None,
+    warm_start_vm_pu: Optional[list[float]] = None,
+    warm_start_va_rad: Optional[list[float]] = None,
     use_dc_opf_warm_start: Optional[bool] = None,
     optimize_switched_shunts: bool = False,
     optimize_taps: bool = False,
@@ -7264,6 +7372,12 @@ def solve_ac_opf(
             than a binding operational limit; enable only when limits are genuine.
         warm_start: Prior OpfResult to use as NLP warm start (Vm, Va, Pg, Qg).
             Typically halves solver iterations for sequential market clearing.
+        warm_start_vm_pu: Explicit initial bus voltage magnitudes in per-unit.
+            Overrides the bus-voltage magnitudes from ``warm_start`` when both
+            are provided.
+        warm_start_va_rad: Explicit initial bus voltage angles in radians.
+            Overrides the bus-voltage angles from ``warm_start`` when both are
+            provided.
         use_dc_opf_warm_start: Seed initial angles from a DC-OPF solution.
             None (default) = auto-enable when n_buses > 2000 and no warm_start.
             True = force DC-OPF warm start; False = use simple DC power flow angles.
@@ -7339,6 +7453,15 @@ def solve_scopf(
     Returns:
         ScopfResult with base-case OPF, screening stats, and contingency metadata.
     """
+    ...
+
+
+def solve_dispatch(
+    network: Network,
+    request: dict[str, Any] | str | None = None,
+    lp_solver: Optional[str] = None,
+) -> DispatchResult:
+    """Solve a canonical dispatch study from a JSON-like request payload."""
     ...
 
 
@@ -8971,6 +9094,18 @@ def case30() -> Network:
 
     Returns:
         Network: 30 buses, 41 branches, 6 generators, base_mva=100.
+    """
+    ...
+
+def market30() -> Network:
+    """Market-enabled IEEE 30-bus derivative.
+
+    A custom variant of the IEEE 30-bus case carrying the reserve / offer
+    schedule / dispatchable-load market primitives used by the dispatch
+    and market crates.
+
+    Returns:
+        Network: 30 buses, 41 branches, 10 generators, base_mva=100.
     """
     ...
 

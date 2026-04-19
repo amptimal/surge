@@ -11,6 +11,7 @@ A useful mental model is:
 - Steady-state and transfer solvers: `surge-dc`, `surge-ac`, `surge-transfer`, `surge-hvdc`
 - Optimization: `surge-opf`
 - Security: `surge-contingency`
+- Markets: `surge-dispatch`, `surge-market`
 - Interfaces: `surge-bindings`, `surge-py`
 
 ## Core Dependency Rules
@@ -20,6 +21,8 @@ A useful mental model is:
 - `surge-sparse` is a utility crate and is not the universal solver base; several solver crates also use their own direct numerical dependencies.
 - `surge-io` handles parse and write boundaries and depends on `surge-network` and `surge-topology`.
 - Solver crates generally depend downward into shared model or lower-level solver crates; interface crates sit at the leaves.
+- `surge-dispatch` composes `surge-dc`, `surge-ac`, `surge-hvdc`, and `surge-opf` into the unified SCED/SCUC kernel.
+- `surge-market` depends on `surge-dispatch` and hosts the canonical market-formulation layer (reserve catalogues, multi-stage workflows, AC SCED setup, GO C3 adapter).
 
 ## Interface Crates
 
@@ -53,6 +56,8 @@ The CLI contract is defined in `src/surge-bindings/src/main.rs` and should be tr
 - `surge-hvdc`
 - `surge-topology`
 - `surge-transfer`
+- `surge-dispatch`
+- `surge-market`
 
 The Python contract is defined by the binding source in `src/surge-py/src/`
 and the package-level stubs in `src/surge-py/python/surge/`, especially

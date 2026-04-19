@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from os import PathLike
+from typing import Any
 
 from ._study_inputs import HvdcOpfLink as HvdcOpfLink
 from ._study_inputs import ParSetpoint as ParSetpoint
@@ -32,6 +34,7 @@ from ._surge import (
     DcBus as DcBus,
     DcConverter as DcConverter,
     DcPfResult as DcPfResult,
+    DispatchResult as DispatchResult,
     DispatchableLoad as DispatchableLoad,
     FactsDevice as FactsDevice,
     FailedContingencyEvaluation as FailedContingencyEvaluation,
@@ -83,12 +86,14 @@ from ._surge import (
     case9 as case9,
     get_max_threads as get_max_threads,
     init_logging as init_logging,
+    market30 as market30,
     set_max_threads as set_max_threads,
     solve_hvdc as solve_hvdc,
     version as version,
 )
 from .opf import (
     AcAngleWarmStartMode as AcAngleWarmStartMode,
+    AcOpfBendersSubproblemResult as AcOpfBendersSubproblemResult,
     AcOpfOptions as AcOpfOptions,
     AcOpfResult as AcOpfResult,
     AcOpfRuntime as AcOpfRuntime,
@@ -108,7 +113,10 @@ from .opf import (
     ScopfRuntime as ScopfRuntime,
     ScopfScreeningPolicy as ScopfScreeningPolicy,
     ThermalRating as ThermalRating,
+    solve_ac_opf_subproblem as solve_ac_opf_subproblem,
 )
+from .dispatch import solve_dispatch as solve_dispatch
+from .dispatch_request import DispatchRequest as DispatchRequest
 from .powerflow import AcPfOptions as AcPfOptions
 from .powerflow import DcPfOptions as DcPfOptions
 from . import audit as audit
@@ -118,8 +126,10 @@ from . import construction as construction
 from . import contingency as contingency
 from . import contingency_io as contingency_io
 from . import dc as dc
+from . import dispatch as dispatch
 from . import io as io
 from . import losses as losses
+from . import market as market
 from . import opf as opf
 from . import powerflow as powerflow
 from . import subsystem as subsystem
@@ -166,3 +176,11 @@ def solve_scopf(
     options: ScopfOptions | None = None,
     runtime: ScopfRuntime | None = None,
 ) -> ScopfResult: ...
+
+
+def solve_dispatch(
+    network: Network,
+    request: Mapping[str, Any] | str | None = None,
+    *,
+    lp_solver: str | None = None,
+) -> DispatchResult: ...

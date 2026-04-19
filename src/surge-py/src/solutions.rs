@@ -10,7 +10,7 @@ use std::sync::Arc;
 use numpy::{IntoPyArray, PyArray1, PyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyAny, PyDict};
 
 use crate::exceptions::{ConvergenceError, SurgeError};
 use crate::network::Network;
@@ -262,54 +262,16 @@ impl AcPfResult {
     /// Per-generator reactive power output (MVAr) as numpy array, in network.generators order.
     ///
     /// Computed from the post-convergence bus Q injection:
-    ///   Qg_bus = q_inject[bus] * base_mva + Qd_bus - Bs_bus * Vm² * base_mva
+    ///   Qg_bus = q_inject[bus] * base_mva + Qd_bus - Bs_bus * Vm²
     /// For buses with multiple generators, Q is apportioned by (Qmax - Qmin) range.
     /// PQ-clamped generators (at Qmax or Qmin) are assigned their limit directly.
     #[getter]
     fn gen_q_mvar<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
         let net = self.attached_net()?;
-        let base = net.base_mva;
-        let bus_map = net.bus_index_map();
-        let load_q = net.bus_load_q_mvar();
-        // Compute net Qg available at each bus (in MVAr)
-        let mut bus_qg: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
-        for (bus_idx, bus) in net.buses.iter().enumerate() {
-            let idx = bus_map[&bus.number];
-            if idx < self.inner.reactive_power_injection_pu.len() {
-                let vm = self.inner.voltage_magnitude_pu[idx];
-                let qd = load_q.get(bus_idx).copied().unwrap_or(0.0);
-                // Qg_total = q_inject * base_mva + Qd - Bs * Vm^2 * base_mva
-                let qg_bus = self.inner.reactive_power_injection_pu[idx] * base + qd
-                    - bus.shunt_susceptance_mvar * vm * vm * base;
-                bus_qg.insert(bus.number, qg_bus);
-            }
-        }
-        // Build total Qmax range per bus for apportionment
-        let mut bus_range: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
-        for g in &net.generators {
-            if g.in_service {
-                *bus_range.entry(g.bus).or_insert(0.0) += (g.qmax - g.qmin).max(0.0);
-            }
-        }
-        let result: Vec<f64> = self
-            .attached_net()?
-            .generators
-            .iter()
-            .map(|g| {
-                if !g.in_service {
-                    return 0.0;
-                }
-                let total_qg = bus_qg.get(&g.bus).copied().unwrap_or(0.0);
-                let range = bus_range.get(&g.bus).copied().unwrap_or(0.0);
-                let gen_range = (g.qmax - g.qmin).max(0.0);
-                if range > 1e-6 {
-                    total_qg * gen_range / range
-                } else {
-                    total_qg
-                }
-            })
-            .collect();
-        Ok(result.into_pyarray(py))
+        Ok(self
+            .inner
+            .generator_reactive_power_mvar(net)
+            .into_pyarray(py))
     }
 
     /// External bus numbers of buses that were switched PV→PQ by reactive limit enforcement.
@@ -1406,6 +1368,14 @@ impl OpfSolution {
         self.inner.devices.discrete_violations.clone()
     }
 
+    /// Persisted exact-audit block for the OPF solution payload.
+    #[getter]
+    fn audit<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let json = serde_json::to_string(&self.inner.audit)
+            .map_err(|e| SurgeError::new_err(format!("Failed to serialize audit block: {e}")))?;
+        py.import("json")?.call_method1("loads", (json,))
+    }
+
     /// Serialise the OPF solution to a JSON string.
     ///
     /// Includes all dispatch, LMP, and power-flow sub-solution fields.
@@ -1414,7 +1384,13 @@ impl OpfSolution {
     /// Returns:
     ///     str: JSON representation of the OPF solution.
     fn to_json(&self) -> PyResult<String> {
-        serde_json::to_string_pretty(&self.inner)
+        let json = if self.inner.has_objective_ledger() {
+            surge_io::json::encode_checked_audited_solution(&self.inner)
+        } else {
+            surge_io::json::encode_audited_solution(&self.inner)
+        }
+        .map_err(|e| SurgeError::new_err(format!("Failed to serialize to JSON: {e}")))?;
+        serde_json::to_string_pretty(&json)
             .map_err(|e| SurgeError::new_err(format!("Failed to serialize to JSON: {e}")))
     }
 
@@ -1557,7 +1533,7 @@ impl OpfSolution {
             net.generators
                 .iter()
                 .filter(|g| g.in_service)
-                .map(|g| g.id.clone())
+                .map(surge_solution::generator_resource_id)
                 .collect()
         };
         let gen_machine_ids = if !inner.generators.gen_machine_ids.is_empty() {
@@ -1566,7 +1542,7 @@ impl OpfSolution {
             net.generators
                 .iter()
                 .filter(|g| g.in_service)
-                .map(|g| g.machine_id.clone().unwrap_or_else(|| "1".to_string()))
+                .map(|g| surge_solution::default_machine_id(g.machine_id.as_deref()))
                 .collect()
         };
         Self {
@@ -2015,6 +1991,69 @@ impl AcOpfHvdcResult {
             self.opf.inner.total_cost,
             self.hvdc_p_dc_mw.len(),
             self.hvdc_iterations
+        )
+    }
+}
+
+/// AC-OPF Benders subproblem result: OpfSolution at a fixed operating point,
+/// plus the slack cost and per-generator marginals used to construct a master
+/// cut in the SCED-AC Benders decomposition.
+#[pyclass(name = "AcOpfBendersSubproblemResult", skip_from_py_object)]
+#[derive(Clone)]
+pub struct AcOpfBendersSubproblemResult {
+    pub(crate) opf: OpfSolution,
+    pub(crate) slack_cost_dollars_per_hour: f64,
+    pub(crate) slack_marginal_by_id: HashMap<String, f64>,
+    pub(crate) converged: bool,
+}
+
+#[pymethods]
+impl AcOpfBendersSubproblemResult {
+    /// The underlying AC-OPF solution at the fixed operating point.
+    #[getter]
+    fn opf(&self) -> OpfSolution {
+        self.opf.clone()
+    }
+
+    /// Whether the NLP backend reported convergence at the fixed point.
+    /// Even when ``True``, callers should check ``slack_cost_dollars_per_hour``
+    /// to decide whether the operating point is operationally acceptable —
+    /// converged-with-large-slacks is a valid state.
+    #[getter]
+    fn converged(&self) -> bool {
+        self.converged
+    }
+
+    /// Total slack penalty cost added by the AC physics at this dispatch
+    /// ($/hr). Equal to ``opf.total_cost`` minus the pure energy cost of the
+    /// fixed Pg schedule, i.e. the aggregated branch-thermal slack, bus P/Q
+    /// balance slack, and any other soft-constraint violations priced at
+    /// their penalty rates.
+    #[getter]
+    fn slack_cost_dollars_per_hour(&self) -> f64 {
+        self.slack_cost_dollars_per_hour
+    }
+
+    /// Per-generator marginal of the slack cost with respect to the fixed
+    /// ``Pg_target`` ($/MW-hr). Keyed by **stable resource_id (generator id
+    /// string)** so the cut survives across network re-builds. Only
+    /// generators that were fixed and produced a nonzero marginal appear.
+    ///
+    /// Represents the gradient of the slack penalty *alone* — the fixed
+    /// generator's own marginal production cost has been subtracted out, so
+    /// the values are safe to use as Benders cut coefficients on top of a
+    /// master objective that already contains DC_cost(Pg).
+    #[getter]
+    fn slack_marginal_by_id(&self) -> HashMap<String, f64> {
+        self.slack_marginal_by_id.clone()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "AcOpfBendersSubproblemResult(converged={}, slack_cost=${:.2}/hr, {} marginals)",
+            self.converged,
+            self.slack_cost_dollars_per_hour,
+            self.slack_marginal_by_id.len(),
         )
     }
 }

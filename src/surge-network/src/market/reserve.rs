@@ -35,6 +35,8 @@ pub enum QualificationRule {
     Synchronized,
     /// Quick-start offline units (can reach output within deployment window).
     QuickStart,
+    /// Quick-start units that are currently offline.
+    OfflineQuickStart,
     /// Frequency-responsive (governor droop active, synchronous machines).
     FrequencyResponsive,
     /// Custom: unit must have this flag name set true in its qualification map.
@@ -52,6 +54,52 @@ pub enum EnergyCoupling {
     None,
 }
 
+/// Whether a reserve product secures real or reactive power.
+///
+/// Surge's reserve infrastructure is real-power-first because the DC
+/// SCUC LP carries no reactive variables. Reactive-power reserves
+/// couple to `Qg` rather than `Pg` and are cleared in the AC-OPF NLP
+/// rather than the DC SCUC LP — the SCUC reserve builder filters
+/// reactive products out at layout time so the LP layout stays
+/// consistent, and the AC-OPF reads the same `ReserveProduct`
+/// definitions and adds dedicated `q_reserve_up` / `q_reserve_down`
+/// variables plus per-device Q-headroom rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ReserveKind {
+    /// Real-power reserve (reg-up, reg-down, spinning, non-spinning,
+    /// on/off ramping, etc.). Default so serde round-trips on legacy
+    /// reserve-product files without the kind tag.
+    #[default]
+    Real,
+    /// Reactive-power reserve. Per-device Q-reserve variables and their
+    /// headroom rows are cleared exclusively in the AC-OPF NLP — the
+    /// SCUC LP filters these out at layout time.
+    Reactive,
+    /// Aggregate reactive-power headroom for SCUC commitment.
+    ///
+    /// Zonal reactive-reserve requirements ask for enough Q range on
+    /// the committed fleet to cover `q^qru,min + q^qrd,min`. The DC
+    /// SCUC cannot clear Q reserves (no `Qg` variable) but it can
+    /// ensure the committed fleet has enough Q range by constraining:
+    ///
+    ///   `Σ (q_max_j − q_min_j) · u^on_jt ≥ q^qru,min_nt + q^qrd,min_nt`
+    ///
+    /// per zone per period. This kind signals the SCUC bounds code to
+    /// derive the per-device physical cap from the reactive range
+    /// `(qmax − qmin)` instead of the real-power range `(pmax − pmin)`.
+    /// Adapters create a synthetic product with this kind when
+    /// reactive zonal requirements are present.
+    ReactiveHeadroom,
+}
+
+fn default_apply_deploy_ramp_limit() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 // ---------------------------------------------------------------------------
 // ReserveProduct — the core definition
 // ---------------------------------------------------------------------------
@@ -67,6 +115,26 @@ pub struct ReserveProduct {
     pub id: String,
     /// Human-readable name (e.g. "Spinning Reserve", "Regulation Up").
     pub name: String,
+    /// Whether this product secures real or reactive power. Defaults to
+    /// `Real` so serde round-trips on product definitions that predate
+    /// the reactive-reserve kind tag. See [`ReserveKind`] for how surge
+    /// routes the two kinds through the SCUC LP versus the AC OPF NLP.
+    #[serde(default)]
+    pub kind: ReserveKind,
+    /// Whether the solver should impose an additional `ramp_rate × deploy_window`
+    /// capability cap on top of the explicit reserve-offer quantity.
+    ///
+    /// Keep this enabled for markets where reserve offers are bids and
+    /// physical deliverability still needs to be derived from the
+    /// unit's ramp curve. Disable it when the source data's per-product
+    /// capability field already encodes deliverable reserve (e.g. a
+    /// format that publishes separate `p_syn_res_ub`, `p_reg_res_up_ub`,
+    /// etc. fields).
+    #[serde(
+        default = "default_apply_deploy_ramp_limit",
+        skip_serializing_if = "is_true"
+    )]
+    pub apply_deploy_ramp_limit: bool,
     /// Up or Down.
     pub direction: ReserveDirection,
     /// Deployment window in seconds. Reserve must be deliverable within this time.
@@ -76,6 +144,31 @@ pub struct ReserveProduct {
     pub qualification: QualificationRule,
     /// How this product couples with the energy dispatch variable.
     pub energy_coupling: EnergyCoupling,
+    /// Optional energy-coupling mode for dispatchable loads.
+    ///
+    /// When omitted, dispatchable loads use `energy_coupling`. Some
+    /// markets require symmetric but opposite load-side coupling for
+    /// specific products — e.g. load-side regulation-up consumes
+    /// footroom to `p_min` while generator-side regulation-up consumes
+    /// headroom to `p_max`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatchable_load_energy_coupling: Option<EnergyCoupling>,
+    /// Reserve products that share this product's absolute capability limit.
+    ///
+    /// When non-empty, the model enforces
+    /// `sum(shared_limit_products) + self <= capacity(self)` for online products,
+    /// or the offline analogue for offline-only quick-start products.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_limit_products: Vec<String>,
+    /// Reserve products whose cleared awards contribute to this product's
+    /// balance requirement.
+    ///
+    /// When empty, only `self.id` contributes. This supports cumulative
+    /// substitution ladders where higher-quality reserves can cover
+    /// lower-quality balance requirements (e.g. a `reg_up + syn`
+    /// balance or a `reg_up + syn + nsyn` balance).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub balance_products: Vec<String>,
     /// Demand/penalty curve for shortage pricing.
     /// A single-segment linear curve is equivalent to a flat penalty.
     pub demand_curve: PenaltyCurve,
@@ -92,55 +185,85 @@ impl ReserveProduct {
                 id: "reg_up".into(),
                 name: "Regulation Up".into(),
                 direction: ReserveDirection::Up,
+                apply_deploy_ramp_limit: true,
                 deploy_secs: 300.0,
                 qualification: QualificationRule::Committed,
                 energy_coupling: EnergyCoupling::Headroom,
+                dispatchable_load_energy_coupling: None,
+                shared_limit_products: Vec::new(),
+                balance_products: Vec::new(),
                 demand_curve: default_curve.clone(),
+                kind: ReserveKind::Real,
             },
             ReserveProduct {
                 id: "reg_dn".into(),
                 name: "Regulation Down".into(),
                 direction: ReserveDirection::Down,
+                apply_deploy_ramp_limit: true,
                 deploy_secs: 300.0,
                 qualification: QualificationRule::Committed,
                 energy_coupling: EnergyCoupling::Footroom,
+                dispatchable_load_energy_coupling: None,
+                shared_limit_products: Vec::new(),
+                balance_products: Vec::new(),
                 demand_curve: default_curve.clone(),
+                kind: ReserveKind::Real,
             },
             ReserveProduct {
                 id: "spin".into(),
                 name: "Spinning Reserve".into(),
                 direction: ReserveDirection::Up,
+                apply_deploy_ramp_limit: true,
                 deploy_secs: 600.0,
                 qualification: QualificationRule::Synchronized,
                 energy_coupling: EnergyCoupling::Headroom,
+                dispatchable_load_energy_coupling: None,
+                shared_limit_products: Vec::new(),
+                balance_products: Vec::new(),
                 demand_curve: default_curve.clone(),
+                kind: ReserveKind::Real,
             },
             ReserveProduct {
                 id: "nspin".into(),
                 name: "Non-Spinning Reserve".into(),
                 direction: ReserveDirection::Up,
+                apply_deploy_ramp_limit: true,
                 deploy_secs: 1800.0,
                 qualification: QualificationRule::QuickStart,
                 energy_coupling: EnergyCoupling::None,
+                dispatchable_load_energy_coupling: None,
+                shared_limit_products: Vec::new(),
+                balance_products: Vec::new(),
                 demand_curve: default_curve.clone(),
+                kind: ReserveKind::Real,
             },
             ReserveProduct {
                 id: "ecrs".into(),
                 name: "ERCOT Contingency Reserve".into(),
                 direction: ReserveDirection::Up,
+                apply_deploy_ramp_limit: true,
                 deploy_secs: 600.0,
                 qualification: QualificationRule::Committed,
                 energy_coupling: EnergyCoupling::Headroom,
+                dispatchable_load_energy_coupling: None,
+                shared_limit_products: Vec::new(),
+                balance_products: Vec::new(),
                 demand_curve: default_curve.clone(),
+                kind: ReserveKind::Real,
             },
             ReserveProduct {
                 id: "rrs".into(),
                 name: "Responsive Reserve".into(),
                 direction: ReserveDirection::Up,
+                apply_deploy_ramp_limit: true,
                 deploy_secs: 600.0,
                 qualification: QualificationRule::FrequencyResponsive,
                 energy_coupling: EnergyCoupling::Headroom,
+                dispatchable_load_energy_coupling: None,
+                shared_limit_products: Vec::new(),
+                balance_products: Vec::new(),
                 demand_curve: default_curve,
+                kind: ReserveKind::Real,
             },
         ]
     }
@@ -195,12 +318,72 @@ impl SystemReserveRequirement {
 /// A zonal requirement for any reserve product.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZonalReserveRequirement {
-    /// Zone identifier — matches values in `generator_area`.
+    /// Zone identifier for this reserve requirement.
+    ///
+    /// When `participant_bus_numbers` is not provided, callers typically
+    /// interpret this as a study-area id and infer membership from
+    /// `generator_area` / bus area. When explicit participant buses are
+    /// provided, `zone_id` remains the stable identifier used for result keys
+    /// and reporting, while membership comes from `participant_bus_numbers`.
     pub zone_id: usize,
     /// Which product this requirement applies to (matches `ReserveProduct::id`).
     pub product_id: String,
-    /// Minimum MW of this product required in this zone.
+    /// Base minimum MW of this product required in this zone.
+    ///
+    /// This exogenous base requirement is combined with any dynamic terms below.
     pub requirement_mw: f64,
+    /// Per-period override for the exogenous base requirement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_period_mw: Option<Vec<f64>>,
+    /// Optional linear shortfall penalty override for this zone and product.
+    ///
+    /// When `None`, the solver falls back to the product demand curve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shortfall_cost_per_unit: Option<f64>,
+    /// Optional coefficient on served dispatchable-load power in this zone.
+    ///
+    /// The effective requirement becomes:
+    /// `base_requirement + served_dispatchable_load_coefficient * Σ served_dl`.
+    /// Callers can embed any fixed-load contribution into `requirement_mw` or
+    /// `per_period_mw`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_dispatchable_load_coefficient: Option<f64>,
+    /// Optional coefficient on the largest generator dispatch in this zone.
+    ///
+    /// The effective requirement becomes:
+    /// `base_requirement + largest_generator_dispatch_coefficient * peak_pg_zone`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub largest_generator_dispatch_coefficient: Option<f64>,
+    /// Optional explicit bus membership for this reserve zone.
+    ///
+    /// When present, the zonal reserve rows sum every producer / load
+    /// whose bus number appears here, instead of inferring membership
+    /// from one scalar area assignment. This supports formulations
+    /// where the same bus may belong to multiple reserve zones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub participant_bus_numbers: Option<Vec<u32>>,
+}
+
+impl ZonalReserveRequirement {
+    /// Effective exogenous base requirement MW for a given period.
+    pub fn requirement_mw_for_period(&self, period: usize) -> f64 {
+        self.per_period_mw
+            .as_ref()
+            .and_then(|v| v.get(period).or_else(|| v.last()).copied())
+            .unwrap_or(self.requirement_mw)
+    }
+
+    /// Whether this requirement carries explicit bus membership.
+    pub fn has_explicit_participant_buses(&self) -> bool {
+        self.participant_bus_numbers.is_some()
+    }
+
+    /// Test whether `bus_number` is explicitly in this reserve zone.
+    pub fn includes_participant_bus_number(&self, bus_number: u32) -> bool {
+        self.participant_bus_numbers
+            .as_ref()
+            .is_some_and(|buses| buses.contains(&bus_number))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +434,7 @@ pub fn qualifies_for(
         QualificationRule::Committed => is_committed,
         QualificationRule::Synchronized => is_committed,
         QualificationRule::QuickStart => is_quick_start || is_committed,
+        QualificationRule::OfflineQuickStart => is_quick_start && !is_committed,
         QualificationRule::FrequencyResponsive => {
             is_committed
                 && qualifications
@@ -262,6 +446,25 @@ pub fn qualifies_for(
             is_committed && qualifications.get(flag).copied().unwrap_or(false)
         }
     }
+}
+
+fn qualification_states(rule: &QualificationRule) -> (bool, bool) {
+    match rule {
+        QualificationRule::Committed
+        | QualificationRule::Synchronized
+        | QualificationRule::FrequencyResponsive
+        | QualificationRule::Custom(_) => (true, false),
+        QualificationRule::QuickStart => (true, true),
+        QualificationRule::OfflineQuickStart => (false, true),
+    }
+}
+
+/// Whether two qualification rules can be active simultaneously for the same
+/// resource in at least one commitment state.
+pub fn qualifications_can_overlap(lhs: &QualificationRule, rhs: &QualificationRule) -> bool {
+    let (lhs_committed, lhs_offline) = qualification_states(lhs);
+    let (rhs_committed, rhs_offline) = qualification_states(rhs);
+    (lhs_committed && rhs_committed) || (lhs_offline && rhs_offline)
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +522,29 @@ mod tests {
         ));
         assert!(!qualifies_for(
             &QualificationRule::Committed,
+            false,
+            false,
+            &q
+        ));
+    }
+
+    #[test]
+    fn test_qualifies_offline_quick_start() {
+        let q = HashMap::new();
+        assert!(qualifies_for(
+            &QualificationRule::OfflineQuickStart,
+            false,
+            true,
+            &q
+        ));
+        assert!(!qualifies_for(
+            &QualificationRule::OfflineQuickStart,
+            true,
+            true,
+            &q
+        ));
+        assert!(!qualifies_for(
+            &QualificationRule::OfflineQuickStart,
             false,
             false,
             &q
@@ -393,6 +619,26 @@ mod tests {
             true,
             false,
             &q
+        ));
+    }
+
+    #[test]
+    fn test_qualification_overlap_filters_mutually_exclusive_states() {
+        assert!(qualifications_can_overlap(
+            &QualificationRule::Committed,
+            &QualificationRule::Synchronized,
+        ));
+        assert!(qualifications_can_overlap(
+            &QualificationRule::OfflineQuickStart,
+            &QualificationRule::QuickStart,
+        ));
+        assert!(!qualifications_can_overlap(
+            &QualificationRule::OfflineQuickStart,
+            &QualificationRule::Committed,
+        ));
+        assert!(!qualifications_can_overlap(
+            &QualificationRule::OfflineQuickStart,
+            &QualificationRule::FrequencyResponsive,
         ));
     }
 

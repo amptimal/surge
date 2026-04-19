@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <title>Amptimal</title>
+  <defs>
+    <linearGradient id="stroke" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#c084fc"/>
+      <stop offset="1" stop-color="#818cf8"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="96" fill="#0a0a0f"/>
+  <circle cx="256" cy="256" r="172" fill="none" stroke="url(#stroke)" stroke-width="40"/>
+  <path d="M 84 368 Q 156 368, 210 200 Q 256 72, 302 200 Q 356 368, 428 368"
+        fill="none" stroke="url(#stroke)" stroke-width="40" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

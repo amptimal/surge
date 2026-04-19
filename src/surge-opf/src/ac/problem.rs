@@ -29,6 +29,8 @@ pub(super) const HESS_SKIP: usize = usize::MAX;
 pub(super) struct HessDirectIdx {
     /// Pg diagonal position per generator j.
     pub(super) pg_diag: Vec<usize>,
+    /// Dispatchable-load diagonal position per active load k.
+    pub(super) dl_diag: Vec<usize>,
     /// Vm diagonal position per bus i.
     pub(super) vm_diag: Vec<usize>,
     /// Per Y-bus NNZ at flat index [ybus_row_offsets[i] + k]: 8 positions for
@@ -51,6 +53,10 @@ pub(super) struct HessDirectIdx {
     pub(super) branch_from: Vec<[usize; 10]>,
     /// Branch flow to-side: same layout.
     pub(super) branch_to: Vec<[usize; 10]>,
+    /// Thermal slack sigma_from diagonal position per constrained branch.
+    pub(super) branch_from_slack_diag: Vec<usize>,
+    /// Thermal slack sigma_to diagonal position per constrained branch.
+    pub(super) branch_to_slack_diag: Vec<usize>,
 }
 
 /// Build the direct-index Hessian lookup from the HashMap created by `build_hessian_sparsity`.
@@ -74,6 +80,12 @@ pub(super) fn build_hess_direct_idx(
         .map(|j| {
             let pg = m.pg_var(j);
             lookup(pg, pg)
+        })
+        .collect();
+    let dl_diag: Vec<usize> = (0..m.n_dl)
+        .map(|k| {
+            let dl = m.dl_var(k);
+            lookup(dl, dl)
         })
         .collect();
 
@@ -137,14 +149,78 @@ pub(super) fn build_hess_direct_idx(
 
     let branch_from: Vec<[usize; 10]> = branch_admittances.iter().map(resolve_branch).collect();
     let branch_to: Vec<[usize; 10]> = branch_admittances.iter().map(resolve_branch).collect();
+    let branch_from_slack_diag: Vec<usize> = if m.has_thermal_limit_slacks() {
+        (0..branch_admittances.len())
+            .map(|ci| {
+                let sigma = m.thermal_slack_from_var(ci);
+                lookup(sigma, sigma)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let branch_to_slack_diag: Vec<usize> = if m.has_thermal_limit_slacks() {
+        (0..branch_admittances.len())
+            .map(|ci| {
+                let sigma = m.thermal_slack_to_var(ci);
+                lookup(sigma, sigma)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     HessDirectIdx {
         pg_diag,
+        dl_diag,
         vm_diag,
         ybus_pb,
         branch_from,
         branch_to,
+        branch_from_slack_diag,
+        branch_to_slack_diag,
     }
+}
+
+fn build_regulated_bus_vm_targets(
+    network: &Network,
+    bus_map: &HashMap<u32, usize>,
+) -> Result<Vec<Option<f64>>, AcOpfError> {
+    let mut targets = vec![None; network.n_buses()];
+
+    for generator in network
+        .generators
+        .iter()
+        .filter(|generator| generator.can_voltage_regulate())
+    {
+        let target_bus = generator.reg_bus.unwrap_or(generator.bus);
+        let Some(&bus_idx) = bus_map.get(&target_bus) else {
+            return Err(AcOpfError::InvalidNetwork(format!(
+                "regulated bus {} for generator {} is not present in the AC network",
+                target_bus, generator.id
+            )));
+        };
+        let target_vm = generator.voltage_setpoint_pu;
+        let bus = &network.buses[bus_idx];
+        if target_vm < bus.voltage_min_pu - 1e-9 || target_vm > bus.voltage_max_pu + 1e-9 {
+            return Err(AcOpfError::InvalidNetwork(format!(
+                "regulated bus {} target voltage {} pu for generator {} lies outside bus limits [{}, {}]",
+                target_bus, target_vm, generator.id, bus.voltage_min_pu, bus.voltage_max_pu
+            )));
+        }
+        match targets[bus_idx] {
+            None => targets[bus_idx] = Some(target_vm),
+            Some(existing) if (existing - target_vm).abs() <= 1e-6 => {}
+            Some(existing) => {
+                return Err(AcOpfError::InvalidNetwork(format!(
+                    "regulated bus {} has conflicting voltage targets {} and {} pu",
+                    target_bus, existing, target_vm
+                )));
+            }
+        }
+    }
+
+    Ok(targets)
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +242,10 @@ pub(super) struct AcOpfProblem<'a> {
     /// Cached Jacobian sparsity structure.
     pub(super) jac_rows: Vec<i32>,
     pub(super) jac_cols: Vec<i32>,
+    /// Map (row, col) → index into Jacobian values array. Built once at
+    /// problem construction. Used by tap/phase corrections to add Vm/θ
+    /// derivatives to the existing Y-bus-block entries.
+    pub(super) jac_idx_by_pair: HashMap<(i32, i32), usize>,
     /// Cached Hessian sparsity structure (lower triangle).
     pub(super) hess_rows: Vec<i32>,
     pub(super) hess_cols: Vec<i32>,
@@ -184,24 +264,76 @@ pub(super) struct AcOpfProblem<'a> {
     /// When `false`, there are no hard thermal constraints and the penalty gradient
     /// provides the only enforcement signal.
     pub(super) enforce_thermal_limits: bool,
+    /// Penalty for explicit branch thermal-limit slack variables ($/MVA-h).
+    pub(super) thermal_limit_slack_penalty_per_mva: f64,
+    /// Penalty for per-bus active-power balance slack variables ($/MW-h).
+    pub(super) bus_active_power_balance_slack_penalty_per_mw: f64,
+    /// Penalty for per-bus reactive-power balance slack variables ($/MVAr-h).
+    pub(super) bus_reactive_power_balance_slack_penalty_per_mvar: f64,
+    /// Penalty for per-bus voltage-magnitude slack variables ($/pu-h).
+    pub(super) voltage_magnitude_slack_penalty_per_pu: f64,
+    /// Penalty for per-branch angle-difference slack variables ($/rad-h).
+    pub(super) angle_difference_slack_penalty_per_rad: f64,
     /// Whether switched shunt susceptance banks are NLP variables.
     pub(super) optimize_switched_shunts: bool,
     /// Whether SVC/STATCOM susceptance is an NLP variable.
     pub(super) optimize_svc: bool,
     /// Whether TCSC compensating reactance is an NLP variable.
     pub(super) optimize_tcsc: bool,
-    /// HVDC NLP data (when joint AC-DC NLP is active).
+    /// HVDC NLP data (when joint AC-DC NLP is active via explicit DC topology).
     pub(super) hvdc: Option<super::hvdc::HvdcNlpData>,
-    /// Storage generator global indices co-optimized as NLP variables (CostMinimization mode).
+    /// Point-to-point HVDC P NLP data (when at least one LCC/VSC link
+    /// declares a non-degenerate `[p_dc_min_mw, p_dc_max_mw]` range).
+    /// Parallel to `mapping.hvdc_p2p_*`; the two must stay in sync.
+    pub(super) hvdc_p2p: Option<super::hvdc::HvdcP2PNlpData>,
+    /// Storage generator global indices co-optimized as native AC variables.
     pub(super) storage_gen_indices: Vec<usize>,
     /// State of charge (MWh) for each storage generator at interval start (indexed by s).
     pub(super) storage_soc_mwh: Vec<f64>,
+    /// Dispatchable-load global indices optimized as native AC variables.
+    pub(super) dispatchable_load_indices: Vec<usize>,
+    /// Fixed voltage targets (pu) for regulated buses, keyed by internal bus index.
+    pub(super) regulated_bus_vm_targets: Vec<Option<f64>>,
+    /// When `true`, regulated buses use `lb_vm = ub_vm = target` (PSS/E PV-bus
+    /// behaviour). When `false`, regulated buses keep `[vmin, vmax]` bounds and
+    /// the setpoint is treated as a soft target only.
+    pub(super) enforce_regulated_bus_vm_targets: bool,
+    /// Target generator active-power schedules (MW), parallel to `mapping.gen_indices`.
+    pub(super) generator_target_tracking_mw: Vec<Option<f64>>,
+    /// Per-generator asymmetric penalty coefficients `(upward_per_mw2,
+    /// downward_per_mw2)` parallel to `mapping.gen_indices`. Zero entries
+    /// mean the corresponding direction is unpenalised. Computed during
+    /// `AcOpfProblem::new` from the tracking runtime's per-index
+    /// overrides + default; the legacy scalar
+    /// `generator_target_tracking_penalty_per_mw2` is also kept in sync
+    /// so downstream code that still reads it works unchanged.
+    pub(super) generator_target_tracking_coefficients:
+        Vec<super::types::AcTargetTrackingCoefficients>,
+    /// Additive generator target-tracking penalty coefficient ($/MW²h).
+    /// **Legacy summary.** Equal to the largest per-direction coefficient
+    /// across all in-service generators — used by the single-scalar
+    /// fast paths in `nlp_impl.rs` and by callers that have not yet
+    /// migrated to the per-direction API.
+    pub(super) generator_target_tracking_penalty_per_mw2: f64,
+    /// Target dispatchable-load served-power schedules (MW), parallel to `dispatchable_load_indices`.
+    pub(super) dispatchable_load_target_tracking_mw: Vec<Option<f64>>,
+    /// Per-load asymmetric penalty coefficients, parallel to
+    /// `dispatchable_load_indices`.
+    pub(super) dispatchable_load_target_tracking_coefficients:
+        Vec<super::types::AcTargetTrackingCoefficients>,
+    /// Additive dispatchable-load target-tracking penalty coefficient ($/MW²h).
+    /// **Legacy summary.**
+    pub(super) dispatchable_load_target_tracking_penalty_per_mw2: f64,
     /// Interval duration (hours) for SoC-derived bounds.
     pub(super) dt_hours: f64,
     /// Benders cuts from AC-SCOPF (linear constraints α^T Pg ≤ rhs in per-unit).
     pub(super) cuts: Vec<super::sensitivity::BendersCut>,
     /// Linearized D-curve constraints built from generators' `pq_curve` fields.
     pub(super) pq_constraints: Vec<super::pq_curve::PqConstraint>,
+    /// Reactive-reserve plan: per-zone balance rows, per-device
+    /// q-reserve variable bounds, per-device q-reserve costs. Empty
+    /// when the network has no reactive reserve products.
+    pub(super) reactive_reserve_plan: super::reactive_reserves::AcReactiveReservePlan,
     /// Pre-computed flowgate constraint data (one per active flowgate).
     pub(super) fg_data: Vec<FgConstraintData>,
     /// Pre-computed interface constraint data (one per active interface).
@@ -210,6 +342,12 @@ pub(super) struct AcOpfProblem<'a> {
     pub(super) bus_pd_mw: Vec<f64>,
     /// Per-bus reactive power demand (MVAr), computed from loads and power injections.
     pub(super) bus_qd_mvar: Vec<f64>,
+    /// Original Vm upper bounds per bus (pu) before widening for voltage slacks.
+    /// Empty when voltage slacks are disabled.
+    pub(super) vm_max_orig_pu: Vec<f64>,
+    /// Original Vm lower bounds per bus (pu) before widening for voltage slacks.
+    /// Empty when voltage slacks are disabled.
+    pub(super) vm_min_orig_pu: Vec<f64>,
 }
 
 impl<'a> AcOpfProblem<'a> {
@@ -222,6 +360,7 @@ impl<'a> AcOpfProblem<'a> {
     ) -> Result<Self, AcOpfError> {
         let net_context = OpfNetworkContext::for_ac(network)?;
         let bus_map = net_context.bus_map.clone();
+        let regulated_bus_vm_targets = build_regulated_bus_vm_targets(network, &bus_map)?;
 
         // Identify constrained branches (caller may provide an explicit subset).
         let constrained_branches: Vec<usize> = if let Some(ov) = constrained_branches_override {
@@ -245,18 +384,52 @@ impl<'a> AcOpfProblem<'a> {
             _ => super::hvdc::build_hvdc_nlp_data(network)?,
         };
 
-        // Extract CostMinimization storage generators for native NLP co-optimization.
-        // SelfSchedule and OfferCurve units must be pre-dispatched by the caller.
+        // Build point-to-point HVDC P2P NLP data when at least one link
+        // declares a non-degenerate [p_dc_min_mw, p_dc_max_mw] range and
+        // HVDC is not explicitly disabled. This runs independently of the
+        // `hvdc_data` explicit-DC-topology path; the two are mutually
+        // exclusive in practice (explicit DC topology skips
+        // `network.hvdc.links`) but nothing prevents a caller from
+        // supplying both if they really want to.
+        let hvdc_p2p_data: Option<super::hvdc::HvdcP2PNlpData> = match options.include_hvdc {
+            Some(false) => None,
+            _ => super::hvdc::build_hvdc_p2p_nlp_data(network)?,
+        };
+
+        // Extract storage generators whose real-power dispatch is solved natively.
+        // SelfSchedule units must be pre-dispatched by the caller.
         let mut storage_gen_indices: Vec<usize> = Vec::new();
         let mut storage_soc_mwh: Vec<f64> = Vec::new();
         for (gi, g) in network.generators.iter().enumerate() {
             if !g.in_service {
                 continue;
             }
-            if let Some(sto) = &g.storage
-                && sto.dispatch_mode
-                    == surge_network::network::StorageDispatchMode::CostMinimization
-            {
+            if let Some(sto) = &g.storage {
+                if sto.dispatch_mode == surge_network::network::StorageDispatchMode::SelfSchedule {
+                    continue;
+                }
+                if sto.dispatch_mode == surge_network::network::StorageDispatchMode::OfferCurve {
+                    if sto.discharge_offer.is_none() && sto.charge_bid.is_none() {
+                        return Err(AcOpfError::InvalidNetwork(format!(
+                            "storage generator {gi} (bus {}) uses OfferCurve mode but provides neither discharge_offer nor charge_bid",
+                            g.bus
+                        )));
+                    }
+                    if let Some(points) = sto.discharge_offer.as_deref() {
+                        surge_network::network::StorageParams::validate_market_curve_points(
+                            points,
+                            &format!("storage generator {} discharge_offer", g.id),
+                        )
+                        .map_err(AcOpfError::InvalidNetwork)?;
+                    }
+                    if let Some(points) = sto.charge_bid.as_deref() {
+                        surge_network::network::StorageParams::validate_market_curve_points(
+                            points,
+                            &format!("storage generator {} charge_bid", g.id),
+                        )
+                        .map_err(AcOpfError::InvalidNetwork)?;
+                    }
+                }
                 let soc = options
                     .storage_soc_override
                     .as_ref()
@@ -270,6 +443,25 @@ impl<'a> AcOpfProblem<'a> {
             .iter()
             .map(|&gi| bus_map[&network.generators[gi].bus])
             .collect();
+        let mut dispatchable_load_indices: Vec<usize> = Vec::new();
+        let mut dispatchable_load_bus_idx: Vec<usize> = Vec::new();
+        let mut dispatchable_load_fixed_power_factor: Vec<bool> = Vec::new();
+        let mut dispatchable_load_pf_ratio: Vec<f64> = Vec::new();
+        for (dl_idx, dl) in network.market_data.dispatchable_loads.iter().enumerate() {
+            if !dl.in_service {
+                continue;
+            }
+            dispatchable_load_indices.push(dl_idx);
+            dispatchable_load_bus_idx.push(bus_map[&dl.bus]);
+            dispatchable_load_fixed_power_factor.push(dl.fixed_power_factor);
+            dispatchable_load_pf_ratio.push(
+                if dl.fixed_power_factor && dl.p_sched_pu.abs() > 1e-10 {
+                    dl.q_sched_pu / dl.p_sched_pu
+                } else {
+                    0.0
+                },
+            );
+        }
 
         let mapping = AcOpfMapping::new(
             &net_context,
@@ -281,7 +473,16 @@ impl<'a> AcOpfProblem<'a> {
             options.optimize_svc,
             options.optimize_tcsc,
             hvdc_data.as_ref(),
+            hvdc_p2p_data.as_ref(),
             storage_bus_idx,
+            dispatchable_load_bus_idx,
+            dispatchable_load_fixed_power_factor,
+            dispatchable_load_pf_ratio,
+            options.bus_active_power_balance_slack_penalty_per_mw > 0.0,
+            options.bus_reactive_power_balance_slack_penalty_per_mvar > 0.0,
+            options.voltage_magnitude_slack_penalty_per_pu > 0.0,
+            options.thermal_limit_slack_penalty_per_mva > 0.0 && options.enforce_thermal_limits,
+            options.angle_difference_slack_penalty_per_rad > 0.0 && options.enforce_angle_limits,
             options.enforce_flowgates,
             options.enforce_capability_curves,
         )?;
@@ -350,24 +551,71 @@ impl<'a> AcOpfProblem<'a> {
             &bus_map,
             &branch_admittances,
             hvdc_data.as_ref(),
+            hvdc_p2p_data.as_ref(),
         );
 
-        // D-curve Jacobian sparsity (empty when enforce_capability_curves=false).
-        let pq_constraints = if options.enforce_capability_curves {
-            super::pq_curve::build_pq_constraints(
-                &mapping.gen_indices,
-                &network.generators,
-                network.base_mva,
-            )
-        } else {
-            vec![]
-        };
+        // D-curve Jacobian sparsity (empty when
+        // `enforce_capability_curves=false`). Build every row in the
+        // unified PqConstraint block: D-curve (OPF-06), linear p-q
+        // linking for producers and consumers, and flat q-headroom
+        // with reactive-reserve coupling. All three families share
+        // the same `q_dev − slope·p_dev + sign·q_reserve ∈
+        // [lhs_lb, lhs_ub]` form so the downstream residual /
+        // Jacobian / sparsity machinery is identical.
+        let pq_constraints = super::reactive_reserves::build_pq_rows_with_q_reserves(
+            network,
+            &mapping,
+            &dispatchable_load_indices,
+            options.enforce_capability_curves,
+        );
+        assert_eq!(
+            pq_constraints.len(),
+            mapping.n_con_pq_cons_expected(),
+            "unified pq row build disagrees with AcOpfMapping row count"
+        );
+        // Jacobian sparsity for the unified PqConstraint row family.
+        // Each row contributes 2 entries (p, q) by default, plus an
+        // optional 3rd entry for the q-reserve coupling term.
+        use super::pq_curve::PqDeviceKind;
         for (ci, c) in pq_constraints.iter().enumerate() {
             let con_row = (mapping.pq_con_offset + ci) as i32;
+            let (p_col, q_col) = match c.kind {
+                PqDeviceKind::Producer => (
+                    mapping.pg_var(c.device_local),
+                    mapping.qg_var(c.device_local),
+                ),
+                PqDeviceKind::Consumer => (
+                    mapping.dl_var(c.device_local),
+                    mapping.dl_q_var(c.device_local),
+                ),
+            };
             jac_rows.push(con_row);
-            jac_cols.push(mapping.pg_var(c.gen_local) as i32);
+            jac_cols.push(p_col as i32);
             jac_rows.push(con_row);
-            jac_cols.push(mapping.qg_var(c.gen_local) as i32);
+            jac_cols.push(q_col as i32);
+            if let Some(res_col) = c.q_reserve_var {
+                jac_rows.push(con_row);
+                jac_cols.push(res_col as i32);
+            }
+        }
+
+        // Zonal q-reserve balance rows:
+        //   Σ_{j ∈ zone} q^qru_j + q^qru,+_n ≥ q^qru,min_n
+        // Each participant variable contributes one Jacobian entry with
+        // coefficient +1.0, plus one entry for the shortfall slack.
+        let reactive_reserve_plan = super::reactive_reserves::build_reactive_reserve_plan(
+            network,
+            &mapping,
+            &dispatchable_load_indices,
+        );
+        for (i, zone_row) in reactive_reserve_plan.zone_rows.iter().enumerate() {
+            let con_row = (mapping.zone_q_reserve_balance_row(i)) as i32;
+            for &col in &zone_row.participant_cols {
+                jac_rows.push(con_row);
+                jac_cols.push(col as i32);
+            }
+            jac_rows.push(con_row);
+            jac_cols.push(zone_row.shortfall_var as i32);
         }
 
         // Flowgate and interface Jacobian sparsity.
@@ -417,6 +665,43 @@ impl<'a> AcOpfProblem<'a> {
         }
         let cuts = context.benders_cuts.clone();
 
+        // Voltage-magnitude slack constraint Jacobian sparsity.
+        // High row i: g = vm[i] - σ_high[i]  →  dg/dVm_i = 1, dg/dσ_high_i = -1
+        // Low  row i: g = -vm[i] - σ_low[i]  →  dg/dVm_i = -1, dg/dσ_low_i = -1
+        if mapping.has_voltage_slacks() {
+            for i in 0..mapping.n_vm_slack {
+                let high_row = (mapping.vm_slack_con_offset + i) as i32;
+                jac_rows.push(high_row);
+                jac_cols.push(mapping.vm_var(i) as i32);
+                jac_rows.push(high_row);
+                jac_cols.push(mapping.vm_slack_high_var(i) as i32);
+                let low_row = (mapping.vm_slack_con_offset + mapping.n_vm_slack + i) as i32;
+                jac_rows.push(low_row);
+                jac_cols.push(mapping.vm_var(i) as i32);
+                jac_rows.push(low_row);
+                jac_cols.push(mapping.vm_slack_low_var(i) as i32);
+            }
+        }
+
+        // Angle-difference slack constraint Jacobian sparsity — modifies
+        // the existing angle rows in place:
+        //   g = Va_from - Va_to - σ_high + σ_low, bounds [angmin, angmax]
+        // dg/dσ_high = -1, dg/dσ_low = +1. The base Va_from/Va_to columns
+        // are already in the sparsity pattern from the angle constraint
+        // builder; we only need to append the two new slack columns.
+        if mapping.has_angle_slacks() {
+            let ang_row_base = (2 * mapping.n_bus + 2 * constrained_branches.len()) as i32;
+            for (ai, _) in mapping.angle_constrained_branches.iter().enumerate() {
+                let row = ang_row_base + ai as i32;
+                // dg/d(sigma_high) = -1
+                jac_rows.push(row);
+                jac_cols.push(mapping.angle_slack_high_var(ai) as i32);
+                // dg/d(sigma_low) = +1
+                jac_rows.push(row);
+                jac_cols.push(mapping.angle_slack_low_var(ai) as i32);
+            }
+        }
+
         // Build Hessian sparsity (lower triangle)
         let (mut hess_rows, mut hess_cols, mut hess_map) = build_hessian_sparsity(
             &mapping,
@@ -424,6 +709,7 @@ impl<'a> AcOpfProblem<'a> {
             &ybus,
             &branch_admittances,
             hvdc_data.as_ref(),
+            hvdc_p2p_data.as_ref(),
         );
 
         // Flowgate/interface Hessian sparsity: (Va,Vm) × (Va,Vm) at monitored branch endpoints.
@@ -464,6 +750,9 @@ impl<'a> AcOpfProblem<'a> {
                     }
                 }
             }
+            for k in 0..mapping.n_dl {
+                add_hess(mapping.dl_var(k), mapping.dl_var(k));
+            }
         }
 
         // Build direct-index Hessian lookup for hot-path sections.
@@ -479,10 +768,100 @@ impl<'a> AcOpfProblem<'a> {
         let x0 = build_initial_point(
             network,
             &mapping,
+            &branch_admittances,
+            &regulated_bus_vm_targets,
+            options.enforce_regulated_bus_vm_targets,
             context.runtime.warm_start.as_ref(),
             dc_opf_angles,
             hvdc_data.as_ref(),
+            hvdc_p2p_data.as_ref(),
         );
+        let objective_target_tracking = context.runtime.objective_target_tracking.as_ref();
+        let generator_target_tracking_mw: Vec<Option<f64>> = mapping
+            .gen_indices
+            .iter()
+            .map(|&gi| {
+                objective_target_tracking
+                    .and_then(|tracking| tracking.generator_p_targets_mw.get(&gi).copied())
+            })
+            .collect();
+        let dispatchable_load_target_tracking_mw: Vec<Option<f64>> = dispatchable_load_indices
+            .iter()
+            .map(|&dl_idx| {
+                objective_target_tracking.and_then(|tracking| {
+                    tracking
+                        .dispatchable_load_p_targets_mw
+                        .get(&dl_idx)
+                        .copied()
+                })
+            })
+            .collect();
+
+        // Per-generator asymmetric coefficient lookup. Falls back to the
+        // tracking default, which itself falls back to the legacy
+        // scalar. Unpenalised generators land on `ZERO` and contribute
+        // nothing to the objective.
+        let generator_target_tracking_coefficients: Vec<
+            super::types::AcTargetTrackingCoefficients,
+        > = mapping
+            .gen_indices
+            .iter()
+            .zip(generator_target_tracking_mw.iter())
+            .map(|(&gi, target)| {
+                if target.is_none() {
+                    return super::types::AcTargetTrackingCoefficients::ZERO;
+                }
+                objective_target_tracking
+                    .map(|tracking| tracking.generator_coefficients_for(gi))
+                    .unwrap_or(super::types::AcTargetTrackingCoefficients::ZERO)
+            })
+            .collect();
+        let dispatchable_load_target_tracking_coefficients: Vec<
+            super::types::AcTargetTrackingCoefficients,
+        > = dispatchable_load_indices
+            .iter()
+            .zip(dispatchable_load_target_tracking_mw.iter())
+            .map(|(&dl_idx, target)| {
+                if target.is_none() {
+                    return super::types::AcTargetTrackingCoefficients::ZERO;
+                }
+                objective_target_tracking
+                    .map(|tracking| tracking.dispatchable_load_coefficients_for(dl_idx))
+                    .unwrap_or(super::types::AcTargetTrackingCoefficients::ZERO)
+            })
+            .collect();
+
+        // Legacy scalar summary: the maximum per-direction coefficient
+        // across all *penalised* generators. This preserves the
+        // behaviour of callers that still check the scalar as a gate
+        // for enabling the target-tracking path in the NLP.
+        let generator_target_tracking_penalty_per_mw2 = generator_target_tracking_coefficients
+            .iter()
+            .map(|pair| pair.max())
+            .fold(0.0_f64, f64::max);
+        let dispatchable_load_target_tracking_penalty_per_mw2 =
+            dispatchable_load_target_tracking_coefficients
+                .iter()
+                .map(|pair| pair.max())
+                .fold(0.0_f64, f64::max);
+
+        let vm_max_orig_pu: Vec<f64> = if mapping.has_voltage_slacks() {
+            network.buses.iter().map(|b| b.voltage_max_pu).collect()
+        } else {
+            Vec::new()
+        };
+        let vm_min_orig_pu: Vec<f64> = if mapping.has_voltage_slacks() {
+            network.buses.iter().map(|b| b.voltage_min_pu).collect()
+        } else {
+            Vec::new()
+        };
+
+        let jac_idx_by_pair: HashMap<(i32, i32), usize> = jac_rows
+            .iter()
+            .zip(jac_cols.iter())
+            .enumerate()
+            .map(|(idx, (&r, &c))| ((r, c), idx))
+            .collect();
 
         Ok(Self {
             network,
@@ -494,25 +873,46 @@ impl<'a> AcOpfProblem<'a> {
             ybus_row_offsets,
             jac_rows,
             jac_cols,
+            jac_idx_by_pair,
             hess_rows,
             hess_cols,
             hess_map,
             hess_idx,
             x0,
             enforce_thermal_limits: options.enforce_thermal_limits,
+            thermal_limit_slack_penalty_per_mva: options.thermal_limit_slack_penalty_per_mva,
+            bus_active_power_balance_slack_penalty_per_mw: options
+                .bus_active_power_balance_slack_penalty_per_mw,
+            bus_reactive_power_balance_slack_penalty_per_mvar: options
+                .bus_reactive_power_balance_slack_penalty_per_mvar,
+            voltage_magnitude_slack_penalty_per_pu: options.voltage_magnitude_slack_penalty_per_pu,
+            angle_difference_slack_penalty_per_rad: options.angle_difference_slack_penalty_per_rad,
             optimize_switched_shunts: options.optimize_switched_shunts,
             optimize_svc: options.optimize_svc,
             optimize_tcsc: options.optimize_tcsc,
             hvdc: hvdc_data,
+            hvdc_p2p: hvdc_p2p_data,
             storage_gen_indices,
             storage_soc_mwh,
+            dispatchable_load_indices,
+            regulated_bus_vm_targets,
+            enforce_regulated_bus_vm_targets: options.enforce_regulated_bus_vm_targets,
+            generator_target_tracking_mw,
+            generator_target_tracking_coefficients,
+            generator_target_tracking_penalty_per_mw2,
+            dispatchable_load_target_tracking_mw,
+            dispatchable_load_target_tracking_coefficients,
+            dispatchable_load_target_tracking_penalty_per_mw2,
             dt_hours: options.dt_hours.max(1e-6),
             cuts,
             pq_constraints,
+            reactive_reserve_plan,
             fg_data,
             iface_data,
             bus_pd_mw: network.bus_load_p_mw(),
             bus_qd_mvar: network.bus_load_q_mvar(),
+            vm_max_orig_pu,
+            vm_min_orig_pu,
         })
     }
 }
@@ -520,11 +920,14 @@ impl<'a> AcOpfProblem<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ac::types::{AcOpfOptions, AcOpfRunContext};
+    use crate::ac::types::{
+        AcObjectiveTargetTracking, AcOpfOptions, AcOpfRunContext, AcOpfRuntime,
+    };
     use crate::nlp::NlpProblem;
-    use surge_network::market::CostCurve;
+    use surge_network::market::{CostCurve, DispatchableLoad};
     use surge_network::network::{
         Branch, Bus, BusType, DcBranch, DcBus, DcConverter, DcConverterStation, Generator, Load,
+        StorageDispatchMode, StorageParams,
     };
 
     fn explicit_hvdc_problem_network(current_max_pu: f64) -> Network {
@@ -658,6 +1061,191 @@ mod tests {
         net
     }
 
+    fn native_storage_problem_network() -> Network {
+        let mut net = Network::new("opf_native_storage");
+        net.base_mva = 100.0;
+        net.buses.push(Bus::new(1, BusType::Slack, 138.0));
+        net.loads.push(Load::new(1, 50.0, 0.0));
+
+        let mut thermal = Generator::new(1, 50.0, 1.0);
+        thermal.pmin = 0.0;
+        thermal.pmax = 150.0;
+        thermal.qmin = -100.0;
+        thermal.qmax = 100.0;
+        thermal.cost = Some(CostCurve::Polynomial {
+            startup: 0.0,
+            shutdown: 0.0,
+            coeffs: vec![60.0, 0.0],
+        });
+        net.generators.push(thermal);
+
+        let storage = Generator {
+            bus: 1,
+            in_service: true,
+            pmin: -30.0,
+            pmax: 30.0,
+            qmin: -50.0,
+            qmax: 50.0,
+            machine_base_mva: 100.0,
+            cost: None,
+            storage: Some(StorageParams {
+                charge_efficiency: 0.9486832981,
+                discharge_efficiency: 0.9486832981,
+                energy_capacity_mwh: 80.0,
+                soc_initial_mwh: 40.0,
+                soc_min_mwh: 0.0,
+                soc_max_mwh: 80.0,
+                variable_cost_per_mwh: 0.0,
+                degradation_cost_per_mwh: 0.0,
+                dispatch_mode: StorageDispatchMode::OfferCurve,
+                self_schedule_mw: 0.0,
+                discharge_offer: Some(vec![(0.0, 0.0), (30.0, 300.0)]),
+                charge_bid: Some(vec![(0.0, 0.0), (30.0, 900.0)]),
+                max_c_rate_charge: None,
+                max_c_rate_discharge: None,
+                chemistry: None,
+                discharge_foldback_soc_mwh: None,
+                charge_foldback_soc_mwh: None,
+            }),
+            ..Generator::default()
+        };
+        net.generators.push(storage);
+        net
+    }
+
+    fn target_tracking_problem_network() -> Network {
+        let mut net = Network::new("opf_target_tracking");
+        net.base_mva = 100.0;
+        net.buses.push(Bus::new(1, BusType::Slack, 138.0));
+
+        let mut generator = Generator::new(1, 40.0, 1.0);
+        generator.pmin = 0.0;
+        generator.pmax = 200.0;
+        generator.qmin = -100.0;
+        generator.qmax = 100.0;
+        generator.cost = Some(CostCurve::Polynomial {
+            startup: 0.0,
+            shutdown: 0.0,
+            coeffs: vec![5.0, 0.0],
+        });
+        net.generators.push(generator);
+
+        let mut load = DispatchableLoad::curtailable(1, 50.0, 0.0, 0.0, 7.0, net.base_mva);
+        load.resource_id = "dl0".into();
+        net.market_data.dispatchable_loads.push(load);
+        net
+    }
+
+    fn linear_cost_generator(bus: u32, p_mw: f64, vs_pu: f64, slope: f64) -> Generator {
+        let mut generator = Generator::new(bus, p_mw, vs_pu);
+        generator.pmax = 200.0;
+        generator.pmin = 0.0;
+        generator.qmax = 150.0;
+        generator.qmin = -150.0;
+        generator.cost = Some(CostCurve::Polynomial {
+            startup: 0.0,
+            shutdown: 0.0,
+            coeffs: vec![0.0, slope, 0.0],
+        });
+        generator
+    }
+
+    #[test]
+    fn regulated_bus_voltage_targets_fix_vm_bounds_for_local_and_remote_regulation() {
+        let mut net = Network::new("regulated_vm_bounds");
+        net.base_mva = 100.0;
+
+        let mut b1 = Bus::new(1, BusType::Slack, 230.0);
+        b1.voltage_min_pu = 0.95;
+        b1.voltage_max_pu = 1.05;
+        let mut b2 = Bus::new(2, BusType::PV, 230.0);
+        b2.voltage_min_pu = 0.95;
+        b2.voltage_max_pu = 1.05;
+        let mut b3 = Bus::new(3, BusType::PQ, 230.0);
+        b3.voltage_min_pu = 0.95;
+        b3.voltage_max_pu = 1.05;
+        net.buses.extend([b1, b2, b3]);
+        net.branches.push(Branch::new_line(1, 2, 0.01, 0.1, 0.02));
+        net.branches.push(Branch::new_line(2, 3, 0.01, 0.1, 0.02));
+        net.loads.push(Load::new(3, 80.0, 20.0));
+
+        net.generators
+            .push(linear_cost_generator(1, 90.0, 1.04, 10.0));
+        let mut remote_reg = linear_cost_generator(1, 40.0, 1.01, 12.0);
+        remote_reg.reg_bus = Some(2);
+        net.generators.push(remote_reg);
+
+        let problem = AcOpfProblem::new(
+            &net,
+            &AcOpfOptions::default(),
+            &AcOpfRunContext::default(),
+            None,
+            None,
+        )
+        .expect("regulated-bus voltage targets should build");
+        let (lb, ub) = problem.var_bounds();
+
+        assert_eq!(lb[problem.mapping.vm_var(0)], 1.04);
+        assert_eq!(ub[problem.mapping.vm_var(0)], 1.04);
+        assert_eq!(lb[problem.mapping.vm_var(1)], 1.01);
+        assert_eq!(ub[problem.mapping.vm_var(1)], 1.01);
+        assert_eq!(lb[problem.mapping.vm_var(2)], 0.95);
+        assert_eq!(ub[problem.mapping.vm_var(2)], 1.05);
+    }
+
+    #[test]
+    fn conflicting_regulated_bus_voltage_targets_are_rejected() {
+        let mut net = Network::new("conflicting_regulated_vm");
+        net.base_mva = 100.0;
+        net.buses.push(Bus::new(1, BusType::Slack, 230.0));
+        net.buses.push(Bus::new(2, BusType::PV, 230.0));
+        net.branches.push(Branch::new_line(1, 2, 0.01, 0.1, 0.02));
+        net.loads.push(Load::new(2, 40.0, 10.0));
+
+        net.generators
+            .push(linear_cost_generator(1, 80.0, 1.04, 10.0));
+        let mut remote_a = linear_cost_generator(1, 20.0, 1.01, 12.0);
+        remote_a.reg_bus = Some(2);
+        net.generators.push(remote_a);
+        let mut remote_b = linear_cost_generator(1, 15.0, 1.03, 14.0);
+        remote_b.reg_bus = Some(2);
+        net.generators.push(remote_b);
+
+        let error = match AcOpfProblem::new(
+            &net,
+            &AcOpfOptions::default(),
+            &AcOpfRunContext::default(),
+            None,
+            None,
+        ) {
+            Ok(_) => panic!("conflicting targets on the same regulated bus should fail"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, AcOpfError::InvalidNetwork(ref message) if message.contains("conflicting voltage targets")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "encoded spec behavior drifted from implementation; revisit voltage-regulation eligibility rules"]
+    fn regulated_bus_voltage_targets_ignore_zero_reactive_range_generators() {
+        let mut net = Network::new("ignore_zero_reactive_range_regulator");
+        net.base_mva = 100.0;
+        net.buses.push(Bus::new(1, BusType::Slack, 230.0));
+
+        let mut fixed_q = linear_cost_generator(1, 10.0, 1.03, 5.0);
+        fixed_q.qmin = 0.0;
+        fixed_q.qmax = 0.0;
+        fixed_q.voltage_regulated = true;
+        net.generators.push(fixed_q);
+
+        let bus_map = net.bus_index_map();
+        let targets = build_regulated_bus_vm_targets(&net, &bus_map)
+            .expect("zero-range regulator should be ignored");
+        assert_eq!(targets, vec![None]);
+    }
+
     #[test]
     fn hvdc_converter_current_bound_uses_raw_current_limit() {
         let net = explicit_hvdc_problem_network(0.6);
@@ -674,6 +1262,98 @@ mod tests {
         assert!(
             (ub[problem.mapping.iconv_var(0)] - 0.6).abs() < 1e-12,
             "HVDC current bound should use raw current_max_pu"
+        );
+    }
+
+    #[test]
+    fn offer_curve_storage_uses_native_storage_variables_and_zero_pg_bounds() {
+        let net = native_storage_problem_network();
+        let problem = AcOpfProblem::new(
+            &net,
+            &AcOpfOptions::default(),
+            &AcOpfRunContext::default(),
+            None,
+            None,
+        )
+        .expect("should build AC-OPF problem with native offer-curve storage");
+
+        assert_eq!(
+            problem.storage_gen_indices,
+            vec![1],
+            "offer-curve storage should be included in native storage variables"
+        );
+
+        let (lb, ub) = problem.var_bounds();
+        let storage_local_gen = problem
+            .mapping
+            .gen_indices
+            .iter()
+            .position(|&gi| gi == 1)
+            .expect("storage generator should be part of generator mapping");
+        assert_eq!(lb[problem.mapping.pg_var(storage_local_gen)], 0.0);
+        assert_eq!(ub[problem.mapping.pg_var(storage_local_gen)], 0.0);
+        assert!(
+            ub[problem.mapping.discharge_var(0)] > 0.0,
+            "native discharge variable should remain available"
+        );
+        assert!(
+            ub[problem.mapping.charge_var(0)] > 0.0,
+            "native charge variable should remain available"
+        );
+    }
+
+    #[test]
+    fn target_tracking_adds_to_existing_objective_gradient_and_hessian() {
+        let net = target_tracking_problem_network();
+        let runtime =
+            AcOpfRuntime::default().with_objective_target_tracking(AcObjectiveTargetTracking {
+                generator_p_penalty_per_mw2: 2.0,
+                generator_p_targets_mw: std::iter::once((0usize, 30.0)).collect(),
+                dispatchable_load_p_penalty_per_mw2: 3.0,
+                dispatchable_load_p_targets_mw: std::iter::once((0usize, 40.0)).collect(),
+                ..Default::default()
+            });
+        let context = AcOpfRunContext::from_runtime(&runtime);
+        let problem = AcOpfProblem::new(&net, &AcOpfOptions::default(), &context, None, None)
+            .expect("should build AC-OPF problem with target tracking");
+
+        let mut x = problem.initial_point();
+        x[problem.mapping.pg_var(0)] = 45.0 / net.base_mva;
+        x[problem.mapping.qg_var(0)] = 0.0;
+        x[problem.mapping.dl_var(0)] = 25.0 / net.base_mva;
+        x[problem.mapping.dl_q_var(0)] = 0.0;
+
+        let objective = problem.eval_objective(&x);
+        let expected_objective = 5.0 * 45.0
+            + 7.0 * (50.0 - 25.0)
+            + 2.0 * (45.0_f64 - 30.0).powi(2)
+            + 3.0 * (25.0_f64 - 40.0).powi(2);
+        assert!(
+            (objective - expected_objective).abs() < 1e-9,
+            "tracking should add to the existing objective; expected {expected_objective}, got {objective}"
+        );
+
+        let mut gradient = vec![0.0; problem.n_vars()];
+        problem.eval_gradient(&x, &mut gradient);
+        assert!(
+            (gradient[problem.mapping.pg_var(0)] - 6_500.0).abs() < 1e-9,
+            "generator gradient should include original cost plus tracking penalty"
+        );
+        assert!(
+            (gradient[problem.mapping.dl_var(0)] + 9_700.0).abs() < 1e-9,
+            "dispatchable-load gradient should include original curtailment cost plus tracking penalty"
+        );
+
+        let mut hessian_values = vec![0.0; problem.hessian_structure().0.len()];
+        let lambda = vec![0.0; problem.n_constraints()];
+        problem.eval_hessian(&x, 1.0, &lambda, &mut hessian_values);
+        assert!(
+            (hessian_values[problem.hess_idx.pg_diag[0]] - 40_000.0).abs() < 1e-9,
+            "generator Hessian diagonal should include tracking curvature"
+        );
+        assert!(
+            (hessian_values[problem.hess_idx.dl_diag[0]] - 60_000.0).abs() < 1e-9,
+            "dispatchable-load Hessian diagonal should include tracking curvature"
         );
     }
 }

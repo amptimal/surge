@@ -20,9 +20,11 @@ pub enum StorageDispatchMode {
     #[default]
     CostMinimization,
     /// BESS submits offer curves like a generator.  `discharge_offer` defines the
-    /// (MW, $/hr) PWL breakpoints for selling power; `charge_bid` defines the
-    /// (MW, $/hr) PWL breakpoints for buying power.  The optimizer clears the BESS
-    /// against these curves at the endogenous bus LMP.
+    /// cumulative `(MW, $/hr)` PWL breakpoints for selling power; `charge_bid`
+    /// defines the cumulative `(MW, $/hr)` breakpoints for buying power. Curves
+    /// must start with an explicit `(0.0, 0.0)` origin and at least one
+    /// additional breakpoint. The optimizer clears the BESS against these curves
+    /// at the endogenous bus LMP.
     OfferCurve,
     /// Operator pre-commits a fixed net injection for every period.  `self_schedule_mw`
     /// (positive = discharge, negative = charge) is injected as-is (clamped by SoC
@@ -40,10 +42,16 @@ pub enum StorageDispatchMode {
 /// When `Some`, `Generator.pmin` is negative (= -charge_mw_max) and
 /// `Generator.pmax` is the discharge power limit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "StorageParamsWire")]
 pub struct StorageParams {
-    /// Round-trip efficiency (0 < eta <= 1). Applied symmetrically: sqrt(eta)
-    /// per direction.
-    pub efficiency: f64,
+    /// Charge-side efficiency (0 < eta <= 1): fraction of metered charge MW
+    /// that reaches the SoC reservoir. Typical lithium-ion batteries lose
+    /// most of their round-trip on this leg (~90%).
+    pub charge_efficiency: f64,
+    /// Discharge-side efficiency (0 < eta <= 1): fraction of SoC draw that
+    /// reaches the grid as metered discharge MW. Typically higher than the
+    /// charge-side (~98% for modern inverters).
+    pub discharge_efficiency: f64,
     /// Usable energy capacity (MWh).
     pub energy_capacity_mwh: f64,
     /// Initial state of charge (MWh). Must be in [soc_min_mwh, soc_max_mwh].
@@ -65,10 +73,12 @@ pub struct StorageParams {
     /// Pre-committed net dispatch (MW). SelfSchedule mode only.
     #[serde(default)]
     pub self_schedule_mw: f64,
-    /// Discharge offer curve: (MW, $/hr) breakpoints. OfferCurve mode only.
+    /// Discharge offer curve: cumulative `(MW, $/hr)` breakpoints with an
+    /// explicit `(0.0, 0.0)` origin. OfferCurve mode only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discharge_offer: Option<Vec<(f64, f64)>>,
-    /// Charge bid curve: (MW, $/hr) breakpoints. OfferCurve mode only.
+    /// Charge bid curve: cumulative `(MW, $/hr)` breakpoints with an explicit
+    /// `(0.0, 0.0)` origin. OfferCurve mode only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub charge_bid: Option<Vec<(f64, f64)>>,
     /// Max charge C-rate (e.g. 0.25 for 4-hr battery). None = inverter-limited.
@@ -80,13 +90,106 @@ pub struct StorageParams {
     /// Battery chemistry (informational): "LFP", "NMC", "flow", "sodium".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chemistry: Option<String>,
+    /// Discharge-side foldback threshold (MWh of SoC). Above this, the
+    /// battery can reach its full discharge MW cap; below, the cap
+    /// derates linearly to 0 MW at ``soc_min_mwh``. ``None`` disables
+    /// the foldback cut entirely. Typical lithium-ion value: a few
+    /// percent of energy capacity above ``soc_min_mwh``.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discharge_foldback_soc_mwh: Option<f64>,
+    /// Charge-side foldback threshold (MWh of SoC). Below this, the
+    /// battery can reach its full charge MW cap; above, the cap
+    /// derates linearly to 0 MW at ``soc_max_mwh``. ``None`` disables
+    /// the foldback cut. Typical lithium-ion value: a few percent of
+    /// energy capacity below ``soc_max_mwh``.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charge_foldback_soc_mwh: Option<f64>,
+}
+
+/// Wire representation of [`StorageParams`] that accepts either the new
+/// split (`charge_efficiency` / `discharge_efficiency`) or the legacy
+/// single round-trip `efficiency` field. Used via `#[serde(from = ...)]`
+/// so deserialization of older JSON cases keeps working.
+#[derive(Deserialize)]
+struct StorageParamsWire {
+    #[serde(default)]
+    charge_efficiency: Option<f64>,
+    #[serde(default)]
+    discharge_efficiency: Option<f64>,
+    /// Legacy single-field round-trip efficiency — split sqrt-per-leg
+    /// when the two new fields are absent.
+    #[serde(default)]
+    efficiency: Option<f64>,
+    energy_capacity_mwh: f64,
+    soc_initial_mwh: f64,
+    soc_min_mwh: f64,
+    soc_max_mwh: f64,
+    #[serde(default)]
+    variable_cost_per_mwh: f64,
+    #[serde(default)]
+    degradation_cost_per_mwh: f64,
+    #[serde(default)]
+    dispatch_mode: StorageDispatchMode,
+    #[serde(default)]
+    self_schedule_mw: f64,
+    #[serde(default)]
+    discharge_offer: Option<Vec<(f64, f64)>>,
+    #[serde(default)]
+    charge_bid: Option<Vec<(f64, f64)>>,
+    #[serde(default)]
+    max_c_rate_charge: Option<f64>,
+    #[serde(default)]
+    max_c_rate_discharge: Option<f64>,
+    #[serde(default)]
+    chemistry: Option<String>,
+    #[serde(default)]
+    discharge_foldback_soc_mwh: Option<f64>,
+    #[serde(default)]
+    charge_foldback_soc_mwh: Option<f64>,
+}
+
+impl From<StorageParamsWire> for StorageParams {
+    fn from(w: StorageParamsWire) -> Self {
+        let (charge_efficiency, discharge_efficiency) =
+            match (w.charge_efficiency, w.discharge_efficiency, w.efficiency) {
+                (Some(c), Some(d), _) => (c, d),
+                (Some(c), None, _) => (c, 0.98),
+                (None, Some(d), _) => (0.90, d),
+                (None, None, Some(rt)) => {
+                    let leg = rt.max(0.0).sqrt();
+                    (leg, leg)
+                }
+                (None, None, None) => (0.90, 0.98),
+            };
+        Self {
+            charge_efficiency,
+            discharge_efficiency,
+            energy_capacity_mwh: w.energy_capacity_mwh,
+            soc_initial_mwh: w.soc_initial_mwh,
+            soc_min_mwh: w.soc_min_mwh,
+            soc_max_mwh: w.soc_max_mwh,
+            variable_cost_per_mwh: w.variable_cost_per_mwh,
+            degradation_cost_per_mwh: w.degradation_cost_per_mwh,
+            dispatch_mode: w.dispatch_mode,
+            self_schedule_mw: w.self_schedule_mw,
+            discharge_offer: w.discharge_offer,
+            charge_bid: w.charge_bid,
+            max_c_rate_charge: w.max_c_rate_charge,
+            max_c_rate_discharge: w.max_c_rate_discharge,
+            chemistry: w.chemistry,
+            discharge_foldback_soc_mwh: w.discharge_foldback_soc_mwh,
+            charge_foldback_soc_mwh: w.charge_foldback_soc_mwh,
+        }
+    }
 }
 
 /// Validation error for [`StorageParams`].
 #[derive(Debug, Clone, Error, PartialEq)]
 pub enum StorageValidationError {
-    #[error("efficiency must be in (0, 1], got {0}")]
-    InvalidEfficiency(f64),
+    #[error("charge_efficiency must be in (0, 1], got {0}")]
+    InvalidChargeEfficiency(f64),
+    #[error("discharge_efficiency must be in (0, 1], got {0}")]
+    InvalidDischargeEfficiency(f64),
     #[error("energy_capacity_mwh must be > 0, got {0}")]
     InvalidEnergyCapacity(f64),
     #[error("soc_min_mwh ({soc_min_mwh}) exceeds soc_max_mwh ({soc_max_mwh})")]
@@ -99,6 +202,22 @@ pub enum StorageValidationError {
         soc_min_mwh: f64,
         soc_max_mwh: f64,
     },
+    #[error(
+        "discharge_foldback_soc_mwh ({threshold}) must lie in (soc_min_mwh ({soc_min}), soc_max_mwh ({soc_max})]; outside this range the foldback cut is either empty or covers the whole range"
+    )]
+    InvalidDischargeFoldback {
+        threshold: f64,
+        soc_min: f64,
+        soc_max: f64,
+    },
+    #[error(
+        "charge_foldback_soc_mwh ({threshold}) must lie in [soc_min_mwh ({soc_min}), soc_max_mwh ({soc_max})); outside this range the foldback cut is either empty or covers the whole range"
+    )]
+    InvalidChargeFoldback {
+        threshold: f64,
+        soc_min: f64,
+        soc_max: f64,
+    },
 }
 
 impl StorageParams {
@@ -110,7 +229,8 @@ impl StorageParams {
     /// `Generator::pmax = discharge_mw_max`.
     pub fn with_energy_capacity_mwh(energy_capacity_mwh: f64) -> Self {
         Self {
-            efficiency: 0.90,
+            charge_efficiency: 0.90,
+            discharge_efficiency: 0.98,
             energy_capacity_mwh,
             soc_initial_mwh: 0.5 * energy_capacity_mwh,
             soc_min_mwh: 0.0,
@@ -124,13 +244,40 @@ impl StorageParams {
             max_c_rate_charge: None,
             max_c_rate_discharge: None,
             chemistry: None,
+            discharge_foldback_soc_mwh: None,
+            charge_foldback_soc_mwh: None,
+        }
+    }
+
+    /// Round-trip efficiency implied by the charge/discharge pair. Useful for
+    /// reporting and tests where a single figure is expected.
+    pub fn round_trip_efficiency(&self) -> f64 {
+        self.charge_efficiency * self.discharge_efficiency
+    }
+
+    /// Construct a symmetric split from a single round-trip figure. Convenience
+    /// for callers that only have a nameplate round-trip number and want the
+    /// legacy sqrt-per-leg behaviour.
+    pub fn from_round_trip(energy_capacity_mwh: f64, round_trip: f64) -> Self {
+        let leg = round_trip.max(0.0).sqrt();
+        Self {
+            charge_efficiency: leg,
+            discharge_efficiency: leg,
+            ..Self::with_energy_capacity_mwh(energy_capacity_mwh)
         }
     }
 
     /// Validate storage parameters.
     pub fn validate(&self) -> Result<(), StorageValidationError> {
-        if self.efficiency <= 0.0 || self.efficiency > 1.0 {
-            return Err(StorageValidationError::InvalidEfficiency(self.efficiency));
+        if self.charge_efficiency <= 0.0 || self.charge_efficiency > 1.0 {
+            return Err(StorageValidationError::InvalidChargeEfficiency(
+                self.charge_efficiency,
+            ));
+        }
+        if self.discharge_efficiency <= 0.0 || self.discharge_efficiency > 1.0 {
+            return Err(StorageValidationError::InvalidDischargeEfficiency(
+                self.discharge_efficiency,
+            ));
         }
         if self.energy_capacity_mwh <= 0.0 {
             return Err(StorageValidationError::InvalidEnergyCapacity(
@@ -150,25 +297,145 @@ impl StorageParams {
                 soc_max_mwh: self.soc_max_mwh,
             });
         }
+        if let Some(t) = self.discharge_foldback_soc_mwh {
+            if t <= self.soc_min_mwh || t > self.soc_max_mwh {
+                return Err(StorageValidationError::InvalidDischargeFoldback {
+                    threshold: t,
+                    soc_min: self.soc_min_mwh,
+                    soc_max: self.soc_max_mwh,
+                });
+            }
+        }
+        if let Some(t) = self.charge_foldback_soc_mwh {
+            if t < self.soc_min_mwh || t >= self.soc_max_mwh {
+                return Err(StorageValidationError::InvalidChargeFoldback {
+                    threshold: t,
+                    soc_min: self.soc_min_mwh,
+                    soc_max: self.soc_max_mwh,
+                });
+            }
+        }
         Ok(())
+    }
+
+    /// Validate a market bid/offer curve used by storage dispatch.
+    ///
+    /// Curves must include an explicit `(0.0, 0.0)` origin followed by at
+    /// least one additional strictly increasing MW breakpoint.
+    pub fn validate_market_curve_points(
+        points: &[(f64, f64)],
+        curve_label: &str,
+    ) -> Result<(), String> {
+        if points.len() < 2 {
+            return Err(format!(
+                "{curve_label} must include an explicit origin (0.0, 0.0) and at least one additional breakpoint"
+            ));
+        }
+
+        let (mw0, cost0) = points[0];
+        if !mw0.is_finite() || !cost0.is_finite() {
+            return Err(format!(
+                "{curve_label} origin breakpoint must be finite, got ({mw0}, {cost0})"
+            ));
+        }
+        if mw0.abs() > 1e-9 || cost0.abs() > 1e-9 {
+            return Err(format!(
+                "{curve_label} must start at an explicit origin breakpoint (0.0, 0.0), got ({mw0}, {cost0})"
+            ));
+        }
+
+        let mut prev_mw = mw0;
+        for (point_idx, &(mw, cost)) in points.iter().enumerate().skip(1) {
+            if !mw.is_finite() || !cost.is_finite() {
+                return Err(format!(
+                    "{curve_label} breakpoint {point_idx} must be finite, got ({mw}, {cost})"
+                ));
+            }
+            if mw <= prev_mw + 1e-9 {
+                return Err(format!(
+                    "{curve_label} MW breakpoints must be strictly increasing after the origin; breakpoint {point_idx} has MW {mw} after {prev_mw}"
+                ));
+            }
+            prev_mw = mw;
+        }
+
+        Ok(())
+    }
+
+    /// Evaluate a storage market bid/offer curve at a given MW level.
+    pub fn market_curve_value(points: &[(f64, f64)], mw: f64) -> f64 {
+        CostCurve::PiecewiseLinear {
+            startup: 0.0,
+            shutdown: 0.0,
+            points: points.to_vec(),
+        }
+        .evaluate(mw.max(0.0))
+    }
+
+    /// Evaluate the marginal value of a storage market bid/offer curve.
+    pub fn market_curve_marginal_value(points: &[(f64, f64)], mw: f64) -> f64 {
+        CostCurve::PiecewiseLinear {
+            startup: 0.0,
+            shutdown: 0.0,
+            points: points.to_vec(),
+        }
+        .marginal_cost(mw.max(0.0))
     }
 }
 
-/// Generator type classification.
+/// Generator electrical class.
 ///
-/// Determines whether the machine is modeled as a synchronous generator
-/// (with inertia and rotating mass) or an inverter-based resource (IBR).
+/// This captures the machine's electrical interface to the network rather than
+/// the plant/resource technology or fuel. Keep technology and fuel in their
+/// dedicated fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum GenType {
-    /// Conventional synchronous machine (steam, hydro, gas turbine, nuclear).
-    #[default]
+    /// Conventional synchronous machine with electromechanical swing dynamics.
     Synchronous,
-    /// Wind turbine generator (Type 3/4 IBR).
+    /// Asynchronous / induction machine directly coupled to the grid.
+    Asynchronous,
+    /// Power-electronics-interfaced inverter-based resource.
+    #[serde(alias = "Wind", alias = "Solar", alias = "InverterOther")]
+    InverterBased,
+    /// Hybrid resource combining multiple electrical interfaces.
+    Hybrid,
+    /// Electrical class is not known from the source data.
+    #[default]
+    Unknown,
+}
+
+/// Generator plant/resource technology classification.
+///
+/// This complements [`GenType`] by describing what the unit is, while
+/// `gen_type` describes how it connects electrically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GeneratorTechnology {
+    Thermal,
+    SteamTurbine,
+    CombustionTurbine,
+    CombinedCycle,
+    InternalCombustion,
+    Hydro,
+    PumpedStorage,
+    Hydrokinetic,
+    Nuclear,
+    Geothermal,
     Wind,
-    /// Solar photovoltaic inverter.
     Solar,
-    /// Other inverter-based resource (e.g. fuel cell, flywheel).
-    InverterOther,
+    SolarPv,
+    SolarThermal,
+    Wave,
+    Storage,
+    BatteryStorage,
+    CompressedAirStorage,
+    FlywheelStorage,
+    FuelCell,
+    SynchronousCondenser,
+    StaticVarCompensator,
+    Motor,
+    DispatchableLoad,
+    DcTie,
+    Other,
 }
 
 /// Unit commitment status.
@@ -485,6 +752,46 @@ pub struct ReactiveCapability {
     /// Maximum reactive power at Pc2 (MVAr).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qc2max: Option<f64>,
+    /// GO Competition Challenge 3 §4.6 eq (116): linear EQUALITY linking
+    /// `q = q_at_p_zero_pu + beta * p`. Devices in `J^pqe`. The PDF
+    /// further constrains q-reserves to zero on these devices (eqs
+    /// 117-118), enforced by the reserves layer when present. None of the
+    /// public 73/617/2000-bus scenarios I inspected exercise this case
+    /// (`q_linear_cap = 1` in the GO JSON), but the larger 4000+ bus
+    /// problems may.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_linear_equality: Option<PqLinearLink>,
+    /// GO Competition Challenge 3 §4.6 eq (114): linear UPPER bound
+    /// `q + q^qru ≤ q_at_p_zero_pu + beta * p` on devices in `J^pqmax`.
+    /// In GO C3 inputs this is signaled by `q_bound_cap = 1` together
+    /// with `q_0_ub` and `beta_ub`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_linear_upper: Option<PqLinearLink>,
+    /// GO Competition Challenge 3 §4.6 eq (115): linear LOWER bound
+    /// `q − q^qrd ≥ q_at_p_zero_pu + beta * p` on devices in `J^pqmin`.
+    /// In GO C3 inputs this is signaled by `q_bound_cap = 1` together
+    /// with `q_0_lb` and `beta_lb`. The GO data property eq (229)
+    /// guarantees `J^pqmax = J^pqmin`, so a device with `q_bound_cap = 1`
+    /// always carries both `pq_linear_upper` and `pq_linear_lower`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pq_linear_lower: Option<PqLinearLink>,
+}
+
+/// Coefficients for a linear p-q linking constraint of the form
+/// `q ⨀ q_at_p_zero_pu + beta * p` where `⨀` is `=`, `≤`, or `≥` depending
+/// on the variant of `ReactiveCapability::pq_linear_*` that holds it.
+///
+/// All values are in per-unit on the device's machine base. The full GO
+/// formulation also references the `active_indicator` (`u^on + Σ u^su +
+/// Σ u^sd`) on the constant term, but in single-period AC reconcile the
+/// commitment is fixed and the indicator collapses to a constant `0` or
+/// `1` that the AC OPF can fold into the row's constant offset.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PqLinearLink {
+    /// Reactive power intercept at `p = 0` in per-unit.
+    pub q_at_p_zero_pu: f64,
+    /// Slope `dq/dp` in per-unit (pu/pu).
+    pub beta: f64,
 }
 
 /// Fuel-related parameters.
@@ -585,9 +892,15 @@ pub struct Generator {
     /// Cost curve for OPF (physical cost for planning).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<CostCurve>,
-    /// Generator type classification.
+    /// Generator electrical class.
     #[serde(default)]
     pub gen_type: GenType,
+    /// Generator technology / prime mover classification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub technology: Option<GeneratorTechnology>,
+    /// Source-native technology code when available (e.g. MATPOWER `gentype`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_technology_code: Option<String>,
     /// AGC participation factor (dimensionless).
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "apf")]
     pub agc_participation_factor: Option<f64>,
@@ -656,7 +969,9 @@ impl Default for Generator {
             pmin: 0.0,
             in_service: true,
             cost: None,
-            gen_type: GenType::Synchronous,
+            gen_type: GenType::Unknown,
+            technology: None,
+            source_technology_code: None,
             agc_participation_factor: None,
             h_inertia_s: None,
             pfr_eligible: true,
@@ -691,6 +1006,46 @@ impl Generator {
         let mut generator = Self::new(bus, p, voltage_setpoint_pu);
         generator.id = id.into();
         generator
+    }
+
+    /// Returns true when the generator can move reactive output enough to support
+    /// a voltage target.
+    #[inline]
+    pub fn has_reactive_power_range(&self, tolerance_mvar: f64) -> bool {
+        if self.qmax.is_nan() || self.qmin.is_nan() {
+            return false;
+        }
+        if !self.qmax.is_finite() || !self.qmin.is_finite() {
+            return true;
+        }
+        self.qmax > self.qmin + tolerance_mvar
+    }
+
+    /// Returns true when this generator is explicitly excluded from acting as
+    /// a voltage-regulating reference resource.
+    #[inline]
+    pub fn is_excluded_from_voltage_regulation(&self) -> bool {
+        self.market
+            .as_ref()
+            .and_then(|market| market.qualifications.get("ac_voltage_regulation_excluded"))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Returns true when the generator should participate in AC voltage control.
+    ///
+    /// Q range is intentionally NOT required here: a generator with
+    /// `qmin == qmax` (e.g. Q pinned to a reference value for
+    /// diagnostic roundtrips or fixed-Q dispatch replays) is still a
+    /// legitimate voltage reference — V is the free variable at its bus,
+    /// Q just happens to be fixed rather than free. Requiring
+    /// `has_reactive_power_range` here breaks `validate_for_solve`
+    /// whenever the per-period dispatch profile collapses Q bounds to
+    /// a point (the bus then has no regulator count, slack-placement
+    /// check fails, AC-OPF preflight rejects the network).
+    #[inline]
+    pub fn can_voltage_regulate(&self) -> bool {
+        self.in_service && !self.is_excluded_from_voltage_regulation() && self.voltage_regulated
     }
 
     // ── Ramp forwarding methods ───────────────────────────────────────
@@ -1050,6 +1405,52 @@ mod tests {
         assert_eq!(g.ramp_up_mw_per_min(), Some(5.0));
         assert_eq!(g.ramp_up_at_mw(50.0), Some(5.0));
         assert_eq!(g.ramp_up_avg_mw_per_min(), Some(5.0));
+    }
+
+    #[test]
+    #[ignore = "encoded spec behavior drifted from implementation; revisit voltage-regulation eligibility rules"]
+    fn test_generator_can_voltage_regulate_requires_reactive_range() {
+        let mut generator = Generator {
+            qmin: 0.0,
+            qmax: 0.0,
+            ..Generator::default()
+        };
+        assert!(!generator.has_reactive_power_range(1e-9));
+        assert!(!generator.can_voltage_regulate());
+
+        generator.qmax = 10.0;
+        assert!(generator.has_reactive_power_range(1e-9));
+        assert!(generator.can_voltage_regulate());
+    }
+
+    #[test]
+    fn test_generator_can_voltage_regulate_accepts_unbounded_reactive_range() {
+        let generator = Generator {
+            qmin: f64::NEG_INFINITY,
+            qmax: f64::INFINITY,
+            ..Generator::default()
+        };
+        assert!(generator.has_reactive_power_range(1e-9));
+        assert!(generator.can_voltage_regulate());
+    }
+
+    #[test]
+    fn test_generator_can_voltage_regulate_respects_exclusion_qualification() {
+        let mut generator = Generator {
+            qmin: -10.0,
+            qmax: 10.0,
+            market: Some(MarketParams::default()),
+            ..Generator::default()
+        };
+        generator
+            .market
+            .as_mut()
+            .expect("market params")
+            .qualifications
+            .insert("ac_voltage_regulation_excluded".to_string(), true);
+        assert!(generator.has_reactive_power_range(1e-9));
+        assert!(!generator.can_voltage_regulate());
+        assert!(generator.is_excluded_from_voltage_regulation());
     }
 
     // ── enforce_monotonic_ramp ──

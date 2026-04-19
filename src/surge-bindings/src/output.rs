@@ -57,6 +57,25 @@ pub(crate) fn print_json_result(v: &impl serde::Serialize) {
     }
 }
 
+/// Print a pre-encoded JSON value to stdout using the same NaN/Inf error policy
+/// as [`print_json_result`].
+pub(crate) fn print_json_value(v: &serde_json::Value) {
+    match serde_json::to_string_pretty(v) {
+        Ok(json) => println!("{}", json),
+        Err(e) => {
+            tracing::error!(
+                "JSON serialization failed (possible NaN/Inf in results): {}. \
+                 Tip: the solve may have diverged — check the solver status field.",
+                e
+            );
+            println!(
+                "{{\"status\":\"diverged\",\"error\":\"JSON serialization failed: NaN or Inf in results\"}}"
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
 pub(crate) fn resolve_text_detail(
     detail: TextDetail,
     network: &surge_network::Network,

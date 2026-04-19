@@ -1,0 +1,8 @@
+{
+  "name": "go_c3",
+  "title": "GO Challenge 3",
+  "description": "ARPA-E GO Competition Challenge 3 — baseline solves, z-score breakdowns, generator / load / branch / AS views, violation reports, and live re-solve / re-validate.",
+  "route": "go_c3",
+  "icon": "⚡",
+  "tag": "competition"
+}
