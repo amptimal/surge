@@ -540,7 +540,12 @@ fn set_string_option(lib: &HighsLib, highs: *mut std::ffi::c_void, option_name: 
     }
 }
 
-fn set_int_option(lib: &HighsLib, highs: *mut std::ffi::c_void, option_name: &str, value: HighsInt) {
+fn set_int_option(
+    lib: &HighsLib,
+    highs: *mut std::ffi::c_void,
+    option_name: &str,
+    value: HighsInt,
+) {
     let option = CString::new(option_name).expect("static string contains no null bytes");
     unsafe {
         (lib.Highs_setIntOptionValue)(highs, option.as_ptr(), value);
