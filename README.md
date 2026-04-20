@@ -23,12 +23,12 @@ requires a separate license from Amptimal. See [LICENSE](LICENSE),
 
 ## Markets
 
-The `markets/` tree is the headline surface of the repository. Each market is
+The `markets/` folder is where market simulations built on
 a declarative spec — a `Policy`, a `Problem`, and a `solve` entry point —
 built on the canonical dispatch and market layers in `surge-dispatch` and
 `surge-market`. Input and output flow through native Surge types
 (`surge.Network`, the typed `DispatchRequest`, `DispatchResult`,
-`MarketConfig`): no bespoke schemas, no hand-rolled adapters.
+`MarketConfig`)
 
 | Market | What it clears | Topology | Workflow |
 |---|---|---|---|
@@ -224,18 +224,6 @@ native dependency expectations live in
 [docs/support-compatibility.md](docs/support-compatibility.md).
 
 Common native requirements:
-
-- Rust stable 1.87+
-- SuiteSparse / KLU development libraries for AC workflows
-- HiGHS C library for `surge-opf` (install via package manager or set `HIGHS_LIB_DIR`)
-- Ipopt C library for open-source AC-OPF (install via package manager or set `IPOPT_LIB_DIR`)
-- COPT 8.x if you want the commercial AC-OPF backend; `surge-py` wheels built
-  with `COPT_HOME` bundle the Surge NLP shim automatically
-
-> **Note:** `pip install highspy` and `pip install cyipopt` do **not** provide
-> the C shared libraries Surge needs. Install HiGHS and Ipopt via your system
-> package manager (`brew install highs ipopt` /
-> `apt install libhighs-dev coinor-libipopt-dev`).
 
 ## Documentation
 
