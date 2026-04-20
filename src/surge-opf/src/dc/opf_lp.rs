@@ -634,6 +634,7 @@ fn decode_dc_opf_result(
         solver_name: Some(solver_name),
         solver_version: Some(solver_version),
         ac_opf_timings: None,
+        nlp_trace: None,
         bus_q_slack_pos_mvar: vec![],
         bus_q_slack_neg_mvar: vec![],
         bus_p_slack_pos_mw: vec![],
@@ -2411,6 +2412,7 @@ mod tests {
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
             limit_mw_active_period: None,
+            breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
         // Slack flowgate with very high limit
         net.flowgates.push(Flowgate {
@@ -2427,6 +2429,7 @@ mod tests {
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
             limit_mw_active_period: None,
+            breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
         // Test 1: flowgate-only (no interfaces) — avoid redundant / infeasible constraints
         {

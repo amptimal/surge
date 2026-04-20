@@ -49,6 +49,26 @@ _SCUC_MIP_STAT_KEYS = (
     "terminated_by",
 )
 
+_AC_OPF_STAT_KEYS = (
+    "period_idx",
+    "period_label",
+    "solver_name",
+    "solve_time_secs",
+    "attempt_label",
+    "n_vars",
+    "n_constraints",
+    "jac_nnz",
+    "hess_nnz",
+    "status_code",
+    "status_label",
+    "iterations",
+    "objective",
+    "final_primal_inf",
+    "final_dual_inf",
+    "final_mu",
+    "converged",
+)
+
 
 @dataclass
 class _GoC3Outcome:
@@ -72,6 +92,30 @@ def _extract_scuc_mip_stats(workflow_result: dict | None) -> dict | None:
         if not trace:
             return None
         return {key: trace.get(key) for key in _SCUC_MIP_STAT_KEYS if key in trace}
+    return None
+
+
+def _extract_ac_opf_stats(workflow_result: dict | None) -> list[dict] | None:
+    """Return per-period AC-OPF solver stats from the AC SCED stage.
+
+    Walks ``workflow_result["stages"]`` looking for a stage whose
+    ``solution.diagnostics.ac_opf_stats`` is populated. Returns a list
+    of dicts (one per period) restricted to the known keys, or ``None``
+    when the workflow ran no AC SCED stage or the backend didn't emit a
+    trace (non-Ipopt NLP backends return ``None`` traces today).
+    """
+    if not workflow_result:
+        return None
+    for stage in workflow_result.get("stages") or []:
+        solution = stage.get("solution") or {}
+        diagnostics = solution.get("diagnostics") or {}
+        stats = diagnostics.get("ac_opf_stats")
+        if not stats:
+            continue
+        return [
+            {key: entry.get(key) for key in _AC_OPF_STAT_KEYS if key in entry}
+            for entry in stats
+        ]
     return None
 
 
@@ -104,6 +148,25 @@ def _run_pass(
             stop_after_stage=stop_after,
         )
         timings["solve_workflow"] = time.perf_counter() - t0
+
+        stage_err = wr.get("error") if isinstance(wr, dict) else None
+        if stage_err is not None:
+            msg = (
+                f"stage '{stage_err['stage_id']}' ({stage_err['role']}) "
+                f"failed: {stage_err['error']}"
+            )
+            logger.warning(
+                "Native solve failed in stage '%s' (%s): %s",
+                stage_err["stage_id"],
+                stage_err["role"],
+                stage_err["error"],
+            )
+            return _GoC3Outcome(
+                workflow_result=wr,
+                exported=None,
+                step_timings=timings,
+                error=msg,
+            )
 
         if stop_after == "scuc":
             final_solution = wr["stages"][0]["solution"]
@@ -153,8 +216,8 @@ def solve(
 
     Runs the canonical Rust workflow (SCUC → AC-SCED) via
     :mod:`surge.market.go_c3`. One pass, no retries — operational
-    workarounds (e.g. retry with a reactive-support pin) are left to
-    the caller.
+    workarounds (e.g. retry with a reactive-support pin) live in
+    :mod:`benchmarks.go_c3.runner`.
 
     Writes four files to *workdir*:
 
@@ -189,17 +252,30 @@ def solve(
         return artifacts
 
     def extras_from(outcome: _GoC3Outcome) -> dict[str, Any]:
-        return {
+        wr = outcome.workflow_result
+        extras: dict[str, Any] = {
             "problem_path": str(problem.path),
             "solve_mode": "native_workflow",
             "step_timings_secs": outcome.step_timings,
             "workflow_stages": (
-                [stage["stage_id"] for stage in outcome.workflow_result["stages"]]
-                if outcome.workflow_result is not None
+                [stage["stage_id"] for stage in wr["stages"]]
+                if wr is not None
                 else None
             ),
-            "scuc_mip_stats": _extract_scuc_mip_stats(outcome.workflow_result),
+            "scuc_mip_stats": _extract_scuc_mip_stats(wr),
+            "ac_opf_stats": _extract_ac_opf_stats(wr),
         }
+        if wr is not None:
+            extras["stage_timings_secs"] = [
+                {"stage_id": stage["stage_id"], "timings": stage.get("timings")}
+                for stage in wr["stages"]
+            ]
+            stage_err = wr.get("error")
+            if stage_err is not None:
+                extras["failed_stage_id"] = stage_err["stage_id"]
+                extras["failed_stage_role"] = stage_err["role"]
+                extras["failed_stage_error"] = stage_err["error"]
+        return extras
 
     return run_market_solve(
         workdir,

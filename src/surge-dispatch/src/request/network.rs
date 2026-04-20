@@ -145,6 +145,13 @@ pub struct LossFactorPolicy {
     pub enabled: bool,
     pub max_iterations: usize,
     pub tolerance: f64,
+    /// Cold-start strategy the SCUC security loop uses to seed the
+    /// first iteration's loss-factor state. Subsequent iterations
+    /// always warm-start from the prior iteration's converged
+    /// `dloss_dp`, so this only affects the very first MIP solve. See
+    /// [`LossFactorWarmStartMode`] for the supported strategies.
+    #[serde(default)]
+    pub warm_start_mode: LossFactorWarmStartMode,
 }
 
 impl Default for LossFactorPolicy {
@@ -153,8 +160,46 @@ impl Default for LossFactorPolicy {
             enabled: false,
             max_iterations: 3,
             tolerance: 1e-3,
+            warm_start_mode: LossFactorWarmStartMode::default(),
         }
     }
+}
+
+/// Cold-start strategy for the SCUC loss-factor warm-start on the
+/// first security iteration.
+///
+/// Defaults to [`LossFactorWarmStartMode::Disabled`] — first MIP is
+/// solved lossless, refinement LP corrects after. Set to one of the
+/// other variants to inject a loss estimate before the first MIP and
+/// (when the estimate is close to the converged state) skip the
+/// refinement LP re-solve entirely.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize, JsonSchema,
+)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum LossFactorWarmStartMode {
+    /// No cold-start warm-start on iter 0. The first MIP is solved
+    /// lossless; the refinement LP corrects for losses after.
+    /// Subsequent security iterations still warm-start from the prior
+    /// iteration's `dloss_dp` if available.
+    #[default]
+    Disabled,
+    /// Seed every bus's `dloss` to the same rate `rate ∈ [0, 0.5]`
+    /// (typical `0.02` for 2%). `total_losses_mw = rate × total_load`.
+    /// No per-bus variation; cheapest cold-start. Good when the
+    /// network's losses are dominated by a roughly uniform background
+    /// loss rate rather than strong per-bus asymmetries.
+    Uniform { rate: f64 },
+    /// Seed `dloss` from the loss-PTDF applied to the per-bus load
+    /// vector, normalised so total weighted losses match `rate ×
+    /// total_load`. No DC PF invocation. Captures per-bus variation
+    /// from network topology + load pattern alone.
+    LoadPattern { rate: f64 },
+    /// Seed from a DC power flow on each hourly network's initial-
+    /// condition dispatch. Most accurate cold-start; costs one DC PF
+    /// per period (sub-ms on 617-bus). Falls back to
+    /// `Uniform { rate: 0.02 }` if the DC PF fails.
+    DcPf,
 }
 
 /// Forbidden-operating-zone enforcement policy.

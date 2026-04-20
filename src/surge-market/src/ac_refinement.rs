@@ -531,7 +531,9 @@ impl RefinementRuntime {
                 report.selected_iteration = iteration;
                 report.selected_after_failed_or_worse_wide_band_retry =
                     grid_outcome.selected_after_failed_or_worse_wide_band_retry;
-                return Ok((grid_outcome.solution, report));
+                let mut solution = grid_outcome.solution;
+                solution.stamp_ac_opf_attempt_label(&grid_outcome.attempt_name);
+                return Ok((solution, report));
             }
 
             let mut probe_fired = false;
@@ -567,7 +569,9 @@ impl RefinementRuntime {
                 report.selected_iteration = iteration;
                 report.selected_after_failed_or_worse_wide_band_retry =
                     grid_outcome.selected_after_failed_or_worse_wide_band_retry;
-                return Ok((grid_outcome.solution, report));
+                let mut solution = grid_outcome.solution;
+                solution.stamp_ac_opf_attempt_label(&grid_outcome.attempt_name);
+                return Ok((solution, report));
             }
             working_request = probe_next_request.expect("probe_fired implies some request");
         }

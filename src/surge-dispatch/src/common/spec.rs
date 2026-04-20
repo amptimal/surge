@@ -266,6 +266,12 @@ pub(crate) struct DispatchProblemSpec<'a> {
     pub max_nomogram_iter: usize,
     pub max_loss_factor_iters: usize,
     pub loss_factor_tol: f64,
+    /// Cold-start warm-start strategy for the first SCUC security
+    /// iteration's loss factors. Copied from
+    /// [`crate::request::DispatchInput::loss_factor_warm_start_mode`].
+    /// The security loop consults this on iter 0 to decide whether to
+    /// pre-seed the MIP with a loss estimate.
+    pub loss_factor_warm_start_mode: crate::request::network::LossFactorWarmStartMode,
     pub enforce_forbidden_zones: bool,
     pub foz_max_transit_periods: Option<usize>,
     pub load_profiles: &'a LoadProfiles,
@@ -380,6 +386,7 @@ impl<'a> DispatchProblemSpec<'a> {
             options.max_nomogram_iter,
             options.max_loss_factor_iters,
             options.loss_factor_tol,
+            crate::request::network::LossFactorWarmStartMode::Disabled,
             options.enforce_forbidden_zones,
             options.foz_max_transit_periods,
             &options.load_profiles,
@@ -474,6 +481,7 @@ impl<'a> DispatchProblemSpec<'a> {
             input.max_nomogram_iter,
             input.max_loss_factor_iters,
             input.loss_factor_tol,
+            input.loss_factor_warm_start_mode,
             input.enforce_forbidden_zones,
             input.foz_max_transit_periods,
             &input.load_profiles,
@@ -568,6 +576,7 @@ impl<'a> DispatchProblemSpec<'a> {
         max_nomogram_iter: usize,
         max_loss_factor_iters: usize,
         loss_factor_tol: f64,
+        loss_factor_warm_start_mode: crate::request::network::LossFactorWarmStartMode,
         enforce_forbidden_zones: bool,
         foz_max_transit_periods: Option<usize>,
         load_profiles: &'a LoadProfiles,
@@ -661,6 +670,7 @@ impl<'a> DispatchProblemSpec<'a> {
             max_nomogram_iter,
             max_loss_factor_iters,
             loss_factor_tol,
+            loss_factor_warm_start_mode,
             enforce_forbidden_zones,
             foz_max_transit_periods,
             load_profiles,
@@ -776,6 +786,7 @@ impl<'a> DispatchProblemSpec<'a> {
             max_nomogram_iter: self.max_nomogram_iter,
             max_loss_factor_iters: self.max_loss_factor_iters,
             loss_factor_tol: self.loss_factor_tol,
+            loss_factor_warm_start_mode: self.loss_factor_warm_start_mode,
             enforce_forbidden_zones: self.enforce_forbidden_zones,
             foz_max_transit_periods: self.foz_max_transit_periods,
             load_profiles: self.load_profiles,
@@ -918,6 +929,7 @@ impl<'a> DispatchProblemSpec<'a> {
             max_nomogram_iter: self.max_nomogram_iter,
             max_loss_factor_iters: self.max_loss_factor_iters,
             loss_factor_tol: self.loss_factor_tol,
+            loss_factor_warm_start_mode: self.loss_factor_warm_start_mode,
             enforce_forbidden_zones: self.enforce_forbidden_zones,
             foz_max_transit_periods: self.foz_max_transit_periods,
             load_profiles: self.load_profiles,

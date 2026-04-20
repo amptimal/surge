@@ -201,6 +201,36 @@ pub struct GoC3Policy {
     /// cap is irrelevant since no second solve consumes the added cuts.
     pub scuc_security_max_cuts_per_iteration: usize,
 
+    /// Cold-start loss-factor warm-start mode used on the first SCUC
+    /// security iteration. Subsequent iterations always warm-start
+    /// from the prior iteration's converged `dloss_dp` regardless of
+    /// this setting. Modes:
+    ///
+    /// * `None` — no cold-start; first MIP is lossless, refinement LP
+    ///   corrects after.
+    /// * `Some(("uniform", rate))` — every bus seeded with
+    ///   `dloss = rate`, `total_losses = rate × total_load`. Crude but
+    ///   free.
+    /// * `Some(("load_pattern", rate))` (default `("load_pattern",
+    ///   0.02)`) — per-bus `dloss` from loss-PTDF applied to the load
+    ///   vector; calibrated to `rate × total_load`. Captures topology
+    ///   asymmetry without running DC PF.
+    /// * `Some(("dc_pf", 0.0))` — DC power flow on initial gen
+    ///   setpoints; most accurate cold-start, costs ~ms per period.
+    ///   Falls back to uniform if the resulting loss estimate exceeds
+    ///   5% of load (guards against degenerate PF with only a partial
+    ///   commitment available).
+    ///
+    /// Serialized as a 2-tuple `(mode_str, rate)` for convenient
+    /// Python-side construction; the rate is ignored for `dc_pf`.
+    pub scuc_loss_factor_warm_start: Option<(String, f64)>,
+
+    /// Override for `DispatchRequest::network::loss_factors::max_iterations`.
+    /// Default `Some(0)` — trust the warm-start entirely, skip the
+    /// refinement LP. `None` preserves the historical 1-iteration
+    /// behaviour; higher values run additional refinement rounds.
+    pub scuc_loss_factor_max_iterations: Option<usize>,
+
     /// Per-period AC SCED concurrency.
     ///
     /// * `None` (default) — sequential per-period AC SCED, each period
@@ -284,9 +314,11 @@ impl Default for GoC3Policy {
             sced_enforce_regulated_bus_vm_targets: false,
             reactive_support_pin_factor: 0.0,
             run_pricing: false,
-            scuc_security_preseed_count_per_period: 1_000,
+            scuc_security_preseed_count_per_period: 250,
             scuc_security_max_iterations: 5,
-            scuc_security_max_cuts_per_iteration: 5_000,
+            scuc_security_max_cuts_per_iteration: 2_500,
+            scuc_loss_factor_warm_start: Some(("load_pattern".to_string(), 0.02)),
+            scuc_loss_factor_max_iterations: Some(0),
             ac_sced_period_concurrency: None,
             commitment_mip_rel_gap: None,
             commitment_time_limit_secs: None,

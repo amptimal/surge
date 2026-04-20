@@ -96,6 +96,7 @@ pub(crate) fn build_input(
         use_loss_factors: request.network.loss_factors.enabled,
         max_loss_factor_iters: request.network.loss_factors.max_iterations,
         loss_factor_tol: request.network.loss_factors.tolerance,
+        loss_factor_warm_start_mode: request.network.loss_factors.warm_start_mode,
         enforce_forbidden_zones: request.network.forbidden_zones.enabled,
         foz_max_transit_periods: request.network.forbidden_zones.max_transit_periods,
         enforce_shutdown_deloading: request.network.commitment_transitions.shutdown_deloading,

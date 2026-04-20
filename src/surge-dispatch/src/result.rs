@@ -301,6 +301,13 @@ pub struct DispatchDiagnostics {
     /// Empty for DC-only solves.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ac_sced_period_timings: Vec<crate::sced::ac::AcScedPeriodTimings>,
+    /// Per-period AC OPF solver stats (problem size, Ipopt termination
+    /// status, residuals, barrier parameter). Parallel to
+    /// [`DispatchDiagnostics::ac_sced_period_timings`]; populated when
+    /// the NLP backend provides a trace (Ipopt). Entries may be skipped
+    /// for periods whose backend returns no trace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ac_opf_stats: Vec<crate::sced::ac::AcOpfStats>,
     /// Commitment (SCUC) MIP progress trace. Populated only when the
     /// caller supplied a `mip_gap_schedule` on the commitment options
     /// and the LP/MIP backend supports progress callbacks (Gurobi today).
@@ -1346,6 +1353,19 @@ impl DispatchSolution {
         &self.diagnostics
     }
 
+    /// Stamp the refinement-runtime attempt label onto every
+    /// [`crate::sced::ac::AcOpfStats`] entry that doesn't already have
+    /// one set. Called by surge-market's refinement runtime when it
+    /// selects a winning attempt so post-mortem consumers can see which
+    /// retry variant produced each period's solve.
+    pub fn stamp_ac_opf_attempt_label(&mut self, label: &str) {
+        for stats in &mut self.diagnostics.ac_opf_stats {
+            if stats.attempt_label.is_none() {
+                stats.attempt_label = Some(label.to_string());
+            }
+        }
+    }
+
     /// Mutable access to the diagnostics payload. Used by the dispatch
     /// wrappers to patch in pipeline-level phase timings that aren't
     /// known at solution-construction time (e.g. `prepare_request_secs`,
@@ -1366,7 +1386,14 @@ impl DispatchSolution {
         &self.summary.objective_terms
     }
 
+    /// Recompute the dispatch-level audit block. Gated by the
+    /// `SURGE_OBJECTIVE_AUDIT` env var — see
+    /// [`surge_solution::objective_audit_enabled`]. No-op when the gate
+    /// is off; `audit` stays at its serde default.
     pub fn refresh_audit(&mut self) {
+        if !surge_solution::objective_audit_enabled() {
+            return;
+        }
         self.audit = <Self as AuditableSolution>::computed_solution_audit(self);
     }
 

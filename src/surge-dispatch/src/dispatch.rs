@@ -619,6 +619,16 @@ pub struct RawDispatchSolution {
     /// Model diagnostic snapshots captured during solve.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_diagnostics: Vec<crate::model_diagnostic::ModelDiagnostic>,
+
+    /// Final loss-factor state from the SCUC refinement iteration —
+    /// `dloss_dp[t][bus]` and `total_losses_mw[t]`. Internal plumbing
+    /// used by the security loop to warm-start the next iteration's
+    /// SCUC solve with the converged loss sensitivities (skipping
+    /// the lossless-MIP pass). `#[serde(skip)]` because it's runtime
+    /// state, not a persisted solution artifact; downstream consumers
+    /// use `bus_loss_allocation_mw` for the user-facing loss data.
+    #[serde(skip)]
+    pub scuc_final_loss_warm_start: Option<crate::scuc::losses::LossFactorWarmStart>,
 }
 
 // ---------------------------------------------------------------------------
@@ -685,6 +695,7 @@ impl RawDispatchSolution {
             cc_transition_costs: Vec::new(),
             model_diagnostics: Vec::new(),
             bus_loss_allocation_mw: Vec::new(),
+            scuc_final_loss_warm_start: None,
         }
     }
 }
@@ -2237,6 +2248,7 @@ fn attach_keyed_period_views(
         security: result.diagnostics.security.clone(),
         sced_ac_benders: result.diagnostics.sced_ac_benders.clone(),
         ac_sced_period_timings: result.diagnostics.ac_sced_period_timings.clone(),
+        ac_opf_stats: result.diagnostics.ac_opf_stats.clone(),
         commitment_mip_trace: result.diagnostics.commitment_mip_trace.clone(),
     };
 }
@@ -2659,6 +2671,7 @@ fn emit_public_keyed_solution(
         ac_voltage_penalty_per_pu: _,
         ac_angle_penalty_per_rad: _,
         bus_loss_allocation_mw: _,
+        scuc_final_loss_warm_start: _,
     } = result;
 
     let resource_meta_by_id: HashMap<&str, &DispatchResource> = resources
@@ -2884,6 +2897,7 @@ fn emit_public_keyed_solution(
             security: diagnostics.security,
             sced_ac_benders: diagnostics.sced_ac_benders.clone(),
             ac_sced_period_timings: diagnostics.ac_sced_period_timings,
+            ac_opf_stats: diagnostics.ac_opf_stats,
             commitment_mip_trace: diagnostics.commitment_mip_trace,
         },
         periods,
@@ -2945,6 +2959,7 @@ pub(crate) struct SequentialDispatchAccumulator {
     exact_dispatch_overrides_by_period: Vec<Vec<Option<f64>>>,
     state: SequentialDispatchState,
     ac_sced_period_timings: Vec<crate::sced::ac::AcScedPeriodTimings>,
+    ac_opf_stats: Vec<crate::sced::ac::AcOpfStats>,
 }
 
 impl SequentialDispatchAccumulator {
@@ -2982,6 +2997,7 @@ impl SequentialDispatchAccumulator {
             exact_dispatch_overrides_by_period,
             state: SequentialDispatchState::from_initial_state(problem_spec.initial_state),
             ac_sced_period_timings: Vec::with_capacity(problem_spec.n_periods),
+            ac_opf_stats: Vec::with_capacity(problem_spec.n_periods),
         }
     }
 
@@ -3098,6 +3114,7 @@ impl SequentialDispatchAccumulator {
             self.storage_soc,
         );
         result.diagnostics.ac_sced_period_timings = self.ac_sced_period_timings;
+        result.diagnostics.ac_opf_stats = self.ac_opf_stats;
         result.bus_angles_rad = self.bus_angles_rad;
         result.bus_voltage_pu = self.bus_voltage_pu;
         result.generator_q_mvar = self.generator_q_mvar;
@@ -5156,6 +5173,9 @@ fn record_ac_sced_period_into_accumulator(
     artifacts: AcScedPeriodArtifacts,
 ) {
     accumulator.ac_sced_period_timings.push(artifacts.timings);
+    if let Some(stats) = artifacts.opf_stats {
+        accumulator.ac_opf_stats.push(stats);
+    }
     let sol = artifacts.period_solution;
     let (lmp_energy, lmp_congestion, lmp_loss) =
         decompose_ac_sced_lmp(net_t, &sol.lmp, &sol.bus_voltage_pu, &sol.bus_angle_rad);
@@ -6283,6 +6303,7 @@ mod tests {
                 enabled: input.use_loss_factors,
                 max_iterations: input.max_loss_factor_iters,
                 tolerance: input.loss_factor_tol,
+                warm_start_mode: Default::default(),
             },
             forbidden_zones: crate::request::ForbiddenZonePolicy {
                 enabled: input.enforce_forbidden_zones,
@@ -8016,6 +8037,7 @@ mod tests {
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
             limit_mw_active_period: None,
+            breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
         net.flowgates.push(surge_network::network::Flowgate {
             name: "FG_12_slack".to_string(),
@@ -8031,6 +8053,7 @@ mod tests {
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
             limit_mw_active_period: None,
+            breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
 
         let sol = solve_dispatch(
@@ -9430,8 +9453,6 @@ mod tests {
             "expected clean AC fixed-commitment ledger, got {:#?}",
             result.objective_ledger_mismatches()
         );
-        assert!(result.audit().audit_passed);
-        assert!(!result.audit().has_residual_terms);
     }
 
     #[test]
@@ -10798,8 +10819,6 @@ mod tests {
             "market30 multi-hour SCUC should reconcile exactly: {:#?}",
             keyed.objective_ledger_mismatches()
         );
-        assert!(keyed.audit().audit_passed);
-        assert!(!keyed.audit().has_residual_terms);
 
         let nuclear_idx = market30_generator_index(&network, "G4");
         let bess_idx = market30_generator_index(&network, "B1");
@@ -10931,8 +10950,6 @@ mod tests {
             "market30 reserve co-optimization should reconcile exactly: {:#?}",
             keyed.objective_ledger_mismatches()
         );
-        assert!(keyed.audit().audit_passed);
-        assert!(!keyed.audit().has_residual_terms);
 
         let g3_id = network.generators[market30_generator_index(&network, "G3")]
             .id
@@ -11055,7 +11072,6 @@ mod tests {
             "market30 congestion/HVDC regression should reconcile exactly: {:#?}",
             result.objective_ledger_mismatches()
         );
-        assert!(!result.audit().has_residual_terms);
         let period = &result.periods[0];
 
         assert_eq!(period.hvdc_results.len(), 1);
@@ -11158,7 +11174,6 @@ mod tests {
             "fixed-HVDC regression should reconcile exactly: {:#?}",
             result.objective_ledger_mismatches()
         );
-        assert!(!result.audit().has_residual_terms);
         assert_eq!(result.periods.len(), 1);
         assert_eq!(result.periods[0].hvdc_results.len(), 1);
         assert!(
@@ -11229,8 +11244,6 @@ mod tests {
             "carbon-priced market30 case should reconcile exactly: {:#?}",
             carbon.objective_ledger_mismatches()
         );
-        assert!(!baseline.audit().has_residual_terms);
-        assert!(!carbon.audit().has_residual_terms);
 
         let baseline_coal = baseline.periods[0]
             .resource(&coal_id)

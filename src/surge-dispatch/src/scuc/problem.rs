@@ -257,6 +257,20 @@ fn dispatchable_load_warm_start_target_pu(
     zero_price_dispatchable_load_target_pu(cost_model, p_sched_pu, dl.p_min_pu, p_max_pu, base_mva)
 }
 
+/// Expose the private `dispatchable_load_warm_start_target_pu` as
+/// MW for crate-internal consumers (currently the loss-factor cold
+/// start in `scuc::security`). Returns the zero-price expected served
+/// demand in MW for a single dispatchable load at a single period.
+pub(crate) fn dispatchable_load_warm_start_target_mw_pub(
+    dl_index: usize,
+    period: usize,
+    dl: &DispatchableLoad,
+    spec: &DispatchProblemSpec<'_>,
+    base_mva: f64,
+) -> f64 {
+    dispatchable_load_warm_start_target_pu(dl_index, period, dl, spec, base_mva) * base_mva
+}
+
 fn estimated_dispatchable_load_target_mw(
     spec: &DispatchProblemSpec<'_>,
     hourly_networks: &[Network],
@@ -3042,6 +3056,17 @@ pub(super) struct ScucProblemInput<'a> {
     pub solve: &'a DcSolveSession<'a>,
     pub problem: ScucProblemBuildState,
     pub problem_plan: ScucProblemPlan<'a>,
+    /// Optional loss-factor warm start seeded by the caller. When
+    /// present and `spec.use_loss_factors` is true, `solve_problem`
+    /// applies the estimate to the bus-balance rows and injection
+    /// coefficients BEFORE the first MIP, so the lossless-MIP
+    /// dispatch is avoided and [`iterate_loss_factors`] typically
+    /// converges in zero or one inner LP re-solves. Sources: the
+    /// security-loop cache (prior iteration's final `dloss_dp`),
+    /// a DC PF on a rough dispatch, a load-pattern approximation,
+    /// or a uniform loss rate — see `markets::go_c3::policy`
+    /// `scuc_warm_start_loss_factors` for the policy knob.
+    pub initial_loss_warm_start: Option<crate::scuc::losses::LossFactorWarmStart>,
 }
 
 pub(super) struct ScucProblemState<'a> {
@@ -3059,6 +3084,15 @@ pub(super) struct ScucProblemState<'a> {
     /// final diagnostics even after downstream re-solves replace
     /// `solution`.
     pub commitment_mip_trace: Option<MipTrace>,
+    /// Final loss-factor state from the refinement iteration. Carries
+    /// the per-period `dloss_dp` sensitivities and the per-period
+    /// total system losses in MW, computed from the solved theta of
+    /// the last LP re-solve. `None` when loss factors are disabled or
+    /// the network has ≤ 1 bus. Security-loop callers cache this
+    /// across iterations and feed it back in via
+    /// [`ScucProblemInput::initial_loss_warm_start`] so the next
+    /// SCUC solve can skip the pre-iter warm-start miss.
+    pub final_loss_warm_start: Option<crate::scuc::losses::LossFactorWarmStart>,
 }
 
 fn apply_commitment_schedule_bounds(
@@ -5056,6 +5090,7 @@ pub(super) fn solve_problem(
         solve,
         mut problem,
         mut problem_plan,
+        initial_loss_warm_start,
     } = input;
     let spec = &solve.spec;
     let solver = solve.solver.as_ref();
@@ -5113,6 +5148,70 @@ pub(super) fn solve_problem(
         hours = n_hours,
         generators = n_gen,
         "SCUC: MIP problem dimensions"
+    );
+
+    // Per-group variable breakdown. Sum of hourly-blocks × n_hours plus
+    // post-hourly allocations should equal n_var exactly. Logged at info
+    // so post-mortems on large scenarios don't need --log-level=debug.
+    let hourly_blocks = layout.block_breakdown_per_hour();
+    let vars_per_hour = layout.vars_per_hour();
+    let hourly_total: usize = hourly_blocks.iter().map(|(_, c)| c * n_hours).sum();
+    let post_hourly_total = n_var.saturating_sub(vars_per_hour * n_hours);
+    let cc_vars = cc_block_size;
+    let penalty_slacks = model_plan.variable.n_penalty_slacks;
+    let other_post_hourly = post_hourly_total
+        .saturating_sub(cc_vars)
+        .saturating_sub(penalty_slacks);
+    let mut breakdown_lines = String::new();
+    for (name, per_period) in &hourly_blocks {
+        let total = per_period * n_hours;
+        let pct = if n_var > 0 {
+            total as f64 / n_var as f64 * 100.0
+        } else {
+            0.0
+        };
+        breakdown_lines.push_str(&format!(
+            "\n  {:<28} {:>10} × {:>3} = {:>14}  {:>6.2}%",
+            name, per_period, n_hours, total, pct,
+        ));
+    }
+    if cc_vars > 0 {
+        let pct = cc_vars as f64 / n_var as f64 * 100.0;
+        breakdown_lines.push_str(&format!(
+            "\n  {:<28} {:>10} (post-hourly)         {:>14}  {:>6.2}%",
+            "combined_cycle_vars", cc_vars, cc_vars, pct,
+        ));
+    }
+    if penalty_slacks > 0 {
+        let pct = penalty_slacks as f64 / n_var as f64 * 100.0;
+        breakdown_lines.push_str(&format!(
+            "\n  {:<28} {:>10} (post-hourly)         {:>14}  {:>6.2}%",
+            "penalty_slacks", penalty_slacks, penalty_slacks, pct,
+        ));
+    }
+    if other_post_hourly > 0 {
+        let pct = other_post_hourly as f64 / n_var as f64 * 100.0;
+        breakdown_lines.push_str(&format!(
+            "\n  {:<28} {:>10} (post-hourly)         {:>14}  {:>6.2}%",
+            "other_post_hourly", other_post_hourly, other_post_hourly, pct,
+        ));
+    }
+    let contiguity_delta = (hourly_total + post_hourly_total) as i64 - n_var as i64;
+    info!(
+        n_var,
+        vars_per_hour,
+        hourly_total,
+        post_hourly_total,
+        cc_vars,
+        penalty_slacks,
+        contiguity_delta,
+        "SCUC variable breakdown (n_hours={}, n_gen={}):{}\n  {:<28} {:>10}        {:>14}       100%",
+        n_hours,
+        n_gen,
+        breakdown_lines,
+        "TOTAL",
+        "",
+        n_var,
     );
     if !cc_infos.is_empty() {
         info!(
@@ -5245,6 +5344,67 @@ pub(super) fn solve_problem(
             ));
         }
     }
+    // Build the loss-factor setup once per solve, to be shared between
+    // the optional pre-MIP warm-start application and the post-MIP
+    // refinement iteration. Costs one O(n_nz) column walk + per-period
+    // loss-PTDF build — shared so the refinement loop doesn't rebuild.
+    let loss_prep = if spec.use_loss_factors && network.n_buses() > 1 {
+        let _prep_t0 = Instant::now();
+        let prep = crate::scuc::losses::build_loss_factor_prep(
+            &prob,
+            &model_plan.hourly_networks,
+            &solve.bus_map,
+            layout,
+            &setup.gen_bus_idx,
+            &problem.hour_row_bases,
+            problem.n_branch_flow + problem.n_fg_rows + model_plan.network_plan.iface_rows.len(),
+            network.n_buses(),
+        )?;
+        info!(
+            stage = "build_loss_factor_prep",
+            secs = _prep_t0.elapsed().as_secs_f64(),
+            "SCUC helper solve timing"
+        );
+        Some(prep)
+    } else {
+        None
+    };
+
+    // Pre-MIP loss-factor warm start: when a caller supplies an
+    // `initial_loss_warm_start` (security-loop cache from the prior
+    // iteration, DC-PF-on-rough-dispatch estimate, load-pattern
+    // approximation, or a uniform loss rate), scale the LP
+    // coefficients + bus-balance RHS with it BEFORE the first MIP.
+    // Without this, the first MIP is solved lossless and the
+    // refinement loop needs one full LP re-solve to correct for
+    // losses. With a decent warm start the lossless-MIP dispatch
+    // already matches the loss-aware optimum, so `iterate_loss_factors`
+    // can fire the `loss_iter > 0 || initial_dloss.is_some()`
+    // convergence gate at iter 0 and avoid the re-solve entirely.
+    if let (Some(prep), Some(warm)) = (&loss_prep, initial_loss_warm_start.as_ref()) {
+        let base_mva = network.base_mva;
+        let total_losses_pu: Vec<f64> = warm
+            .total_losses_mw
+            .iter()
+            .map(|mw| if base_mva > 0.0 { mw / base_mva } else { 0.0 })
+            .collect();
+        let _warm_t0 = Instant::now();
+        crate::scuc::losses::apply_bus_loss_factors(
+            &mut prob,
+            prep,
+            &problem.hour_row_bases,
+            problem.n_branch_flow + problem.n_fg_rows + model_plan.network_plan.iface_rows.len(),
+            &warm.dloss_dp,
+            &total_losses_pu,
+        );
+        info!(
+            stage = "apply_loss_warm_start",
+            secs = _warm_t0.elapsed().as_secs_f64(),
+            total_losses_mw_t0 = warm.total_losses_mw.first().copied().unwrap_or(0.0),
+            "SCUC helper solve timing: pre-MIP loss-factor warm-start applied"
+        );
+    }
+
     if let Some(path) = std::env::var_os("SURGE_DEBUG_DUMP_SCUC_LP") {
         let path = Path::new(&path);
         dump_scuc_lp(
@@ -5429,30 +5589,61 @@ pub(super) fn solve_problem(
     }
 
     let mut bus_loss_allocation_mw: Vec<Vec<f64>> = Vec::new();
-    if spec.use_loss_factors && network.n_buses() > 1 {
+    let mut final_loss_warm_start: Option<crate::scuc::losses::LossFactorWarmStart> = None;
+    if let Some(ref prep) = loss_prep {
         let _loss_iter_t0 = Instant::now();
-        let loss_result = iterate_loss_factors(ScucLossIterationInput {
-            solver,
-            spec,
-            hourly_networks: &model_plan.hourly_networks,
-            bus_map: &solve.bus_map,
-            layout,
-            gen_bus_idx: &setup.gen_bus_idx,
-            hour_row_bases: &problem.hour_row_bases,
-            n_flow: problem.n_branch_flow
-                + problem.n_fg_rows
-                + model_plan.network_plan.iface_rows.len(),
-            n_bus: network.n_buses(),
-            time_limit_secs: remaining_time_limit_secs(solve_deadline),
-            problem: &mut prob,
-            solution: &mut solution,
-        })?;
+        // Thread the caller's initial_dloss (if any) into the
+        // convergence-detection logic so a well-seeded solve can
+        // short-circuit on iter 0.
+        let initial_dloss_slice: Option<Vec<Vec<f64>>> = initial_loss_warm_start
+            .as_ref()
+            .map(|ws| ws.dloss_dp.clone());
+        let loss_result = iterate_loss_factors(
+            ScucLossIterationInput {
+                solver,
+                spec,
+                hourly_networks: &model_plan.hourly_networks,
+                bus_map: &solve.bus_map,
+                layout,
+                gen_bus_idx: &setup.gen_bus_idx,
+                hour_row_bases: &problem.hour_row_bases,
+                n_flow: problem.n_branch_flow
+                    + problem.n_fg_rows
+                    + model_plan.network_plan.iface_rows.len(),
+                n_bus: network.n_buses(),
+                time_limit_secs: remaining_time_limit_secs(solve_deadline),
+                problem: &mut prob,
+                solution: &mut solution,
+            },
+            prep,
+            initial_dloss_slice.as_deref(),
+        )?;
         info!(
             stage = "iterate_loss_factors",
             secs = _loss_iter_t0.elapsed().as_secs_f64(),
             "SCUC helper solve timing"
         );
         bus_loss_allocation_mw = loss_result.loss_allocation_mw;
+
+        // Compose the final warm-start state to return to the caller
+        // (the security loop). Captures both the refined `dloss_dp`
+        // and the per-period total losses (in MW) consistent with
+        // the solved theta.
+        let theta_by_hour = crate::scuc::losses::extract_theta_by_hour(
+            &solution,
+            layout,
+            n_hours,
+            network.n_buses(),
+        );
+        let total_losses_mw = crate::scuc::losses::compute_total_losses_mw_from_theta(
+            &model_plan.hourly_networks,
+            &solve.bus_map,
+            &theta_by_hour,
+        );
+        final_loss_warm_start = Some(crate::scuc::losses::LossFactorWarmStart {
+            dloss_dp: loss_result.dloss_dp,
+            total_losses_mw,
+        });
     }
 
     if !matches!(
@@ -5693,5 +5884,6 @@ pub(super) fn solve_problem(
         model_diagnostic,
         bus_loss_allocation_mw,
         commitment_mip_trace,
+        final_loss_warm_start,
     })
 }

@@ -4589,6 +4589,7 @@ mod flowgate_scuc_tests {
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
             limit_mw_active_period: None,
+            breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
 
         let opts = DispatchOptions {
@@ -4631,6 +4632,7 @@ mod flowgate_scuc_tests {
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
             limit_mw_active_period: None,
+            breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
 
         let opts = DispatchOptions {
@@ -4705,6 +4707,7 @@ mod flowgate_scuc_tests {
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
             limit_mw_active_period: None,
+            breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
         // Slack flowgate on same branch with very high limit
         net.flowgates.push(Flowgate {
@@ -4719,6 +4722,7 @@ mod flowgate_scuc_tests {
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
             limit_mw_active_period: None,
+            breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
 
         let opts = DispatchOptions {
@@ -4944,6 +4948,7 @@ mod flowgate_scuc_tests {
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
             limit_mw_active_period: None,
+            breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
 
         // Self-referential nomogram: FG_12 flow → tighten FG_12 limit to 100 MW.
@@ -5038,6 +5043,7 @@ mod flowgate_scuc_tests {
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
             limit_mw_active_period: None,
+            breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
         // Nomogram that never tightens (limit = 300 MW > initial 200 MW).
         net.nomograms.push(OperatingNomogram {

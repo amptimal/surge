@@ -1911,6 +1911,7 @@ mod impl_ {
                 objective: objval,
                 iterations: None, // COPT NLP does not expose iteration count via C API
                 converged,
+                trace: None,
             })
         }
     }

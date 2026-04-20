@@ -185,6 +185,57 @@ pub struct Flowgate {
     /// `limit_mw_schedule` / `limit_mw` lookup is used unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit_mw_active_period: Option<u32>,
+    /// Which side(s) of the flowgate limit can bind. Defaults to
+    /// [`FlowgateBreachSides::Both`] for user-supplied or preseeded
+    /// cuts where the screener doesn't know the direction. The
+    /// iterative security-SCUC screener emits
+    /// [`FlowgateBreachSides::Upper`] or [`FlowgateBreachSides::Lower`]
+    /// after observing which side of `±limit_mw` the monitored-branch
+    /// flow actually crossed, so the bounds layer can pin the
+    /// non-breached side's slack column to zero and let the surge
+    /// lp-reduce presolve drop it. Saves a factor-of-two on slack
+    /// columns per (flowgate, period) pair when set.
+    #[serde(default, skip_serializing_if = "FlowgateBreachSides::is_both")]
+    pub breach_sides: FlowgateBreachSides,
+}
+
+/// Which side(s) of a [`Flowgate`]'s limit the LP allocates slack
+/// columns for. `Both` (default) keeps the symmetric encoding; `Upper`
+/// and `Lower` restrict slack allocation to the matching side,
+/// collapsing the other side's slack column to zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowgateBreachSides {
+    /// The symmetric default: slack on both sides of the limit band.
+    #[default]
+    Both,
+    /// Only the upper side (`monitored_flow ≤ +limit`) can bind. The
+    /// lower-side slack column is pinned to zero.
+    Upper,
+    /// Only the lower side (`-limit ≤ monitored_flow`) can bind. The
+    /// upper-side slack column is pinned to zero.
+    Lower,
+}
+
+impl FlowgateBreachSides {
+    /// Helper for `#[serde(skip_serializing_if)]`: treats the default
+    /// `Both` variant as elidable in JSON to preserve on-disk format
+    /// compatibility for all flowgates where no direction is known.
+    pub fn is_both(&self) -> bool {
+        matches!(self, FlowgateBreachSides::Both)
+    }
+
+    /// Whether an upper-side slack column should be allocated for
+    /// this flowgate.
+    pub fn allocates_upper_slack(&self) -> bool {
+        matches!(self, FlowgateBreachSides::Both | FlowgateBreachSides::Upper)
+    }
+
+    /// Whether a lower-side slack column should be allocated for
+    /// this flowgate.
+    pub fn allocates_lower_slack(&self) -> bool {
+        matches!(self, FlowgateBreachSides::Both | FlowgateBreachSides::Lower)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,6 +278,8 @@ struct FlowgateSerde {
     pub hvdc_band_coefficients: Vec<(usize, usize, f64)>,
     #[serde(default)]
     pub limit_mw_active_period: Option<u32>,
+    #[serde(default)]
+    pub breach_sides: FlowgateBreachSides,
 }
 
 impl TryFrom<FlowgateSerde> for Flowgate {
@@ -269,6 +322,7 @@ impl TryFrom<FlowgateSerde> for Flowgate {
             hvdc_coefficients: value.hvdc_coefficients,
             hvdc_band_coefficients: value.hvdc_band_coefficients,
             limit_mw_active_period: value.limit_mw_active_period,
+            breach_sides: value.breach_sides,
         })
     }
 }
@@ -431,6 +485,7 @@ mod tests {
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
             limit_mw_active_period: None,
+            breach_sides: FlowgateBreachSides::Both,
         };
         assert_eq!(fg.effective_limit_mw(0), 90.0);
         assert_eq!(fg.effective_limit_mw(2), 70.0);

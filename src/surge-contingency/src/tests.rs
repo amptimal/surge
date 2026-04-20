@@ -497,6 +497,7 @@ fn test_fast_violation_helper_includes_flowgate_and_interface_limits() {
         hvdc_coefficients: Vec::new(),
         hvdc_band_coefficients: Vec::new(),
         limit_mw_active_period: None,
+        breach_sides: surge_network::network::FlowgateBreachSides::Both,
     });
     net.interfaces.push(Interface {
         name: "IF_1".into(),
@@ -563,6 +564,7 @@ fn test_fast_violation_helper_ignores_outaged_branches_for_flowgates() {
         hvdc_coefficients: Vec::new(),
         hvdc_band_coefficients: Vec::new(),
         limit_mw_active_period: None,
+        breach_sides: surge_network::network::FlowgateBreachSides::Both,
     });
 
     let bus_map = net.bus_index_map();

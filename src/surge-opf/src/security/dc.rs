@@ -1288,6 +1288,7 @@ pub(crate) fn solve_dc_preventive_with_context(
                     solver_name: Some(lp_solver.name().to_string()),
                     solver_version: Some(lp_solver.version().to_string()),
                     ac_opf_timings: None,
+                    nlp_trace: None,
                     bus_q_slack_pos_mvar: vec![],
                     bus_q_slack_neg_mvar: vec![],
                     bus_p_slack_pos_mw: vec![],
@@ -2711,6 +2712,7 @@ pub(crate) fn solve_dc_corrective_with_context(
                     solver_name: Some(lp_solver.name().to_string()),
                     solver_version: Some(lp_solver.version().to_string()),
                     ac_opf_timings: None,
+                    nlp_trace: None,
                     bus_q_slack_pos_mvar: vec![],
                     bus_q_slack_neg_mvar: vec![],
                     bus_p_slack_pos_mw: vec![],
@@ -4482,6 +4484,7 @@ mod tests {
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
             limit_mw_active_period: None,
+            breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
 
         let opts = ScopfOptions {
@@ -4562,6 +4565,7 @@ mod tests {
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
             limit_mw_active_period: None,
+            breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
 
         let opts = ScopfOptions {

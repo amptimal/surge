@@ -99,7 +99,9 @@ pub use angle_reference::{
     AngleReference, DistributedAngleWeight, apply_angle_reference, apply_angle_reference_subset,
 };
 pub use area_schedule::AreaSchedule;
-pub use flowgate::{Flowgate, INACTIVE_FLOWGATE_LIMIT_MW, Interface, OperatingNomogram};
+pub use flowgate::{
+    Flowgate, FlowgateBreachSides, INACTIVE_FLOWGATE_LIMIT_MW, Interface, OperatingNomogram,
+};
 pub use owner::{Owner, OwnershipEntry};
 pub use power_injection::PowerInjection;
 pub use refs::{

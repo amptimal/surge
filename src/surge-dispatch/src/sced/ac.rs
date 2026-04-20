@@ -250,11 +250,103 @@ pub struct AcScedPeriodTimings {
     pub period_total_secs: f64,
 }
 
+/// Per-period AC OPF solver stats: problem size, termination status,
+/// final residuals, barrier parameter. Mirror of `surge_solution::NlpTrace`
+/// with the period index and winning refinement attempt label folded in.
+///
+/// Populated when the underlying NLP backend provided a trace (Ipopt
+/// today; COPT and Gurobi backends return `None`). Exposed on
+/// [`DispatchDiagnostics::ac_opf_stats`] as a `Vec` keyed by period
+/// index, parallel to `ac_sced_period_timings`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AcOpfStats {
+    /// 0-based period index within the solved horizon.
+    pub period_idx: u32,
+    /// Optional period label from the request (e.g. an ISO timestamp).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub period_label: Option<String>,
+    /// NLP backend name (e.g. `"Ipopt"`, `"COPT"`, `"Gurobi-NLP"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub solver_name: Option<String>,
+    /// Wall-clock time inside the NLP solver for the winning attempt
+    /// (from `OpfSolution.solve_time_secs`).
+    pub solve_time_secs: f64,
+    /// Which refinement-runtime attempt produced this solution, when the
+    /// AC SCED stage ran under [`crate::RefinementRuntime`]. `None` on
+    /// vanilla single-shot solves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_label: Option<String>,
+    /// Problem size: number of decision variables.
+    pub n_vars: u32,
+    /// Problem size: number of constraints.
+    pub n_constraints: u32,
+    /// Problem size: nonzeros in the constraint Jacobian.
+    pub jac_nnz: u32,
+    /// Problem size: nonzeros in the Hessian (0 when approximated).
+    pub hess_nnz: u32,
+    /// Raw NLP status code (backend-specific; see [`surge_solution::NlpTrace`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<i32>,
+    /// Human-readable status label (e.g. `"Solve_Succeeded"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_label: Option<String>,
+    /// Iteration count at termination.
+    pub iterations: u32,
+    /// Final objective value.
+    pub objective: f64,
+    /// Primal infeasibility at the final iterate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_primal_inf: Option<f64>,
+    /// Dual (KKT stationarity) infeasibility at the final iterate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_dual_inf: Option<f64>,
+    /// Final barrier parameter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_mu: Option<f64>,
+    /// Whether the solver considered the problem converged.
+    pub converged: bool,
+}
+
+impl AcOpfStats {
+    /// Build an [`AcOpfStats`] from an [`OpfSolution`] + the period
+    /// context the AC SCED driver owns. Returns `None` when the solver
+    /// backend did not populate `nlp_trace` (e.g. DC-OPF, COPT-NLP).
+    pub fn from_opf_solution(
+        opf: &OpfSolution,
+        period_idx: u32,
+        period_label: Option<String>,
+    ) -> Option<Self> {
+        let trace = opf.nlp_trace.as_ref()?;
+        Some(Self {
+            period_idx,
+            period_label,
+            solver_name: opf.solver_name.clone(),
+            solve_time_secs: opf.solve_time_secs,
+            attempt_label: None,
+            n_vars: trace.n_vars,
+            n_constraints: trace.n_constraints,
+            jac_nnz: trace.jac_nnz,
+            hess_nnz: trace.hess_nnz,
+            status_code: trace.status_code,
+            status_label: trace.status_label.clone(),
+            iterations: trace.iterations,
+            objective: trace.objective,
+            final_primal_inf: trace.final_primal_inf,
+            final_dual_inf: trace.final_dual_inf,
+            final_mu: trace.final_mu,
+            converged: trace.converged,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct AcScedPeriodArtifacts {
     pub period_solution: AcScedPeriodSolution,
     pub opf_solution: OpfSolution,
     pub timings: AcScedPeriodTimings,
+    /// Per-period NLP solver stats, derived from `opf_solution.nlp_trace`.
+    /// `None` when the backend did not populate a trace.
+    pub opf_stats: Option<AcOpfStats>,
 }
 
 /// Solution for a multi-period AC-SCED.
@@ -2774,10 +2866,13 @@ pub(crate) fn solve_ac_sced_with_problem_spec_artifacts(
         period_total_secs: start.elapsed().as_secs_f64(),
     };
 
+    let opf_stats = AcOpfStats::from_opf_solution(&sol, context.period as u32, None);
+
     Ok(AcScedPeriodArtifacts {
         period_solution,
         opf_solution: sol,
         timings,
+        opf_stats,
     })
 }
 
@@ -5237,6 +5332,7 @@ mod tests {
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
             limit_mw_active_period: None,
+            breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
 
         // Self-referential nomogram: tighten FG_12 to 100 MW regardless of flow.

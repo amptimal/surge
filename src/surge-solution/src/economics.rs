@@ -158,6 +158,32 @@ pub struct ObjectiveLedgerMismatch {
 /// Version tag for the persisted solution-audit schema.
 pub const SOLUTION_AUDIT_SCHEMA_VERSION: &str = "1";
 
+/// Whether the objective-ledger audit should run on solution finalization.
+///
+/// Controlled by the `SURGE_OBJECTIVE_AUDIT` env var; off by default. The
+/// audit is a ledger-sum consistency check — useful when debugging a new
+/// penalty-term or cost-rollup wiring, not useful on every solve. Enable
+/// with `SURGE_OBJECTIVE_AUDIT=1`.
+///
+/// When disabled, `refresh_audit()` is a no-op and the `audit` field on
+/// the solution keeps its serde default (`audit_passed: false`,
+/// `ledger_mismatches: []`). Callers that want to run the audit on
+/// demand can still invoke `objective_ledger_mismatches()` directly —
+/// this gate only affects the auto-populated `audit` block.
+pub fn objective_audit_enabled() -> bool {
+    match std::env::var("SURGE_OBJECTIVE_AUDIT") {
+        Ok(value) => {
+            let trimmed = value.trim();
+            !trimmed.is_empty()
+                && !trimmed.eq_ignore_ascii_case("0")
+                && !trimmed.eq_ignore_ascii_case("false")
+                && !trimmed.eq_ignore_ascii_case("off")
+                && !trimmed.eq_ignore_ascii_case("no")
+        }
+        Err(_) => false,
+    }
+}
+
 /// Serialized audit status carried alongside a persisted solution payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SolutionAuditReport {

@@ -101,6 +101,11 @@ pub(super) struct ScucBoundsInput<'a> {
     pub n_sbp: usize,
     pub n_branch_flow: usize,
     pub n_fg_rows: usize,
+    /// Map from flowgate LP row index to index into `network.flowgates`.
+    /// The bounds layer uses it to look up `limit_mw_active_period` +
+    /// `breach_sides` when deciding whether to allocate each side's
+    /// slack column or pin it to zero (lp-reduce drops the pinned ones).
+    pub fg_rows: &'a [usize],
     pub n_iface_rows: usize,
     pub n_sto_dis_epi: usize,
     pub n_sto_ch_epi: usize,
@@ -940,29 +945,58 @@ pub(super) fn build_variable_bounds(input: ScucBoundsInput<'_>) -> ScucBoundsSta
                 input.spec.thermal_penalty_curve.marginal_cost_at(0.0) * input.base * dt_h;
         }
         for row_idx in 0..input.n_fg_rows {
-            let lower_idx = input.layout.flowgate_lower_slack_col(t, row_idx);
-            col_lower[lower_idx] = 0.0;
-            col_upper[lower_idx] = f64::INFINITY;
+            // Look up the source flowgate to decide whether this
+            // (row, period, side) triple should actually allocate a
+            // free slack column or be pinned to zero. Period gating
+            // comes from `limit_mw_active_period` (compact N-1 cuts);
+            // side gating from `breach_sides` (iterative screener
+            // preserves the flow-sign). Pinned columns survive to
+            // surge's lp-reduce presolve and get dropped before HiGHS
+            // sees them.
+            let fg_idx = input.fg_rows.get(row_idx).copied();
+            let fg = fg_idx.and_then(|idx| input.network.flowgates.get(idx));
+            let period_matches = match fg.and_then(|f| f.limit_mw_active_period) {
+                Some(p) => t == p as usize,
+                None => true,
+            };
+            let allocate_lower = period_matches
+                && fg.map(|f| f.breach_sides.allocates_lower_slack()).unwrap_or(true);
+            let allocate_upper = period_matches
+                && fg.map(|f| f.breach_sides.allocates_upper_slack()).unwrap_or(true);
+
             let is_explicit_ctg_flowgate = input
                 .explicit_contingency
                 .and_then(|plan| plan.flowgate_row_cases.get(row_idx))
                 .copied()
                 .flatten()
                 .is_some();
-            col_cost[lower_idx] = if is_explicit_ctg_flowgate {
+            let slack_cost = if is_explicit_ctg_flowgate {
                 0.0
             } else {
                 input.spec.thermal_penalty_curve.marginal_cost_at(0.0) * input.base * dt_h
             };
 
-            let upper_idx = input.layout.flowgate_upper_slack_col(t, row_idx);
-            col_lower[upper_idx] = 0.0;
-            col_upper[upper_idx] = f64::INFINITY;
-            col_cost[upper_idx] = if is_explicit_ctg_flowgate {
-                0.0
+            let lower_idx = input.layout.flowgate_lower_slack_col(t, row_idx);
+            if allocate_lower {
+                col_lower[lower_idx] = 0.0;
+                col_upper[lower_idx] = f64::INFINITY;
+                col_cost[lower_idx] = slack_cost;
             } else {
-                input.spec.thermal_penalty_curve.marginal_cost_at(0.0) * input.base * dt_h
-            };
+                col_lower[lower_idx] = 0.0;
+                col_upper[lower_idx] = 0.0;
+                col_cost[lower_idx] = 0.0;
+            }
+
+            let upper_idx = input.layout.flowgate_upper_slack_col(t, row_idx);
+            if allocate_upper {
+                col_lower[upper_idx] = 0.0;
+                col_upper[upper_idx] = f64::INFINITY;
+                col_cost[upper_idx] = slack_cost;
+            } else {
+                col_lower[upper_idx] = 0.0;
+                col_upper[upper_idx] = 0.0;
+                col_cost[upper_idx] = 0.0;
+            }
         }
         for row_idx in 0..input.n_iface_rows {
             let lower_idx = input.layout.interface_lower_slack_col(t, row_idx);

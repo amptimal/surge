@@ -78,9 +78,22 @@ class GoC3Policy:
     reactive_support_pin_factor: float = 0.0
 
     # ── security screening
-    scuc_security_preseed_count_per_period: int = 1_000
+    scuc_security_preseed_count_per_period: int = 250
     scuc_security_max_iterations: int = 5
-    scuc_security_max_cuts_per_iteration: int = 5_000
+    scuc_security_max_cuts_per_iteration: int = 2_500
+    # SCUC loss-factor cold-start warm start. Default
+    # ("load_pattern", 0.02): PTDF-weighted per-bus sensitivity seeded
+    # into the MIP before the first solve, avoiding a full lossless
+    # pass on GO C3. Accepts ("uniform", rate), ("load_pattern", rate),
+    # or ("dc_pf", 0.0); pass None to disable. See
+    # markets/go_c3/RUNBOOK.md § loss-factor warm start.
+    scuc_loss_factor_warm_start: tuple[str, float] | None = ("load_pattern", 0.02)
+    # SCUC loss-factor refinement iteration count. Default 0: trust
+    # the warm start entirely, skip the refinement LP. Set to 1+ to
+    # run refinement rounds on top of the warm start (useful if the
+    # warm start is cold/inactive). None preserves the historical
+    # GO C3 default of 1 refinement pass.
+    scuc_loss_factor_max_iterations: int | None = 0
     disable_flowgates: bool = False
 
     # ── runtime

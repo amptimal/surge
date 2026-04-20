@@ -378,6 +378,25 @@ fn parse_policy(policy: Option<&Bound<'_, PyDict>>) -> PyResult<GoC3Policy> {
             out.scuc_security_max_cuts_per_iteration = value.extract::<usize>()?;
         }
     }
+    // scuc_loss_factor_warm_start: accepts either None or a 2-tuple
+    // `(mode_str, rate)`. Mode is one of "uniform", "load_pattern",
+    // "dc_pf"; rate is an f64 (ignored for "dc_pf"). See
+    // [`surge_io::go_c3::policy::GoC3Policy::scuc_loss_factor_warm_start`].
+    if let Some(value) = policy.get_item("scuc_loss_factor_warm_start")? {
+        if !value.is_none() {
+            let tuple: (String, f64) = value.extract().map_err(|err| {
+                PyValueError::new_err(format!(
+                    "scuc_loss_factor_warm_start must be None or a (mode, rate) tuple: {err}"
+                ))
+            })?;
+            out.scuc_loss_factor_warm_start = Some(tuple);
+        }
+    }
+    if let Some(value) = policy.get_item("scuc_loss_factor_max_iterations")? {
+        if !value.is_none() {
+            out.scuc_loss_factor_max_iterations = Some(value.extract::<usize>()?);
+        }
+    }
     if let Some(value) = policy.get_item("relax_sced_branch_limits_to_dc_slack")? {
         if !value.is_none() {
             out.relax_sced_branch_limits_to_dc_slack = value.extract::<bool>()?;

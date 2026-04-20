@@ -224,6 +224,123 @@ impl ScucLayout {
         self.dispatch.n_vars
     }
 
+    /// Return a per-period variable-block breakdown as `(name, count)`
+    /// pairs. Each entry is the block's width within a single period;
+    /// multiply by `n_periods` to get the horizon contribution. Blocks
+    /// with zero count are dropped so post-mortem logs aren't dominated
+    /// by noise from disabled features (e.g. `plc_sos2_binary` on
+    /// scenarios without PLC, `branch_commitment` without switching).
+    ///
+    /// The sum of returned counts equals `vars_per_hour()` by
+    /// construction — anything else is a layout contiguity bug.
+    pub fn block_breakdown_per_hour(&self) -> Vec<(&'static str, usize)> {
+        let d = &self.dispatch;
+        let entries: &[(&str, usize, usize)] = &[
+            ("theta", d.theta, d.pg),
+            ("pg", d.pg, self.commitment),
+            ("commitment", self.commitment, self.startup),
+            ("startup", self.startup, self.shutdown),
+            ("shutdown", self.shutdown, self.startup_delta),
+            ("startup_delta", self.startup_delta, self.plc_lambda),
+            ("plc_lambda", self.plc_lambda, self.plc_sos2_binary),
+            ("plc_sos2_binary", self.plc_sos2_binary, d.sto_ch),
+            ("sto_ch", d.sto_ch, d.sto_dis),
+            ("sto_dis", d.sto_dis, d.sto_soc),
+            ("sto_soc", d.sto_soc, d.sto_epi_dis),
+            ("sto_epi_dis", d.sto_epi_dis, d.sto_epi_ch),
+            ("sto_epi_ch", d.sto_epi_ch, d.hvdc),
+            ("hvdc", d.hvdc, d.e_g),
+            ("e_g (pwl_epigraph)", d.e_g, d.dl),
+            ("dl (dispatchable_load)", d.dl, d.vbid),
+            ("vbid (virtual_bid)", d.vbid, d.block),
+            ("block (disp_pwr)", d.block, self.regulation_mode),
+            ("regulation_mode", self.regulation_mode, d.reserve),
+            ("reserve", d.reserve, d.block_reserve),
+            ("block_reserve", d.block_reserve, self.foz_delta),
+            ("foz_delta", self.foz_delta, self.foz_phi),
+            ("foz_phi", self.foz_phi, self.foz_rho),
+            ("foz_rho", self.foz_rho, self.ph_mode),
+            ("ph_mode", self.ph_mode, self.pb_curtailment_bus),
+            (
+                "pb_curtailment_bus",
+                self.pb_curtailment_bus,
+                self.pb_excess_bus,
+            ),
+            ("pb_excess_bus", self.pb_excess_bus, self.pb_curtailment_seg),
+            (
+                "pb_curtailment_seg",
+                self.pb_curtailment_seg,
+                self.pb_excess_seg,
+            ),
+            ("pb_excess_seg", self.pb_excess_seg, self.branch_lower_slack),
+            (
+                "branch_lower_slack",
+                self.branch_lower_slack,
+                self.branch_upper_slack,
+            ),
+            (
+                "branch_upper_slack",
+                self.branch_upper_slack,
+                self.flowgate_lower_slack,
+            ),
+            (
+                "flowgate_lower_slack",
+                self.flowgate_lower_slack,
+                self.flowgate_upper_slack,
+            ),
+            (
+                "flowgate_upper_slack",
+                self.flowgate_upper_slack,
+                self.interface_lower_slack,
+            ),
+            (
+                "interface_lower_slack",
+                self.interface_lower_slack,
+                self.interface_upper_slack,
+            ),
+            (
+                "interface_upper_slack",
+                self.interface_upper_slack,
+                self.headroom_slack,
+            ),
+            ("headroom_slack", self.headroom_slack, self.footroom_slack),
+            ("footroom_slack", self.footroom_slack, self.ramp_up_slack),
+            ("ramp_up_slack", self.ramp_up_slack, self.ramp_down_slack),
+            (
+                "ramp_down_slack",
+                self.ramp_down_slack,
+                self.angle_diff_lower_slack,
+            ),
+            (
+                "angle_diff_lower_slack",
+                self.angle_diff_lower_slack,
+                self.angle_diff_upper_slack,
+            ),
+            (
+                "angle_diff_upper_slack",
+                self.angle_diff_upper_slack,
+                self.branch_commitment,
+            ),
+            (
+                "branch_commitment",
+                self.branch_commitment,
+                self.branch_startup,
+            ),
+            ("branch_startup", self.branch_startup, self.branch_shutdown),
+            ("branch_shutdown", self.branch_shutdown, self.branch_flow),
+            (
+                "branch_flow",
+                self.branch_flow,
+                self.branch_flow + self.n_branch_flow_per_hour,
+            ),
+        ];
+        entries
+            .iter()
+            .map(|(name, start, end)| (*name, end.saturating_sub(*start)))
+            .filter(|(_, count)| *count > 0)
+            .collect()
+    }
+
     pub fn hour_col_base(&self, hour: usize) -> usize {
         hour * self.dispatch.n_vars
     }

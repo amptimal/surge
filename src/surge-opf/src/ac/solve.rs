@@ -2479,6 +2479,7 @@ fn solve_ac_opf_with_context_once(
             total_secs: solve_time,
             nlp_attempts,
         }),
+        nlp_trace: sol.trace.clone(),
     };
     solution.refresh_audit();
     Ok(solution)
@@ -3948,6 +3949,7 @@ mod tests {
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
             limit_mw_active_period: None,
+            breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
 
         let opts = AcOpfOptions {
@@ -4002,6 +4004,7 @@ mod tests {
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
             limit_mw_active_period: None,
+            breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
 
         let opts = AcOpfOptions {
@@ -4083,6 +4086,7 @@ mod tests {
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
             limit_mw_active_period: None,
+            breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
 
         let opts = AcOpfOptions {
@@ -4178,6 +4182,7 @@ mod tests {
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
             limit_mw_active_period: None,
+            breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
 
         // With enforce_flowgates=false (default), no flowgate constraints should appear.
@@ -4293,6 +4298,7 @@ mod tests {
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
             limit_mw_active_period: None,
+            breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
 
         let opts = AcOpfOptions {

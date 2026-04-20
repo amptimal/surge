@@ -6,6 +6,30 @@ this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows Semantic Versioning intent.
 
+## [0.1.4] — 2026-04-20
+
+### Added
+
+- **Dispatch observability.** `DispatchSolution` now carries stage-failure
+  diagnostics and per-period AC-OPF statistics, making multi-stage workflow
+  failures and AC-SCED iteration costs inspectable without re-running the
+  solve.
+- **SCUC loss-factor warm start** and **per-period load-pattern sensitivity**
+  in `surge-dispatch` SCUC — reduces MIP root relaxation time on
+  loss-aware formulations. Loss-factor coefficient writes now use a 1e-4
+  cutoff to keep the LP sparse.
+- **Flowgate directional slack** on `surge-network::Flowgate` — lets
+  flowgate limits be relaxed in one direction without disabling the
+  constraint.
+- **HiGHS MIP trace.** `MipTrace` is now populated unconditionally on every
+  HiGHS MIP solve (previously gated); primal bound recovery falls back to
+  `objective_function_value` when `mip_primal_bound` is NaN.
+
+### Fixed
+
+- GO C3 adapter: new market-extras fields are now forwarded into
+  `run-report.json`.
+
 ## [0.1.3] — 2026-04-19
 
 ### Changed

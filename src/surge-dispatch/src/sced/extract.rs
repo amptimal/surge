@@ -1524,6 +1524,7 @@ pub(super) fn extract_solution(input: ScedExtractionInput<'_>) -> RawDispatchSol
         cc_transition_costs: Vec::new(),
         model_diagnostics: Vec::new(),
         bus_loss_allocation_mw: Vec::new(),
+        scuc_final_loss_warm_start: None,
     }
 }
 
