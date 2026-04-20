@@ -1928,6 +1928,7 @@ impl Network {
             hvdc_coefficients: Vec::new(),
             hvdc_band_coefficients: Vec::new(),
             limit_mw_active_period: None,
+            breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
         Ok(())
     }

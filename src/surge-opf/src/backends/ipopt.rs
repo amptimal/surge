@@ -260,6 +260,14 @@ unsafe fn load_ipopt_symbols(lib: Library) -> Result<IpoptLib, String> {
 struct CallbackData<'a> {
     problem: &'a dyn NlpProblem,
     iterations: Cell<u32>,
+    /// Final primal-infeasibility (max constraint violation in Ipopt's
+    /// scaled internal form). Updated every iteration by `intermediate_cb`;
+    /// the terminal value is read into `NlpTrace` after solve.
+    final_primal_inf: Cell<f64>,
+    /// Final dual-infeasibility (KKT stationarity residual).
+    final_dual_inf: Cell<f64>,
+    /// Final barrier parameter `μ`.
+    final_mu: Cell<f64>,
     error: RefCell<Option<String>>,
 }
 
@@ -440,13 +448,41 @@ unsafe extern "C" fn eval_h_cb(
     }
 }
 
+/// Map Ipopt's integer return status to its canonical mnemonic.
+/// Sourced from `IpReturnCodes_inc.h` in the Ipopt distribution.
+fn ipopt_status_label(code: i32) -> &'static str {
+    match code {
+        0 => "Solve_Succeeded",
+        1 => "Solved_To_Acceptable_Level",
+        2 => "Infeasible_Problem_Detected",
+        3 => "Search_Direction_Becomes_Too_Small",
+        4 => "Diverging_Iterates",
+        5 => "User_Requested_Stop",
+        6 => "Feasible_Point_Found",
+        -1 => "Maximum_Iterations_Exceeded",
+        -2 => "Restoration_Failed",
+        -3 => "Error_In_Step_Computation",
+        -4 => "Maximum_CpuTime_Exceeded",
+        -5 => "Maximum_WallTime_Exceeded",
+        -10 => "Not_Enough_Degrees_Of_Freedom",
+        -11 => "Invalid_Problem_Definition",
+        -12 => "Invalid_Option",
+        -13 => "Invalid_Number_Detected",
+        -100 => "Unrecoverable_Exception",
+        -101 => "NonIpopt_Exception_Thrown",
+        -102 => "Insufficient_Memory",
+        -199 => "Internal_Error",
+        _ => "Unknown",
+    }
+}
+
 unsafe extern "C" fn intermediate_cb(
     _alg_mod: Index,
     iter_count: Index,
     _obj_value: Number,
-    _inf_pr: Number,
-    _inf_du: Number,
-    _mu: Number,
+    inf_pr: Number,
+    inf_du: Number,
+    mu: Number,
     _d_norm: Number,
     _regularization_size: Number,
     _alpha_du: Number,
@@ -456,6 +492,9 @@ unsafe extern "C" fn intermediate_cb(
 ) -> Bool {
     let data = unsafe { get_callback_data(user_data) };
     data.iterations.set(iter_count.max(0) as u32);
+    data.final_primal_inf.set(inf_pr);
+    data.final_dual_inf.set(inf_du);
+    data.final_mu.set(mu);
     1
 }
 
@@ -639,6 +678,9 @@ pub fn solve_ipopt(problem: &dyn NlpProblem, options: &NlpOptions) -> Result<Nlp
     let cb_data = CallbackData {
         problem,
         iterations: Cell::new(0),
+        final_primal_inf: Cell::new(f64::NAN),
+        final_dual_inf: Cell::new(f64::NAN),
+        final_mu: Cell::new(f64::NAN),
         error: RefCell::new(None),
     };
     let user_data_ptr = &cb_data as *const CallbackData as UserDataPtr;
@@ -665,24 +707,80 @@ pub fn solve_ipopt(problem: &dyn NlpProblem, options: &NlpOptions) -> Result<Nlp
 
     // Status 0 = Solve_Succeeded, 1 = Solved_To_Acceptable_Level
     let converged = status == 0 || status == 1;
+    let status_label = ipopt_status_label(status);
+
+    // Read the tail values recorded by `intermediate_cb`. NaN iff the
+    // solver never reached a regular iteration (e.g. rejected at
+    // startup) — surface that as `None` in the trace.
+    let to_option = |v: f64| (!v.is_nan()).then_some(v);
+    let final_primal_inf = to_option(cb_data.final_primal_inf.get());
+    let final_dual_inf = to_option(cb_data.final_dual_inf.get());
+    let final_mu = to_option(cb_data.final_mu.get());
+    let iter_count = cb_data.iterations.get();
+    let hess_nnz_out = if use_exact_hessian { nele_hess } else { 0 };
+
+    let trace = surge_solution::NlpTrace {
+        n_vars: n as u32,
+        n_constraints: m as u32,
+        jac_nnz: nele_jac as u32,
+        hess_nnz: hess_nnz_out as u32,
+        status_code: Some(status),
+        status_label: Some(status_label.into()),
+        iterations: iter_count,
+        objective: obj_val,
+        final_primal_inf,
+        final_dual_inf,
+        final_mu,
+        converged,
+    };
+
+    // Compact single-line trace string used both for the `warn!` log on
+    // non-converged paths and for the returned `Err(...)` — guarantees
+    // the upstream caller sees the same diagnostics the tracing sink
+    // does, without requiring `capture_solver_log=True`.
+    let trace_str = format!(
+        "ipopt_trace: status={} ({}), iters={}, obj={:.6e}, \
+         inf_pr={}, inf_du={}, mu={}, n_vars={}, n_constraints={}, jac_nnz={}, hess_nnz={}",
+        status,
+        status_label,
+        iter_count,
+        obj_val,
+        final_primal_inf
+            .map(|v| format!("{v:.4e}"))
+            .unwrap_or_else(|| "n/a".into()),
+        final_dual_inf
+            .map(|v| format!("{v:.4e}"))
+            .unwrap_or_else(|| "n/a".into()),
+        final_mu
+            .map(|v| format!("{v:.4e}"))
+            .unwrap_or_else(|| "n/a".into()),
+        n,
+        m,
+        nele_jac,
+        hess_nnz_out,
+    );
 
     if status == 2 {
-        warn!("Ipopt: infeasible problem detected");
-        return Err("Ipopt: infeasible problem detected".into());
+        warn!(%trace_str, "Ipopt: infeasible problem detected");
+        return Err(format!("Ipopt: infeasible problem detected; {trace_str}"));
     }
     if status == -1 {
-        warn!("Ipopt: maximum iterations exceeded");
-        return Err("Ipopt: maximum iterations exceeded".into());
+        warn!(%trace_str, "Ipopt: maximum iterations exceeded");
+        return Err(format!("Ipopt: maximum iterations exceeded; {trace_str}"));
     }
     if status < -1 {
-        warn!(status = status, "Ipopt: solver error");
-        return Err(format!("Ipopt solver error (status={status})"));
+        warn!(status = status, %trace_str, "Ipopt: solver error");
+        return Err(format!("Ipopt solver error (status={status}); {trace_str}"));
     }
 
     info!(
         converged = converged,
         objective = obj_val,
         ipopt_status = status,
+        status_label = status_label,
+        final_primal_inf = ?final_primal_inf,
+        final_dual_inf = ?final_dual_inf,
+        final_mu = ?final_mu,
         "Ipopt NLP: solve complete"
     );
 
@@ -692,8 +790,9 @@ pub fn solve_ipopt(problem: &dyn NlpProblem, options: &NlpOptions) -> Result<Nlp
         z_lower: mult_x_l,
         z_upper: mult_x_u,
         objective: obj_val,
-        iterations: Some(cb_data.iterations.get()),
+        iterations: Some(iter_count),
         converged,
+        trace: Some(trace),
     })
 }
 
@@ -746,6 +845,9 @@ mod tests {
         let data = CallbackData {
             problem: &problem,
             iterations: Cell::new(0),
+            final_primal_inf: Cell::new(f64::NAN),
+            final_dual_inf: Cell::new(f64::NAN),
+            final_mu: Cell::new(f64::NAN),
             error: RefCell::new(None),
         };
         let mut obj_value = 123.0;

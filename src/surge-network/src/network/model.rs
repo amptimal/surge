@@ -3787,6 +3787,7 @@ mod tests {
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
             limit_mw_active_period: None,
+            breach_sides: crate::network::FlowgateBreachSides::Both,
         });
 
         let err = net.validate_structure().unwrap_err();
@@ -3814,6 +3815,7 @@ mod tests {
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
             limit_mw_active_period: None,
+            breach_sides: crate::network::FlowgateBreachSides::Both,
         });
 
         let err = net.validate_structure().unwrap_err();

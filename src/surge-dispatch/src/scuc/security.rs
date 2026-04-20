@@ -7,7 +7,10 @@ use surge_network::Network;
 use surge_network::network::BranchRatingCondition;
 use tracing::{debug, info, warn};
 
-use super::solve::{solve_scuc_with_owned_network, solve_scuc_with_problem_spec};
+use super::solve::{
+    solve_scuc_with_owned_network, solve_scuc_with_problem_spec,
+    solve_scuc_with_problem_spec_warm_started,
+};
 use super::types::SecurityDispatchSpec;
 use crate::common::contingency::{ContingencyCut, ContingencyCutKind};
 use crate::common::spec::{
@@ -39,6 +42,10 @@ struct HvdcSecurityCut {
     f_max_mw: f64,
     /// Violation severity in p.u. over the monitored branch thermal limit.
     excess_pu: f64,
+    /// Which side of the thermal band the post-contingency flow
+    /// crossed. `true` when `post_flow > +limit` — see
+    /// [`crate::common::security::BranchSecurityViolation::breach_upper`].
+    breach_upper: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +54,9 @@ struct BranchSecurityViolation {
     contingency_branch_idx: usize,
     monitored_branch_idx: usize,
     severity_pu: f64,
+    /// See
+    /// [`crate::common::security::BranchSecurityViolation::breach_upper`].
+    breach_upper: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -73,7 +83,7 @@ struct HourlySecurityContext {
     hvdc_contingencies: Vec<HourlyHvdcContingency>,
 }
 
-const MAX_CONNECTIVITY_CUT_ROUNDS: usize = 5;
+const MAX_CONNECTIVITY_CUT_ROUNDS: usize = 3;
 
 /// Per-unit magnitude cutoff below which a `(contingency, monitored
 /// branch)` LODF pair is not emitted as a contingency cut in the
@@ -319,6 +329,54 @@ pub(crate) fn solve_security_dispatch(
     // when workload dynamics favor it.
     let last_commitment: Option<Vec<Vec<bool>>> = None;
 
+    // Cross-iteration loss-factor warm-start cache. Each security
+    // iteration's SCUC solve emits a final `(dloss_dp, total_losses_mw)`
+    // state on `RawDispatchSolution.scuc_final_loss_warm_start`. We
+    // catch it and feed it into the next iteration's solve, so the
+    // pre-MIP application in `scuc::problem::solve_problem` can scale
+    // bus-balance rows + injection coefficients with a close-to-optimum
+    // loss estimate before the first MIP call. On cases where the
+    // commitment doesn't change much between security iterations, this
+    // elides the post-MIP loss-factor LP re-solve (~40+ s per iter on
+    // 617-bus D2) because the lossless-MIP dispatch already matches
+    // the warm-started optimum.
+    let mut cached_loss_warm_start: Option<crate::scuc::losses::LossFactorWarmStart> = None;
+
+    // Cold-start loss-factor warm start for iter 0. Only runs when
+    // loss factors are enabled AND the policy opts in via
+    // `loss_factor_warm_start_mode`. Each mode has its own cost/accuracy
+    // tradeoff — see `crate::scuc::losses` for the mode implementations.
+    // Falls through gracefully to `None` if the compute fails; the
+    // security loop then falls back to lossless-MIP + refinement-LP as
+    // before.
+    if scuc_spec.use_loss_factors
+        && n_bus > 1
+        && !matches!(
+            scuc_spec.loss_factor_warm_start_mode,
+            crate::request::network::LossFactorWarmStartMode::Disabled,
+        )
+    {
+        let _cs_t0 = std::time::Instant::now();
+        let cold = build_cold_start_loss_warm_start(
+            &scuc_spec,
+            network,
+            &hourly_networks,
+            n_bus,
+            n_periods,
+        );
+        if let Some(ws) = cold {
+            info!(
+                stage = "cold_start_loss_warm_start",
+                secs = _cs_t0.elapsed().as_secs_f64(),
+                mode = ?scuc_spec.loss_factor_warm_start_mode,
+                n_hours = ws.dloss_dp.len(),
+                total_losses_mw_t0 = ws.total_losses_mw.first().copied().unwrap_or(0.0),
+                "Security SCUC: cold-start loss-factor warm start"
+            );
+            cached_loss_warm_start = Some(ws);
+        }
+    }
+
     for iter in 0..options.max_iterations {
         let iter_start = std::time::Instant::now();
         // Build network with accumulated security flowgates
@@ -361,12 +419,20 @@ pub(crate) fn solve_security_dispatch(
         // `Σ branch_commitment ≥ 1` over the cut set. The first
         // iteration has no cuts; subsequent rounds grow the cut pool
         // until the LP's switching pattern is connected across every
-        // period (or we hit the 5-round cap).
+        // period (or we hit the round cap).
         let mut sol: Option<RawDispatchSolution> = None;
         if iter_scuc_spec.allow_branch_switching {
             for refit_round in 0..MAX_CONNECTIVITY_CUT_ROUNDS {
                 let spec_with_cuts = iter_scuc_spec.with_connectivity_cuts(&connectivity_cuts);
-                let round_sol = solve_scuc_with_problem_spec(&net, spec_with_cuts)?;
+                // Thread the cached loss warm-start into every
+                // connectivity-cut refit too — the LP rows added by
+                // the cut loop don't change the bus-balance row
+                // structure, so the loss factors still apply.
+                let round_sol = solve_scuc_with_problem_spec_warm_started(
+                    &net,
+                    spec_with_cuts,
+                    cached_loss_warm_start.clone(),
+                )?;
                 let new_cuts_added = add_connectivity_cuts_from_solution(
                     &round_sol,
                     &hourly_networks,
@@ -395,8 +461,30 @@ pub(crate) fn solve_security_dispatch(
         }
         let sol = match sol {
             Some(s) => s,
-            None => solve_scuc_with_problem_spec(&net, iter_scuc_spec)?,
+            None => solve_scuc_with_problem_spec_warm_started(
+                &net,
+                iter_scuc_spec,
+                cached_loss_warm_start.clone(),
+            )?,
         };
+        // Capture the just-solved final loss state so the next security
+        // iteration (if any) can skip the lossless-MIP pass.
+        if sol
+            .scuc_final_loss_warm_start
+            .as_ref()
+            .map(|w| w.is_populated())
+            .unwrap_or(false)
+        {
+            cached_loss_warm_start = sol.scuc_final_loss_warm_start.clone();
+            debug!(
+                iter,
+                n_hours = cached_loss_warm_start
+                    .as_ref()
+                    .map(|w| w.dloss_dp.len())
+                    .unwrap_or(0),
+                "Security SCUC: cached loss-factor warm start for next iteration"
+            );
+        }
         let inner_solve_secs = iter_start.elapsed().as_secs_f64();
 
         // Check N-1 violations across all periods
@@ -504,7 +592,13 @@ pub(crate) fn solve_security_dispatch(
 
             let context = &hourly_contexts[violation.period];
             let hourly_network = &hourly_networks[violation.period];
-            let fg = build_branch_security_flowgate(violation, hourly_network, context, n_periods);
+            let fg = build_branch_security_flowgate(
+                violation,
+                hourly_network,
+                context,
+                n_periods,
+                false, // iterative cut — breach side is known
+            );
             let br_l = &hourly_network.branches[violation.monitored_branch_idx];
             let br_k = &hourly_network.branches[violation.contingency_branch_idx];
 
@@ -593,6 +687,148 @@ pub(crate) fn solve_security_dispatch(
             n_preseed_pairs_binding: None,
         },
     ))
+}
+
+/// Compute a cold-start [`LossFactorWarmStart`] per the policy mode.
+///
+/// Called on iter 0 of the security loop when the caller opted in via
+/// `DispatchProblemSpec::loss_factor_warm_start_mode`. Dispatches to
+/// the appropriate loss-estimate source; handles all the per-period
+/// bus-load + loss-PTDF setup that the chosen source needs.
+///
+/// Returns `None` when loss factors are off or the mode is Disabled —
+/// callers should check this and skip the warm-start application.
+fn build_cold_start_loss_warm_start(
+    spec: &DispatchProblemSpec<'_>,
+    _network: &surge_network::Network,
+    hourly_networks: &[surge_network::Network],
+    n_bus: usize,
+    n_periods: usize,
+) -> Option<crate::scuc::losses::LossFactorWarmStart> {
+    use crate::request::network::LossFactorWarmStartMode;
+
+    // Shared: per-period bus load and total load. Two sources must be
+    // summed for GO C3-style markets:
+    //   1. `network.loads` — fixed-demand loads (traditional PSS/E
+    //      Load objects). Included via `bus_load_p_mw_with_map`, the
+    //      same helper `bus_p_injection_pu` uses, so our vector
+    //      matches the injection side exactly (Loads minus
+    //      PowerInjections).
+    //   2. `spec.dispatchable_loads` — demand-response / elastic
+    //      load resources. On GO C3 these carry ALL the demand (the
+    //      network's `loads` vec is empty at each hour), so missing
+    //      them produced `total_load_by_hour = 0` on every period,
+    //      which in turn made `build_uniform_loss_warm_start` return
+    //      an all-zero warm start and `build_load_pattern_*` skip
+    //      every period via the `<= 1e-6` gate — silently inert.
+    //
+    // For dispatchable loads we use the zero-price warm-start target
+    // (same quantity `estimated_dispatchable_load_target_mw` uses
+    // when sizing the MIP). This is the LP's expected served demand
+    // at zero price; it accurately represents the load the MIP will
+    // plan for.
+    let mut bus_load_mw_by_hour: Vec<Vec<f64>> = Vec::with_capacity(n_periods);
+    let mut total_load_by_hour: Vec<f64> = Vec::with_capacity(n_periods);
+    let first_map = hourly_networks.first().map(|n| n.bus_index_map());
+    for (hour, network_t) in hourly_networks.iter().enumerate() {
+        let map_t = network_t.bus_index_map();
+        let mut bus_load = network_t.bus_load_p_mw_with_map(&map_t);
+
+        let base_mva = network_t.base_mva.max(1.0);
+        for (dl_idx, dl) in spec.dispatchable_loads.iter().enumerate() {
+            if !dl.in_service {
+                continue;
+            }
+            let target_mw = crate::scuc::problem::dispatchable_load_warm_start_target_mw_pub(
+                dl_idx, hour, dl, spec, base_mva,
+            );
+            if target_mw <= 0.0 {
+                continue;
+            }
+            if let Some(&bus_idx) = map_t.get(&dl.bus) {
+                if bus_idx < bus_load.len() {
+                    bus_load[bus_idx] += target_mw;
+                }
+            }
+        }
+
+        total_load_by_hour.push(bus_load.iter().map(|v| v.max(0.0)).sum());
+        bus_load_mw_by_hour.push(bus_load);
+    }
+    let _ = first_map;
+    // `bus_map` below is used by load_pattern / dc_pf for PTDF
+    // column-index → bus-index lookup. Use the first network's map —
+    // PTDF columns are keyed by that network's bus order.
+    let bus_map = hourly_networks.first()?.bus_index_map();
+
+    match spec.loss_factor_warm_start_mode {
+        LossFactorWarmStartMode::Disabled => None,
+        LossFactorWarmStartMode::Uniform { rate } => Some(
+            crate::scuc::losses::build_uniform_loss_warm_start(n_bus, &total_load_by_hour, rate),
+        ),
+        LossFactorWarmStartMode::LoadPattern { rate } => {
+            // Loss-PTDF per period is needed for the load-pattern
+            // source. Build it once per period.
+            let loss_ptdf_by_hour: Result<Vec<_>, _> = hourly_networks
+                .iter()
+                .map(|net_t| {
+                    let monitored: Vec<usize> = (0..net_t.n_branches()).collect();
+                    surge_dc::compute_ptdf(net_t, &surge_dc::PtdfRequest::for_branches(&monitored))
+                })
+                .collect();
+            match loss_ptdf_by_hour {
+                Ok(loss_ptdf_by_hour) => {
+                    Some(crate::scuc::losses::build_load_pattern_loss_warm_start(
+                        hourly_networks,
+                        &bus_map,
+                        &loss_ptdf_by_hour,
+                        &bus_load_mw_by_hour,
+                        &total_load_by_hour,
+                        n_bus,
+                        rate,
+                    ))
+                }
+                Err(err) => {
+                    warn!(%err, "load-pattern cold-start: PTDF build failed; using Uniform(0.02)");
+                    Some(crate::scuc::losses::build_uniform_loss_warm_start(
+                        n_bus,
+                        &total_load_by_hour,
+                        0.02,
+                    ))
+                }
+            }
+        }
+        LossFactorWarmStartMode::DcPf => {
+            // DC-PF source also needs the loss-PTDF (for computing
+            // `dloss_dp` from solved theta). Same per-period build as
+            // LoadPattern above.
+            let loss_ptdf_by_hour: Result<Vec<_>, _> = hourly_networks
+                .iter()
+                .map(|net_t| {
+                    let monitored: Vec<usize> = (0..net_t.n_branches()).collect();
+                    surge_dc::compute_ptdf(net_t, &surge_dc::PtdfRequest::for_branches(&monitored))
+                })
+                .collect();
+            match loss_ptdf_by_hour {
+                Ok(loss_ptdf_by_hour) => Some(crate::scuc::losses::build_dc_pf_loss_warm_start(
+                    hourly_networks,
+                    &bus_map,
+                    &loss_ptdf_by_hour,
+                    &bus_load_mw_by_hour,
+                    &total_load_by_hour,
+                    n_bus,
+                )),
+                Err(err) => {
+                    warn!(%err, "dc-pf cold-start: PTDF build failed; using Uniform(0.02)");
+                    Some(crate::scuc::losses::build_uniform_loss_warm_start(
+                        n_bus,
+                        &total_load_by_hour,
+                        0.02,
+                    ))
+                }
+            }
+        }
+    }
 }
 
 fn attach_security_metadata(
@@ -849,7 +1085,7 @@ pub(crate) fn solve_explicit_security_dispatch(
             // (617-bus D1 = 8.6M). The old borrowed entry cloned the
             // whole network (flowgates included) inside SCUC. Passing
             // by value saves a peak-RSS copy in that range.
-            solve_scuc_with_owned_network(explicit_network, scuc_spec, Some(hourly_networks))?
+            solve_scuc_with_owned_network(explicit_network, scuc_spec, Some(hourly_networks), None)?
         }
     };
 
@@ -1077,6 +1313,7 @@ fn screen_branch_violations(
                     contingency_branch_idx: k,
                     monitored_branch_idx: l,
                     severity_pu: excess,
+                    breach_upper: post_flow > 0.0,
                 });
             }
         }
@@ -1192,6 +1429,7 @@ fn screen_hvdc_violations(
                     band_coefficients,
                     f_max_mw: limit_mva,
                     excess_pu: excess,
+                    breach_upper: post_flow > 0.0,
                 });
             }
         }
@@ -1285,12 +1523,17 @@ fn preseed_branch_flowgates(
                 contingency_branch_idx: k,
                 monitored_branch_idx: l,
                 severity_pu: 0.0,
+                // Preseed: ranking-based, no observed flow direction —
+                // the builder emits FlowgateBreachSides::Both so the
+                // bounds layer keeps symmetric slacks.
+                breach_upper: true,
             };
             out.push(build_branch_security_flowgate(
                 &violation,
                 hourly_network,
                 context,
                 n_periods,
+                true, // preseed
             ));
             taken += 1;
         }
@@ -1304,8 +1547,9 @@ fn build_branch_security_flowgate(
     hourly_network: &Network,
     context: &HourlySecurityContext,
     n_periods: usize,
+    preseed: bool,
 ) -> surge_network::network::Flowgate {
-    use surge_network::network::{BranchRef, Flowgate, WeightedBranchRef};
+    use surge_network::network::{BranchRef, Flowgate, FlowgateBreachSides, WeightedBranchRef};
 
     let monitored_branch = &hourly_network.branches[violation.monitored_branch_idx];
     let contingency_branch = &hourly_network.branches[violation.contingency_branch_idx];
@@ -1367,6 +1611,18 @@ fn build_branch_security_flowgate(
         hvdc_coefficients: Vec::new(),
         hvdc_band_coefficients: Vec::new(),
         limit_mw_active_period: active_period,
+        // Preseed cuts rank (ctg, mon) pairs by magnitude without
+        // observing an actual flow direction, so leave symmetric
+        // slacks. Iterative-loop cuts observed `post_flow` and know
+        // which side crossed the limit — use that to drop the
+        // non-breached side's slack column.
+        breach_sides: if preseed {
+            FlowgateBreachSides::Both
+        } else if violation.breach_upper {
+            FlowgateBreachSides::Upper
+        } else {
+            FlowgateBreachSides::Lower
+        },
     }
 }
 
@@ -1375,7 +1631,7 @@ fn build_hvdc_security_flowgate(
     hourly_network: &Network,
     n_periods: usize,
 ) -> surge_network::network::Flowgate {
-    use surge_network::network::{BranchRef, Flowgate, WeightedBranchRef};
+    use surge_network::network::{BranchRef, Flowgate, FlowgateBreachSides, WeightedBranchRef};
 
     let monitored_branch = &hourly_network.branches[cut.monitored_branch_idx];
     let active_period = (n_periods > 1 && cut.period < n_periods).then_some(cut.period as u32);
@@ -1409,6 +1665,11 @@ fn build_hvdc_security_flowgate(
             .map(|&(band_idx, coefficient)| (cut.hvdc_link_idx, band_idx, -coefficient))
             .collect(),
         limit_mw_active_period: active_period,
+        breach_sides: if cut.breach_upper {
+            FlowgateBreachSides::Upper
+        } else {
+            FlowgateBreachSides::Lower
+        },
     }
 }
 

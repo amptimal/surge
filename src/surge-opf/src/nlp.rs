@@ -67,6 +67,10 @@ pub struct NlpSolution {
     pub iterations: Option<u32>,
     /// Whether the solver converged.
     pub converged: bool,
+    /// Backend-reported stats for the solve (problem size, termination
+    /// status, final residuals). None for backends that don't populate
+    /// it; Ipopt populates it on every success path.
+    pub trace: Option<surge_solution::NlpTrace>,
 }
 
 /// Trait defining a nonlinear programming problem.

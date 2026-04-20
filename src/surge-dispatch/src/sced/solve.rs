@@ -153,6 +153,17 @@ pub(crate) fn solve_explicit_security_sced(
                 contingency_branch_idx: contingency.branch_idx,
                 monitored_branch_idx: monitored_idx,
                 severity_pu: 0.0,
+                // Explicit SCED cut, no observed flow direction —
+                // conservative default of symmetric slacks. The
+                // builder emits FlowgateBreachSides::Upper here
+                // (since breach_upper=true), which is OK for SCED
+                // since the flowgate is gated to the single period
+                // anyway. For pure symmetry we'd also need the
+                // "preseed=true" flag plumbed through
+                // build_branch_lodf_flowgate — deferred since SCED's
+                // explicit contingency list is small enough that the
+                // 2× slack overhead is negligible.
+                breach_upper: true,
             };
             let fg = crate::common::security::build_branch_lodf_flowgate(
                 &violation,

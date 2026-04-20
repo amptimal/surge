@@ -22,7 +22,9 @@
 use std::collections::{HashMap, HashSet};
 
 use surge_network::Network;
-use surge_network::network::{BranchRatingCondition, BranchRef, Flowgate, WeightedBranchRef};
+use surge_network::network::{
+    BranchRatingCondition, BranchRef, Flowgate, FlowgateBreachSides, WeightedBranchRef,
+};
 
 use crate::error::ScedError;
 
@@ -45,6 +47,15 @@ pub struct BranchSecurityViolation {
     pub monitored_branch_idx: usize,
     /// How much the post-contingency `|f|` exceeds `s^max,ctg`, in pu.
     pub severity_pu: f64,
+    /// Which side of the thermal band the post-contingency flow
+    /// crossed. `true` when `post_flow > +limit` (upper breach);
+    /// `false` when `post_flow < -limit` (lower breach). Threaded into
+    /// `Flowgate.breach_sides` by the builder so the bounds layer
+    /// only allocates a slack column on the breached side. Preseeded
+    /// flowgates — where the screener is ranking instead of observing
+    /// a breach — set this to `true` by convention and the builder
+    /// emits `FlowgateBreachSides::Both`.
+    pub breach_upper: bool,
 }
 
 /// Per-branch metadata cached for LODF screening of one period's snapshot.
@@ -242,6 +253,7 @@ pub fn screen_branch_violations(
                     contingency_branch_idx: k,
                     monitored_branch_idx: l,
                     severity_pu: excess,
+                    breach_upper: post_flow > 0.0,
                 });
             }
         }
@@ -331,6 +343,11 @@ pub fn build_branch_lodf_flowgate(
         hvdc_coefficients: Vec::new(),
         hvdc_band_coefficients: Vec::new(),
         limit_mw_active_period: active_period,
+        breach_sides: if violation.breach_upper {
+            FlowgateBreachSides::Upper
+        } else {
+            FlowgateBreachSides::Lower
+        },
     }
 }
 
@@ -476,6 +493,7 @@ mod tests {
             contingency_branch_idx: 0,
             monitored_branch_idx: 2,
             severity_pu: 0.1,
+            breach_upper: true,
         };
         let fg = build_branch_lodf_flowgate(&violation, &net, &context, 4);
         assert_eq!(fg.monitored.len(), 2);
@@ -517,6 +535,7 @@ mod tests {
             contingency_branch_idx: 0,
             monitored_branch_idx: 2,
             severity_pu: 0.1,
+            breach_upper: true,
         };
         let fg = build_branch_lodf_flowgate(&violation, &net, &context, 1);
         assert_eq!(

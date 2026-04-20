@@ -896,22 +896,45 @@ pub(super) fn run_pricing(input: PricingRunInput<'_>) -> Result<PricingRunState<
         },
     })?;
 
-    let loss_result = iterate_loss_factors(ScucLossIterationInput {
-        solver,
-        spec,
-        hourly_networks: &model_plan.hourly_networks,
-        bus_map: &solve.bus_map,
+    // Pricing LP runs its own (fresh) loss-factor iteration against
+    // the pricing problem matrix — build a dedicated prep struct for
+    // it rather than reusing the SCUC primary-solve prep (different
+    // SparseProblem, different `a_value` positions). No warm start is
+    // supplied here: pricing is a one-shot LP re-solve that already
+    // inherits the SCUC commitment, so the initial coefficients are
+    // already close to the converged loss-adjusted state via the
+    // prior SCUC iteration's outputs.
+    let n_flow_pricing = primary_state.problem.n_branch_flow
+        + primary_state.problem.n_fg_rows
+        + network_plan.iface_rows.len();
+    let pricing_prep = crate::scuc::losses::build_loss_factor_prep(
+        &lp_prob,
+        &model_plan.hourly_networks,
+        &solve.bus_map,
         layout,
-        gen_bus_idx: &setup.gen_bus_idx,
-        hour_row_bases: &primary_state.problem.hour_row_bases,
-        n_flow: primary_state.problem.n_branch_flow
-            + primary_state.problem.n_fg_rows
-            + network_plan.iface_rows.len(),
+        &setup.gen_bus_idx,
+        &primary_state.problem.hour_row_bases,
+        n_flow_pricing,
         n_bus,
-        time_limit_secs: None,
-        problem: &mut lp_prob,
-        solution: &mut lp_sol,
-    })?;
+    )?;
+    let loss_result = iterate_loss_factors(
+        ScucLossIterationInput {
+            solver,
+            spec,
+            hourly_networks: &model_plan.hourly_networks,
+            bus_map: &solve.bus_map,
+            layout,
+            gen_bus_idx: &setup.gen_bus_idx,
+            hour_row_bases: &primary_state.problem.hour_row_bases,
+            n_flow: n_flow_pricing,
+            n_bus,
+            time_limit_secs: None,
+            problem: &mut lp_prob,
+            solution: &mut lp_sol,
+        },
+        &pricing_prep,
+        None,
+    )?;
 
     if let Some(path) = std::env::var_os("SURGE_DEBUG_DUMP_SCUC_PRICING_DUALS") {
         let path = Path::new(&path);

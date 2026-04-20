@@ -4220,6 +4220,7 @@ mod impl_ {
                 solver_name: Some("Gurobi-NLP".to_string()),
                 solver_version: Some("13.0".to_string()),
                 ac_opf_timings: None,
+                nlp_trace: None,
             })
         }
     }

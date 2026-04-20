@@ -132,17 +132,29 @@ class MarketPolicy:
     # MIP (90k rows at 5000/period couldn't find an incumbent in 60 s
     # on 617-bus); lower values leave many binding pairs for the
     # iterative loop to clean up.
-    scuc_security_preseed_count_per_period: int = 1_000
+    scuc_security_preseed_count_per_period: int = 250
     # Outer-loop cap for the iterative SCUC N-1 security screening
     # (preseed → solve → check violations → add cuts → repeat). `1`
     # runs a single SCUC solve with only the preseeded cuts.
     scuc_security_max_iterations: int = 5
     # Cap on newly added flowgate cuts per outer iteration. Only
-    # active when ``scuc_security_max_iterations > 1``. Sized ~20× the
-    # preseed default so each iteration can absorb a broad violation
-    # wave on contingency-dense scenarios where iter 1 surfaces many
-    # binding pairs the topology-only preseed missed.
-    scuc_security_max_cuts_per_iteration: int = 5_000
+    # active when ``scuc_security_max_iterations > 1``. Sized wide
+    # enough to absorb a full violation wave on contingency-dense
+    # scenarios where iter 1 surfaces many binding pairs the
+    # topology-only preseed missed.
+    scuc_security_max_cuts_per_iteration: int = 2_500
+    # SCUC loss-factor cold-start warm start for iter 0. Default
+    # ("load_pattern", 0.02): PTDF-weighted per-bus loss sensitivity,
+    # seeded into the MIP pre-solve. Modes: ``("uniform", rate)``,
+    # ``("load_pattern", rate)``, ``("dc_pf", 0.0)``. Pass None to
+    # disable. Subsequent security iterations always warm-start from
+    # the prior iteration's converged `dloss_dp` regardless of this.
+    scuc_loss_factor_warm_start: tuple[str, float] | None = ("load_pattern", 0.02)
+    # SCUC loss-factor refinement iteration count. Default 0: trust
+    # the warm start, skip the refinement LP. None preserves the
+    # historical default of 1 refinement round; 2+ runs further
+    # refinement passes.
+    scuc_loss_factor_max_iterations: int | None = 0
     # When True, disable flowgate enforcement entirely on the SCUC LP —
     # drops both normal flowgates and the explicit N-1 contingency
     # flowgates. Diagnostic-only; production solves need this False for
@@ -414,6 +426,12 @@ def solve_workflow(
     ``stop_after_stage`` — when set to a stage id (e.g. ``"scuc"``),
     only stages up to and including the named stage are solved. Useful
     for extracting the commitment output without running AC SCED.
+
+    Stage failures are reported in ``result["error"]`` (a dict with
+    ``stage_id``, ``role``, ``error``) and ``result["stages"]`` contains
+    the successfully solved prior stages. Callers that want the legacy
+    "raise on stage error" behavior should check ``result["error"]``
+    themselves.
     """
     return _native.solve_market_workflow_py(
         workflow,

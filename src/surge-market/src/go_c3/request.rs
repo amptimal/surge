@@ -409,8 +409,30 @@ pub fn build_dispatch_request(
     // the AC reconcile to absorb them as slack. See `markets/go_c3/
     // adapter.py:4217` for the $10M-penalty calibration motivation.
     network.loss_factors.enabled = true;
-    network.loss_factors.max_iterations = 1;
+    network.loss_factors.max_iterations = policy.scuc_loss_factor_max_iterations.unwrap_or(1);
     network.loss_factors.tolerance = 1.0e-3;
+    // Cold-start loss-factor warm-start mode. Off by default; caller
+    // opts in via `GoC3Policy::scuc_loss_factor_warm_start`.
+    //
+    // * `Some(("uniform", rate))` → `LossFactorWarmStartMode::Uniform { rate }`
+    // * `Some(("load_pattern", rate))` → `LossFactorWarmStartMode::LoadPattern { rate }`
+    // * `Some(("dc_pf", _))` → `LossFactorWarmStartMode::DcPf`
+    // * `None` or unrecognised mode → falls through to `Disabled`.
+    network.loss_factors.warm_start_mode = match policy.scuc_loss_factor_warm_start.as_ref() {
+        Some((mode, rate)) => match mode.as_str() {
+            "uniform" => {
+                surge_dispatch::request::network::LossFactorWarmStartMode::Uniform { rate: *rate }
+            }
+            "load_pattern" => {
+                surge_dispatch::request::network::LossFactorWarmStartMode::LoadPattern {
+                    rate: *rate,
+                }
+            }
+            "dc_pf" => surge_dispatch::request::network::LossFactorWarmStartMode::DcPf,
+            _ => surge_dispatch::request::network::LossFactorWarmStartMode::Disabled,
+        },
+        None => surge_dispatch::request::network::LossFactorWarmStartMode::Disabled,
+    };
 
     // ── Commitment ───────────────────────────────────────────────────────
     let commitment = match commitment_mode {

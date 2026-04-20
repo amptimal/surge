@@ -165,6 +165,10 @@ pub(super) struct ScucColumnBuildInput<'spec, 'input> {
     pub n_sbp: usize,
     pub n_branch_flow: usize,
     pub n_fg_rows: usize,
+    /// Map from LP flowgate row index to `network.flowgates` index.
+    /// Carried so the bounds layer can look up per-row breach_sides +
+    /// active_period and pin inactive slack columns to zero.
+    pub fg_rows: &'input [usize],
     pub n_iface_rows: usize,
     pub n_sto_dis_epi: usize,
     pub n_sto_ch_epi: usize,
@@ -376,6 +380,7 @@ pub(super) fn build_problem_plan<'a>(input: ScucProblemPlanInput<'a, 'a>) -> Scu
         n_sbp: input.model_plan.n_sbp,
         n_branch_flow: input.model_plan.network_plan.constrained_branches.len(),
         n_fg_rows: input.model_plan.network_plan.fg_rows.len(),
+        fg_rows: &input.model_plan.network_plan.fg_rows,
         n_iface_rows: input.model_plan.network_plan.iface_rows.len(),
         n_sto_dis_epi,
         n_sto_ch_epi,
@@ -532,6 +537,7 @@ pub(super) fn build_column_state(input: ScucColumnBuildInput<'_, '_>) -> ScucCol
         n_sbp: input.n_sbp,
         n_branch_flow: input.n_branch_flow,
         n_fg_rows: input.n_fg_rows,
+        fg_rows: input.fg_rows,
         n_iface_rows: input.n_iface_rows,
         n_sto_dis_epi: input.n_sto_dis_epi,
         n_sto_ch_epi: input.n_sto_ch_epi,

@@ -311,21 +311,11 @@ pub fn solve_market_workflow_py<'py>(
     }
     .map_err(|err| SurgeError::new_err(format!("solve_market_workflow failed: {err}")))?;
 
-    // If the result has a stage error and the caller did NOT request
-    // stop_after_stage (i.e. they wanted a full solve), raise it as an
-    // exception for backward compatibility. The partial stages are lost
-    // in this path — callers that want partial results should check
-    // result["error"] instead. This preserves the existing API contract
-    // where solve failures raise SurgeError.
-    if stop_after_stage.is_none() {
-        if let Some(ref err) = result.error {
-            return Err(SurgeError::new_err(format!(
-                "solve_market_workflow failed: {}",
-                err.error
-            )));
-        }
-    }
-
+    // Stage failures are returned in result["error"] along with any
+    // successful prior stages in result["stages"]. Callers inspect
+    // result["error"] to detect stage failures — the previous behavior
+    // of raising discarded the partial stages and stage-error metadata
+    // that debuggers need.
     serialize_to_py(py, &result)
 }
 

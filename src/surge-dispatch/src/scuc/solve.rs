@@ -26,7 +26,19 @@ pub(crate) fn solve_scuc_with_problem_spec(
     network: &Network,
     problem_spec: DispatchProblemSpec<'_>,
 ) -> Result<RawDispatchSolution, ScedError> {
-    solve_scuc_with_owned_network(network.clone(), problem_spec, None)
+    solve_scuc_with_owned_network(network.clone(), problem_spec, None, None)
+}
+
+/// Variant of [`solve_scuc_with_problem_spec`] that accepts an optional
+/// loss-factor warm start. Used by the security loop to thread the
+/// prior iteration's final `dloss_dp` + `total_losses_mw` back into
+/// the next SCUC solve so the lossless-MIP pass can be skipped.
+pub(crate) fn solve_scuc_with_problem_spec_warm_started(
+    network: &Network,
+    problem_spec: DispatchProblemSpec<'_>,
+    initial_loss_warm_start: Option<crate::scuc::losses::LossFactorWarmStart>,
+) -> Result<RawDispatchSolution, ScedError> {
+    solve_scuc_with_owned_network(network.clone(), problem_spec, None, initial_loss_warm_start)
 }
 
 /// Canonical SCUC entry that takes the network by value (no internal
@@ -38,6 +50,7 @@ pub(crate) fn solve_scuc_with_owned_network(
     mut network: Network,
     problem_spec: DispatchProblemSpec<'_>,
     prebuilt_hourly_networks: Option<Vec<Network>>,
+    mut initial_loss_warm_start: Option<crate::scuc::losses::LossFactorWarmStart>,
 ) -> Result<RawDispatchSolution, ScedError> {
     let fn_start = Instant::now();
     let mut timings = DispatchPhaseTimings::default();
@@ -82,6 +95,7 @@ pub(crate) fn solve_scuc_with_owned_network(
         solve: &solve_session,
         problem: problem_build,
         problem_plan,
+        initial_loss_warm_start: initial_loss_warm_start.take(),
     })?;
     timings.solve_problem_secs = t.elapsed().as_secs_f64();
 

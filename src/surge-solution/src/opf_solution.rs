@@ -344,6 +344,62 @@ pub struct OpfSolution {
     /// Per-phase timing breakdown within the OPF solve.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ac_opf_timings: Option<AcOpfTimings>,
+    /// NLP solver stats and final-iterate diagnostics. Populated by the
+    /// NLP backend (Ipopt today). Captures problem size, termination
+    /// status, and residuals/barrier at the final iterate so post-mortem
+    /// analysis can distinguish convergence/infeasibility/iteration-limit
+    /// cases without parsing log strings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nlp_trace: Option<NlpTrace>,
+}
+
+/// NLP solver stats for a single `NlpSolver::solve` call.
+///
+/// Populated by the backend on the returned `NlpSolution`. Carries both
+/// problem structure (size, sparsity) and termination state (status code
+/// and mnemonic, iteration count, final primal/dual residuals, barrier
+/// parameter). Enables SCUC-equivalent debugging on the AC SCED side —
+/// e.g. distinguishing a proven-infeasible solve from one that hit
+/// `max_iter` with small residuals.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct NlpTrace {
+    /// Number of decision variables.
+    pub n_vars: u32,
+    /// Number of constraints (rows of `g(x)`).
+    pub n_constraints: u32,
+    /// Nonzeros in the constraint Jacobian sparsity pattern.
+    pub jac_nnz: u32,
+    /// Nonzeros in the Hessian sparsity pattern (0 when Hessian is
+    /// approximated, e.g. Ipopt L-BFGS mode).
+    pub hess_nnz: u32,
+    /// Raw solver status code (backend-specific). For Ipopt: 0 =
+    /// Solve_Succeeded, 1 = Solved_To_Acceptable_Level, 2 =
+    /// Infeasible_Problem_Detected, -1 = Maximum_Iterations_Exceeded,
+    /// etc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<i32>,
+    /// Human-readable status label (backend mnemonic), e.g.
+    /// `"Solve_Succeeded"`, `"Restoration_Failed"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_label: Option<String>,
+    /// Iteration count at termination.
+    pub iterations: u32,
+    /// Final objective value.
+    pub objective: f64,
+    /// Primal infeasibility at the final iterate (max constraint
+    /// violation in the solver's scaled internal representation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_primal_inf: Option<f64>,
+    /// Dual infeasibility at the final iterate (KKT stationarity residual).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_dual_inf: Option<f64>,
+    /// Final barrier parameter `μ` (Ipopt). Large `μ` at termination
+    /// typically indicates the solver stalled before reaching the
+    /// interior-point endgame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_mu: Option<f64>,
+    /// Whether the solver considered the problem converged.
+    pub converged: bool,
 }
 
 /// Per-phase timing breakdown for a single AC-OPF solve call.
@@ -425,8 +481,15 @@ impl OpfSolution {
         !self.objective_terms.is_empty()
     }
 
-    /// Recompute and store the persisted audit block from the exact objective ledger.
+    /// Recompute and store the persisted audit block from the exact
+    /// objective ledger. Gated by the `SURGE_OBJECTIVE_AUDIT` env var —
+    /// see [`crate::objective_audit_enabled`]. When the gate is off
+    /// (the default), this is a no-op and the `audit` field stays at
+    /// its serde default.
     pub fn refresh_audit(&mut self) {
+        if !crate::objective_audit_enabled() {
+            return;
+        }
         self.audit = <Self as AuditableSolution>::computed_solution_audit(self);
     }
 

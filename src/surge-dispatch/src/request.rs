@@ -7,7 +7,7 @@
 mod axes;
 mod commitment;
 mod market;
-mod network;
+pub mod network;
 mod profiles;
 mod resolve;
 mod runtime;
@@ -569,6 +569,10 @@ pub(crate) struct DispatchInput {
     pub use_loss_factors: bool,
     pub max_loss_factor_iters: usize,
     pub loss_factor_tol: f64,
+    /// Cold-start warm-start strategy for the SCUC first iteration's
+    /// loss factors. See
+    /// [`crate::request::network::LossFactorWarmStartMode`].
+    pub loss_factor_warm_start_mode: crate::request::network::LossFactorWarmStartMode,
     pub enforce_forbidden_zones: bool,
     pub foz_max_transit_periods: Option<usize>,
     pub enforce_shutdown_deloading: bool,
@@ -675,6 +679,7 @@ impl Default for DispatchInput {
             use_loss_factors: false,
             max_loss_factor_iters: 3,
             loss_factor_tol: 1e-3,
+            loss_factor_warm_start_mode: crate::request::network::LossFactorWarmStartMode::Disabled,
             enforce_forbidden_zones: false,
             foz_max_transit_periods: None,
             enforce_shutdown_deloading: false,

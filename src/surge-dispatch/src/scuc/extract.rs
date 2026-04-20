@@ -1759,6 +1759,9 @@ pub(super) fn extract_solution(input: ScucExtractionInput<'_>) -> RawDispatchSol
     let captured_model_diagnostic = primary_state.model_diagnostic;
     let captured_bus_loss_allocation_mw = primary_state.bus_loss_allocation_mw;
     let captured_commitment_mip_trace = primary_state.commitment_mip_trace.clone();
+    // Moved out rather than `.take()`: the field is only consumed here;
+    // subsequent uses of `primary_state` touch different fields.
+    let captured_final_loss_warm_start = primary_state.final_loss_warm_start;
     let model_plan = primary_state.problem_plan.model_plan;
     let sol = &primary_state.solution;
     let layout_plan = &model_plan.layout;
@@ -1842,6 +1845,7 @@ pub(super) fn extract_solution(input: ScucExtractionInput<'_>) -> RawDispatchSol
     });
     result.model_diagnostics = captured_model_diagnostic.into_iter().collect();
     result.diagnostics.commitment_mip_trace = captured_commitment_mip_trace;
+    result.scuc_final_loss_warm_start = captured_final_loss_warm_start;
     result
 }
 
@@ -2155,6 +2159,7 @@ pub(super) fn assemble_solution(input: SolutionAssemblyInput<'_>) -> RawDispatch
             security: None,
             sced_ac_benders: None,
             ac_sced_period_timings: Vec::new(),
+            ac_opf_stats: Vec::new(),
             // Filled in by the caller (extract_solution) after assembly.
             commitment_mip_trace: None,
         },
@@ -2201,6 +2206,7 @@ pub(super) fn assemble_solution(input: SolutionAssemblyInput<'_>) -> RawDispatch
         cc_transition_cost,
         cc_transition_costs,
         model_diagnostics: Vec::new(),
+        scuc_final_loss_warm_start: None,
     }
 }
 

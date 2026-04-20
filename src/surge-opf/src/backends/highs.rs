@@ -10,6 +10,7 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use libloading::Library;
 use tracing::{debug, info, warn};
@@ -1581,7 +1582,7 @@ fn solve_sparse_mip_with_limit(
     time_limit_secs: Option<f64>,
     mip_rel_gap: Option<f64>,
     primal_start: Option<&LpPrimalStart>,
-) -> Result<SparseQpSolution, String> {
+) -> Result<(SparseQpSolution, super::MipTrace), String> {
     let n_integer = integrality.iter().filter(|&&v| v != 0).count();
     info!(
         cols = n_col,
@@ -1592,14 +1593,34 @@ fn solve_sparse_mip_with_limit(
         "HiGHS sparse MIP: starting solve"
     );
     if n_col == 0 {
-        return Ok(SparseQpSolution {
-            x: vec![],
-            row_dual: vec![],
-            col_dual: vec![],
-            objective: 0.0,
-            iterations: 0,
-            converged: true,
-        });
+        return Ok((
+            SparseQpSolution {
+                x: vec![],
+                row_dual: vec![],
+                col_dual: vec![],
+                objective: 0.0,
+                iterations: 0,
+                converged: true,
+            },
+            super::MipTrace {
+                schedule: None,
+                time_limit_secs,
+                final_gap: None,
+                final_time_secs: 0.0,
+                terminated_by: super::MipTerminationReason::Optimal,
+                events: Vec::new(),
+                n_vars: Some(0),
+                n_bin_vars: Some(0),
+                pre_fixed_bin_vars: Some(0),
+                n_int_vars: Some(0),
+                n_rows: Some(n_row as u64),
+                n_nonzeros: Some(a_value.len() as u64),
+                node_count: Some(0),
+                iter_count: Some(0),
+                objective: Some(0.0),
+                objective_bound: Some(0.0),
+            },
+        ));
     }
 
     unsafe {
@@ -1652,7 +1673,8 @@ unsafe fn solve_sparse_mip_inner(
     time_limit_secs: Option<f64>,
     mip_rel_gap: Option<f64>,
     primal_start: Option<&LpPrimalStart>,
-) -> Result<SparseQpSolution, String> {
+) -> Result<(SparseQpSolution, super::MipTrace), String> {
+    let solve_start = Instant::now();
     // Suppress output (set SURGE_HIGHS_VERBOSE=1 to enable HiGHS MIP logging)
     let verbose = std::env::var("SURGE_HIGHS_VERBOSE").is_ok();
     let output_flag = CString::new("output_flag").expect("static string contains no null bytes");
@@ -1892,9 +1914,24 @@ unsafe fn solve_sparse_mip_inner(
     let has_feasible_incumbent = mip_primal_bound.is_finite() || has_callback_incumbent;
 
     if (time_limit_feasible || interrupted) && !has_feasible_incumbent {
-        return Err(
-            "HiGHS MIP reached the time limit before producing any feasible incumbent".into(),
-        );
+        let mut node_count: HighsInt = 0;
+        let node_info =
+            CString::new("mip_node_count").expect("static string contains no null bytes");
+        unsafe { (lib.Highs_getIntInfoValue)(highs, node_info.as_ptr(), &mut node_count) };
+        let cause = if interrupted {
+            "interrupt"
+        } else {
+            "time limit"
+        };
+        let time_limit_str = time_limit_secs
+            .map(|t| format!("{t:.1}s"))
+            .unwrap_or_else(|| "none".into());
+        return Err(format!(
+            "HiGHS MIP reached {cause} before producing any feasible incumbent \
+             (model_status={model_status}, node_count={node_count}, \
+             dual_bound={mip_dual_bound:.4e}, mip_gap={mip_gap:.4e}, \
+             time_limit={time_limit_str})"
+        ));
     }
 
     if (!converged || time_limit_feasible || interrupted)
@@ -1944,14 +1981,85 @@ unsafe fn solve_sparse_mip_inner(
     let mip_info = CString::new("mip_node_count").expect("static string contains no null bytes");
     unsafe { (lib.Highs_getIntInfoValue)(highs, mip_info.as_ptr(), &mut mip_node_count) };
 
-    Ok(SparseQpSolution {
-        x: col_value,
-        row_dual: row_dual_out,
-        col_dual: col_dual_out,
-        objective: obj_val,
-        iterations: (iters.max(mip_node_count)) as u32,
-        converged,
-    })
+    // Pre-presolve model-size stats. HiGHS's integrality flag doesn't
+    // distinguish Binary from Integer, so we treat any integer variable
+    // with col_lower ∈ {0, 1} and col_upper ∈ {0, 1} as binary (matches
+    // how SCUC models encode on-status indicators). `pre_fixed_bin_vars`
+    // counts binaries already pinned by tight bounds before the solve —
+    // HiGHS's presolve removes them, so the "free" count the MIP
+    // actually branches on is `n_bin_vars - pre_fixed_bin_vars`.
+    let mut n_int_count: u64 = 0;
+    let mut n_bin_count: u64 = 0;
+    let mut pre_fixed_bin_count: u64 = 0;
+    for (i, &int_flag) in integrality.iter().enumerate() {
+        if int_flag == 0 {
+            continue;
+        }
+        n_int_count += 1;
+        let lo = col_lower.get(i).copied().unwrap_or(f64::NEG_INFINITY);
+        let hi = col_upper.get(i).copied().unwrap_or(f64::INFINITY);
+        let is_binary_bounds = (lo == 0.0 || lo == 1.0) && (hi == 0.0 || hi == 1.0) && lo <= hi;
+        if is_binary_bounds {
+            n_bin_count += 1;
+            if lo == hi {
+                pre_fixed_bin_count += 1;
+            }
+        }
+    }
+
+    let terminated_by = if model_status == MODEL_STATUS_OPTIMAL {
+        super::MipTerminationReason::Optimal
+    } else if time_limit_feasible {
+        super::MipTerminationReason::TimeLimit
+    } else if model_status == MODEL_STATUS_INFEASIBLE {
+        super::MipTerminationReason::Infeasible
+    } else {
+        super::MipTerminationReason::Other
+    };
+
+    let trace = super::MipTrace {
+        schedule: None,
+        time_limit_secs,
+        final_gap: mip_gap.is_finite().then_some(mip_gap),
+        final_time_secs: solve_start.elapsed().as_secs_f64(),
+        terminated_by,
+        events: Vec::new(),
+        n_vars: Some(n_col as u64),
+        n_bin_vars: Some(n_bin_count),
+        pre_fixed_bin_vars: Some(pre_fixed_bin_count),
+        n_int_vars: Some(n_int_count),
+        n_rows: Some(n_row as u64),
+        n_nonzeros: Some(a_value.len() as u64),
+        node_count: Some(mip_node_count.max(0) as u64),
+        iter_count: Some(iters.max(0) as u64),
+        // Prefer the MIP-tracker primal bound (B&B incumbent). Fall back
+        // to `obj_val` (Highs_getInfoValue "objective_function_value") when
+        // the tracker is NaN — HiGHS leaves `mip_primal_bound` unset when
+        // the problem closes at the root LP without registering a B&B
+        // incumbent (node_count=0). `obj_val` is the canonical objective
+        // value HiGHS reports for the returned solution regardless of
+        // whether the solve branched.
+        objective: if mip_primal_bound.is_finite() {
+            Some(mip_primal_bound)
+        } else if obj_val.is_finite() {
+            Some(obj_val)
+        } else {
+            None
+        },
+        objective_bound: mip_dual_bound.is_finite().then_some(mip_dual_bound),
+    };
+
+    Ok((
+        SparseQpSolution {
+            x: col_value,
+            row_dual: row_dual_out,
+            col_dual: col_dual_out,
+            objective: obj_val,
+            iterations: (iters.max(mip_node_count)) as u32,
+            converged,
+        },
+        trace,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2003,7 +2111,7 @@ impl LpSolver for HiGHSLpSolver {
                 .expect("integrality Some when is_mip is true");
             let highs_integ: Vec<HighsInt> =
                 integ.iter().map(|&v| highs_integrality_value(v)).collect();
-            let sol = solve_sparse_mip_with_limit(
+            let (sol, trace) = solve_sparse_mip_with_limit(
                 &self.lib,
                 prob.n_col,
                 prob.n_row,
@@ -2035,7 +2143,7 @@ impl LpSolver for HiGHSLpSolver {
                 objective: sol.objective,
                 status,
                 iterations: sol.iterations,
-                mip_trace: None,
+                mip_trace: Some(trace),
             })
         } else {
             let sol = solve_sparse_qp(
