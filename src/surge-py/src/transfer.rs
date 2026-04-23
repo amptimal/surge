@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 use crate::exceptions::to_pyerr;
 use crate::matrices::InjectionCapabilityResult;
@@ -343,6 +344,24 @@ impl AcAtcResult {
         self.inner.limiting_constraint.as_str()
     }
 
+    /// Return the AC-ATC result as a JSON-serializable dictionary.
+    ///
+    /// Keys: ``atc_mw``, ``thermal_limit_mw``, ``voltage_limit_mw``,
+    /// ``limiting_bus``, ``binding_branch``, ``limiting_constraint``.
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("atc_mw", self.inner.atc_mw)?;
+        d.set_item("thermal_limit_mw", self.inner.thermal_limit_mw)?;
+        d.set_item("voltage_limit_mw", self.inner.voltage_limit_mw)?;
+        d.set_item("limiting_bus", self.inner.limiting_bus)?;
+        d.set_item("binding_branch", self.inner.binding_branch)?;
+        d.set_item(
+            "limiting_constraint",
+            self.inner.limiting_constraint.as_str(),
+        )?;
+        Ok(d)
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "AcAtcResult(atc_mw={:.2}, thermal_limit_mw={:.2}, voltage_limit_mw={:.2}, limiting_constraint={})",
@@ -414,6 +433,30 @@ impl NercAtcResult {
     #[getter]
     fn transfer_ptdf(&self) -> Vec<f64> {
         self.inner.transfer_ptdf.clone()
+    }
+
+    /// Return the NERC ATC result as a JSON-serializable dictionary.
+    ///
+    /// Keys: ``atc_mw``, ``ttc_mw``, ``trm_mw``, ``cbm_mw``, ``etc_mw``,
+    /// ``limit_cause``, ``binding_branch``, ``binding_contingency``,
+    /// ``monitored_branches``, ``reactive_margin_warning``, ``transfer_ptdf``.
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("atc_mw", self.inner.atc_mw)?;
+        d.set_item("ttc_mw", self.inner.ttc_mw)?;
+        d.set_item("trm_mw", self.inner.trm_mw)?;
+        d.set_item("cbm_mw", self.inner.cbm_mw)?;
+        d.set_item("etc_mw", self.inner.etc_mw)?;
+        d.set_item("limit_cause", self.inner.limit_cause.kind().to_string())?;
+        d.set_item("binding_branch", self.inner.binding_branch())?;
+        d.set_item("binding_contingency", self.inner.binding_contingency())?;
+        d.set_item("monitored_branches", self.inner.monitored_branches.clone())?;
+        d.set_item(
+            "reactive_margin_warning",
+            self.inner.reactive_margin_warning,
+        )?;
+        d.set_item("transfer_ptdf", self.inner.transfer_ptdf.clone())?;
+        Ok(d)
     }
 
     fn __repr__(&self) -> String {

@@ -28,13 +28,13 @@ Returned by `surge.solve_ac_pf()` and `surge.powerflow.solve_ac_pf()`.
 | `n_islands` | int | Number of electrical islands detected |
 | `area_interchange` | dict or None | Area interchange results (when enforce_interchange enabled) |
 | `convergence_history` | ndarray | Nx2 array of [iteration, mismatch] (when recorded) |
+| `branch_apparent_power` | ndarray | Branch apparent power flows (MVA) |
+| `branch_loading_pct` | ndarray | Branch loading as percentage of Rate A (requires attached network) |
 
 ### Methods
 
 | Method | Return | Description |
 |---|---|---|
-| `branch_apparent_power()` | ndarray | Branch apparent power flows (MVA) |
-| `branch_loading_pct()` | ndarray | Branch loading as percentage of Rate A |
 | `get_buses()` | list | All buses with solved voltages and injections |
 | `bus(number)` | object | Single bus result by bus number |
 | `get_branches()` | list | All branches with solved power flows |

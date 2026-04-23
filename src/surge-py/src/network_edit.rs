@@ -618,6 +618,16 @@ impl Network {
         br.circuit = circuit.to_string();
         br.tap = tap;
         br.phase_shift_rad = shift_deg.to_radians();
+        // Match the MATPOWER reader's convention: an off-nominal tap
+        // (|tap - 1| > 1e-6) or a non-zero phase shift flags this
+        // branch as a transformer. Keeps semantics consistent whether
+        // the user loads via MATPOWER or builds networks from Python
+        // (including the PyPSA netCDF bridge).
+        br.branch_type = if (tap - 1.0).abs() > 1e-6 || shift_deg.abs() > 1e-6 {
+            surge_network::network::BranchType::Transformer
+        } else {
+            surge_network::network::BranchType::Line
+        };
         if skin_effect_alpha != 0.0 {
             br.harmonic
                 .get_or_insert_with(HarmonicData::default)

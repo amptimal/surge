@@ -4,7 +4,7 @@ from __future__ import annotations
 from enum import Enum
 
 from .. import Network
-from . import bin, cgmes, dss, epc, export, geo, ieee_cdf, json, matpower, profiles, psse, ucte, xiidm
+from . import bin, cgmes, dss, epc, export, geo, ieee_cdf, json, matpower, profiles, psse, pypsa_nc, ucte, xiidm
 
 
 class Format(str, Enum):

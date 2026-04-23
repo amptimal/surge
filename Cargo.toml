@@ -66,7 +66,7 @@ debug = 1
 incremental = true
 
 [workspace.package]
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.87"
 license = "PolyForm-Noncommercial-1.0.0"
@@ -124,21 +124,21 @@ libloading = "0.8"
 clarabel = "0.11"
 
 # Workspace member cross-refs
-surge-network = { path = "src/surge-network", version = "0.1.4" }
-surge-solution = { path = "src/surge-solution", version = "0.1.4" }
-surge-sparse = { path = "src/surge-sparse", version = "0.1.4" }
-surge-io = { path = "src/surge-io", version = "0.1.4" }
-surge-topology = { path = "src/surge-topology", version = "0.1.4" }
-surge-dc = { path = "src/surge-dc", version = "0.1.4" }
-surge-ac = { path = "src/surge-ac", version = "0.1.4" }
-surge-hvdc = { path = "src/surge-hvdc", version = "0.1.4" }
-surge-contingency = { path = "src/surge-contingency", version = "0.1.4" }
-surge-dispatch = { path = "src/surge-dispatch", version = "0.1.4" }
-surge-market = { path = "src/surge-market", version = "0.1.4" }
-surge-opf = { path = "src/surge-opf", version = "0.1.4" }
-surge-transfer = { path = "src/surge-transfer", version = "0.1.4" }
-surge-bindings = { path = "src/surge-bindings", version = "0.1.4" }
-surge-py = { path = "src/surge-py", version = "0.1.4" }
+surge-network = { path = "src/surge-network", version = "0.1.5" }
+surge-solution = { path = "src/surge-solution", version = "0.1.5" }
+surge-sparse = { path = "src/surge-sparse", version = "0.1.5" }
+surge-io = { path = "src/surge-io", version = "0.1.5" }
+surge-topology = { path = "src/surge-topology", version = "0.1.5" }
+surge-dc = { path = "src/surge-dc", version = "0.1.5" }
+surge-ac = { path = "src/surge-ac", version = "0.1.5" }
+surge-hvdc = { path = "src/surge-hvdc", version = "0.1.5" }
+surge-contingency = { path = "src/surge-contingency", version = "0.1.5" }
+surge-dispatch = { path = "src/surge-dispatch", version = "0.1.5" }
+surge-market = { path = "src/surge-market", version = "0.1.5" }
+surge-opf = { path = "src/surge-opf", version = "0.1.5" }
+surge-transfer = { path = "src/surge-transfer", version = "0.1.5" }
+surge-bindings = { path = "src/surge-bindings", version = "0.1.5" }
+surge-py = { path = "src/surge-py", version = "0.1.5" }
 
 [profile.bench]
 inherits = "release"

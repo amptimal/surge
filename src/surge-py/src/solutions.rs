@@ -211,6 +211,7 @@ impl AcPfResult {
     }
 
     /// Branch apparent power flows (MVA) as numpy array.
+    #[getter]
     fn branch_apparent_power<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
         self.inner.branch_apparent_power().into_pyarray(py)
     }
@@ -250,6 +251,7 @@ impl AcPfResult {
     }
 
     /// Branch loading percentage as numpy array.
+    #[getter]
     fn branch_loading_pct<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
         let net = self.attached_net()?;
         let loading = self
@@ -651,6 +653,30 @@ impl DcPfResult {
     #[getter]
     fn branches(&self) -> Vec<rich_objects::BranchDcSolved> {
         rich_objects::branches_dc_solved(&self.branch_p_mw, &self.net)
+    }
+
+    /// Return the DC power flow solution as a JSON-serializable dictionary.
+    ///
+    /// Keys: ``solve_time_secs``, ``slack_p_mw``, ``total_generation_mw``,
+    /// ``va_rad``, ``va_deg``, ``branch_p_mw``, ``bus_p_inject_mw``,
+    /// ``bus_numbers``, ``branch_from``, ``branch_to``, ``branch_circuit``,
+    /// ``slack_distribution_mw``.
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("solve_time_secs", self.solve_time_secs)?;
+        d.set_item("slack_p_mw", self.slack_p_mw)?;
+        d.set_item("total_generation_mw", self.total_generation_mw)?;
+        d.set_item("va_rad", self.va_rad.clone())?;
+        let va_deg: Vec<f64> = self.va_rad.iter().map(|&a| a.to_degrees()).collect();
+        d.set_item("va_deg", va_deg)?;
+        d.set_item("branch_p_mw", self.branch_p_mw.clone())?;
+        d.set_item("bus_p_inject_mw", self.bus_p_inject_mw.clone())?;
+        d.set_item("bus_numbers", self.bus_numbers.clone())?;
+        d.set_item("branch_from", self.branch_from.clone())?;
+        d.set_item("branch_to", self.branch_to.clone())?;
+        d.set_item("branch_circuit", self.branch_circuit.clone())?;
+        d.set_item("slack_distribution_mw", self.slack_distribution_mw.clone())?;
+        Ok(d)
     }
 
     fn __repr__(&self) -> String {
@@ -1680,6 +1706,25 @@ impl From<surge_opf::BindingContingency> for BindingContingency {
 
 #[pymethods]
 impl BindingContingency {
+    /// Return this binding contingency as a JSON-serializable dictionary.
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("contingency_label", self.contingency_label.clone())?;
+        d.set_item("cut_kind", self.cut_kind.clone())?;
+        d.set_item(
+            "outaged_branch_indices",
+            self.outaged_branch_indices.clone(),
+        )?;
+        d.set_item(
+            "outaged_generator_indices",
+            self.outaged_generator_indices.clone(),
+        )?;
+        d.set_item("monitored_branch_idx", self.monitored_branch_idx)?;
+        d.set_item("loading_pct", self.loading_pct)?;
+        d.set_item("shadow_price", self.shadow_price)?;
+        Ok(d)
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "BindingContingency(label={:?}, kind={}, monitored_branch_idx={}, loading_pct={:.2}, shadow_price={:.4})",
@@ -1724,6 +1769,47 @@ impl From<surge_opf::ContingencyViolation> for ContingencyViolation {
 
 #[pymethods]
 impl ContingencyViolation {
+    /// Return this contingency violation as a JSON-serializable dictionary.
+    ///
+    /// ``thermal_violations`` is a list of dicts with keys
+    /// ``branch_idx``, ``loading_pct``, ``flow_mva``, ``limit_mva``.
+    /// ``voltage_violations`` is a list of dicts with keys
+    /// ``bus_idx``, ``vm_pu``, ``vm_min``, ``vm_max``.
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("contingency_id", self.contingency_id.clone())?;
+        d.set_item("contingency_label", self.contingency_label.clone())?;
+        d.set_item("outaged_branches", self.outaged_branches.clone())?;
+        d.set_item("outaged_generators", self.outaged_generators.clone())?;
+        let thermal: Vec<Bound<'py, PyDict>> = self
+            .thermal_violations
+            .iter()
+            .map(|(branch_idx, loading_pct, flow_mva, limit_mva)| {
+                let e = PyDict::new(py);
+                e.set_item("branch_idx", branch_idx)?;
+                e.set_item("loading_pct", loading_pct)?;
+                e.set_item("flow_mva", flow_mva)?;
+                e.set_item("limit_mva", limit_mva)?;
+                Ok::<_, PyErr>(e)
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        d.set_item("thermal_violations", thermal)?;
+        let voltage: Vec<Bound<'py, PyDict>> = self
+            .voltage_violations
+            .iter()
+            .map(|(bus_idx, vm_pu, vm_min, vm_max)| {
+                let e = PyDict::new(py);
+                e.set_item("bus_idx", bus_idx)?;
+                e.set_item("vm_pu", vm_pu)?;
+                e.set_item("vm_min", vm_min)?;
+                e.set_item("vm_max", vm_max)?;
+                Ok::<_, PyErr>(e)
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        d.set_item("voltage_violations", voltage)?;
+        Ok(d)
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "ContingencyViolation(id={:?}, thermal_violations={}, voltage_violations={})",
@@ -1763,6 +1849,17 @@ impl From<surge_opf::security::FailedContingencyEvaluation> for FailedContingenc
 
 #[pymethods]
 impl FailedContingencyEvaluation {
+    /// Return this failed contingency evaluation as a JSON-serializable dictionary.
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("contingency_id", self.contingency_id.clone())?;
+        d.set_item("contingency_label", self.contingency_label.clone())?;
+        d.set_item("outaged_branches", self.outaged_branches.clone())?;
+        d.set_item("outaged_generators", self.outaged_generators.clone())?;
+        d.set_item("reason", self.reason.clone())?;
+        Ok(d)
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "FailedContingencyEvaluation(id={:?}, reason={:?})",
@@ -1797,6 +1894,16 @@ impl From<surge_opf::ScopfScreeningStats> for ScopfScreeningStats {
 
 #[pymethods]
 impl ScopfScreeningStats {
+    /// Return these screening stats as a JSON-serializable dictionary.
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("pairs_evaluated", self.pairs_evaluated)?;
+        d.set_item("pre_screened_constraints", self.pre_screened_constraints)?;
+        d.set_item("cutting_plane_constraints", self.cutting_plane_constraints)?;
+        d.set_item("threshold_fraction", self.threshold_fraction)?;
+        Ok(d)
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "ScopfScreeningStats(pairs_evaluated={}, pre_screened_constraints={}, cutting_plane_constraints={}, threshold_fraction={:.3})",
@@ -1843,6 +1950,20 @@ impl DcOpfResult {
     #[getter]
     fn is_feasible(&self) -> bool {
         self.is_feasible
+    }
+
+    /// Return the DC-OPF result as a JSON-serializable dictionary.
+    ///
+    /// Extends the underlying ``OpfResult.to_dict()`` payload with
+    /// ``hvdc_dispatch_mw``, ``hvdc_shadow_prices``, ``gen_limit_violations``,
+    /// and ``is_feasible``.
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = self.opf.to_dict(py)?;
+        d.set_item("hvdc_dispatch_mw", self.hvdc_dispatch_mw.clone())?;
+        d.set_item("hvdc_shadow_prices", self.hvdc_shadow_prices.clone())?;
+        d.set_item("gen_limit_violations", self.gen_limit_violations.clone())?;
+        d.set_item("is_feasible", self.is_feasible)?;
+        Ok(d)
     }
 
     fn __repr__(&self) -> String {
@@ -1941,6 +2062,57 @@ impl ScopfResult {
         self.solve_time_secs
     }
 
+    /// Return the SCOPF result as a JSON-serializable dictionary.
+    ///
+    /// Extends the underlying ``OpfResult.to_dict()`` payload (keyed under
+    /// ``base_opf``) with SCOPF metadata (``formulation``, ``mode``,
+    /// ``converged``, ``iterations``, ``solve_time_secs``), contingency
+    /// counts, and serialized lists of ``binding_contingencies``,
+    /// ``remaining_violations``, ``failed_contingencies`` (each via its own
+    /// ``to_dict()``), plus ``screening_stats`` and
+    /// ``lmp_contingency_congestion``.
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("base_opf", self.base_opf.to_dict(py)?)?;
+        d.set_item("formulation", self.formulation.clone())?;
+        d.set_item("mode", self.mode.clone())?;
+        d.set_item("iterations", self.iterations)?;
+        d.set_item("converged", self.converged)?;
+        d.set_item("solve_time_secs", self.solve_time_secs)?;
+        d.set_item(
+            "total_contingencies_evaluated",
+            self.total_contingencies_evaluated,
+        )?;
+        d.set_item(
+            "total_contingency_constraints",
+            self.total_contingency_constraints,
+        )?;
+        let binding: Vec<Bound<'py, PyDict>> = self
+            .binding_contingencies
+            .iter()
+            .map(|c| c.to_dict(py))
+            .collect::<PyResult<Vec<_>>>()?;
+        d.set_item("binding_contingencies", binding)?;
+        let remaining: Vec<Bound<'py, PyDict>> = self
+            .remaining_violations
+            .iter()
+            .map(|v| v.to_dict(py))
+            .collect::<PyResult<Vec<_>>>()?;
+        d.set_item("remaining_violations", remaining)?;
+        let failed: Vec<Bound<'py, PyDict>> = self
+            .failed_contingencies
+            .iter()
+            .map(|f| f.to_dict(py))
+            .collect::<PyResult<Vec<_>>>()?;
+        d.set_item("failed_contingencies", failed)?;
+        d.set_item("screening_stats", self.screening_stats.to_dict(py)?)?;
+        d.set_item(
+            "lmp_contingency_congestion",
+            self.lmp_contingency_congestion.clone(),
+        )?;
+        Ok(d)
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "ScopfResult(formulation={:?}, mode={:?}, converged={}, iterations={}, constraints={}, failed={})",
@@ -1983,6 +2155,18 @@ impl AcOpfHvdcResult {
     #[getter]
     fn hvdc_iterations(&self) -> u32 {
         self.hvdc_iterations
+    }
+
+    /// Return the AC-OPF result as a JSON-serializable dictionary.
+    ///
+    /// Extends the underlying ``OpfResult.to_dict()`` payload with
+    /// ``hvdc_p_dc_mw``, ``hvdc_p_loss_mw``, and ``hvdc_iterations``.
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = self.opf.to_dict(py)?;
+        d.set_item("hvdc_p_dc_mw", self.hvdc_p_dc_mw.clone())?;
+        d.set_item("hvdc_p_loss_mw", self.hvdc_p_loss_mw.clone())?;
+        d.set_item("hvdc_iterations", self.hvdc_iterations)?;
+        Ok(d)
     }
 
     fn __repr__(&self) -> String {
@@ -2748,6 +2932,212 @@ impl ContingencyAnalysis {
             .find(|r| r.id == contingency_id)
             .and_then(|r| r.post_branch_flows.as_ref())
             .map(|v| v.clone().into_pyarray(py))
+    }
+
+    /// Return the contingency analysis as a JSON-serializable dictionary.
+    ///
+    /// Keys:
+    ///   * Summary counts: ``n_contingencies``, ``n_screened_out``,
+    ///     ``n_ac_solved``, ``n_converged``, ``n_with_violations``,
+    ///     ``n_violations``, ``n_voltage_critical``, ``solve_time_secs``.
+    ///   * ``results``: list of per-contingency summary dicts
+    ///     (contingency_id, label, converged, n_violations,
+    ///     max_loading_pct, min_vm_pu, n_islands, vsm_category, max_l_index).
+    ///   * ``violations``: flat list of per-violation dicts
+    ///     (contingency_id, violation_type, from_bus, to_bus, bus_number,
+    ///     loading_pct, flow_mw, flow_mva, limit_mva, vm_pu, vm_limit_pu).
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        use surge_contingency::Violation;
+        let d = PyDict::new(py);
+        let s = &self.inner.summary;
+        d.set_item("n_contingencies", s.total_contingencies)?;
+        d.set_item("n_screened_out", s.screened_out)?;
+        d.set_item("n_ac_solved", s.ac_solved)?;
+        d.set_item("n_converged", s.converged)?;
+        d.set_item("n_with_violations", s.with_violations)?;
+        d.set_item(
+            "n_violations",
+            self.inner
+                .results
+                .iter()
+                .map(|r| r.violations.len())
+                .sum::<usize>(),
+        )?;
+        d.set_item("n_voltage_critical", s.n_voltage_critical)?;
+        d.set_item("solve_time_secs", s.solve_time_secs)?;
+
+        let mut results: Vec<Bound<'py, PyDict>> = Vec::with_capacity(self.inner.results.len());
+        for r in &self.inner.results {
+            let rd = PyDict::new(py);
+            rd.set_item("contingency_id", r.id.clone())?;
+            rd.set_item("label", r.label.clone())?;
+            rd.set_item("converged", r.converged)?;
+            rd.set_item("n_violations", r.violations.len())?;
+            let max_loading = r
+                .violations
+                .iter()
+                .filter_map(|v| {
+                    if let Violation::ThermalOverload { loading_pct, .. } = v {
+                        Some(*loading_pct)
+                    } else {
+                        None
+                    }
+                })
+                .fold(0.0_f64, f64::max);
+            rd.set_item("max_loading_pct", max_loading)?;
+            let min_vm = r
+                .violations
+                .iter()
+                .filter_map(|v| match v {
+                    Violation::VoltageLow { vm, .. } => Some(*vm),
+                    Violation::VoltageHigh { vm, .. } => Some(*vm),
+                    _ => None,
+                })
+                .fold(f64::INFINITY, f64::min);
+            rd.set_item(
+                "min_vm_pu",
+                if min_vm.is_finite() { min_vm } else { f64::NAN },
+            )?;
+            rd.set_item("n_islands", r.n_islands)?;
+            let category = r
+                .voltage_stress
+                .as_ref()
+                .and_then(|vs| vs.category)
+                .map(|c| match c {
+                    surge_contingency::VsmCategory::Secure => "secure",
+                    surge_contingency::VsmCategory::Marginal => "marginal",
+                    surge_contingency::VsmCategory::Critical => "critical",
+                    surge_contingency::VsmCategory::Unstable => "unstable",
+                });
+            rd.set_item("vsm_category", category)?;
+            let max_l = r.voltage_stress.as_ref().and_then(|vs| vs.max_l_index);
+            rd.set_item("max_l_index", max_l)?;
+            results.push(rd);
+        }
+        d.set_item("results", results)?;
+
+        let mut violations: Vec<Bound<'py, PyDict>> = Vec::new();
+        for r in &self.inner.results {
+            for v in &r.violations {
+                let vd = PyDict::new(py);
+                vd.set_item("contingency_id", r.id.clone())?;
+                match v {
+                    Violation::ThermalOverload {
+                        from_bus,
+                        to_bus,
+                        loading_pct,
+                        flow_mw,
+                        flow_mva,
+                        limit_mva,
+                        ..
+                    } => {
+                        vd.set_item("violation_type", "ThermalOverload")?;
+                        vd.set_item("from_bus", *from_bus)?;
+                        vd.set_item("to_bus", *to_bus)?;
+                        vd.set_item("bus_number", py.None())?;
+                        vd.set_item("loading_pct", *loading_pct)?;
+                        vd.set_item("flow_mw", *flow_mw)?;
+                        vd.set_item("flow_mva", *flow_mva)?;
+                        vd.set_item("limit_mva", *limit_mva)?;
+                        vd.set_item("vm_pu", py.None())?;
+                        vd.set_item("vm_limit_pu", py.None())?;
+                    }
+                    Violation::VoltageLow {
+                        bus_number,
+                        vm,
+                        limit,
+                    } => {
+                        vd.set_item("violation_type", "VoltageLow")?;
+                        vd.set_item("from_bus", py.None())?;
+                        vd.set_item("to_bus", py.None())?;
+                        vd.set_item("bus_number", *bus_number)?;
+                        vd.set_item("loading_pct", py.None())?;
+                        vd.set_item("flow_mw", py.None())?;
+                        vd.set_item("flow_mva", py.None())?;
+                        vd.set_item("limit_mva", py.None())?;
+                        vd.set_item("vm_pu", *vm)?;
+                        vd.set_item("vm_limit_pu", *limit)?;
+                    }
+                    Violation::VoltageHigh {
+                        bus_number,
+                        vm,
+                        limit,
+                    } => {
+                        vd.set_item("violation_type", "VoltageHigh")?;
+                        vd.set_item("from_bus", py.None())?;
+                        vd.set_item("to_bus", py.None())?;
+                        vd.set_item("bus_number", *bus_number)?;
+                        vd.set_item("loading_pct", py.None())?;
+                        vd.set_item("flow_mw", py.None())?;
+                        vd.set_item("flow_mva", py.None())?;
+                        vd.set_item("limit_mva", py.None())?;
+                        vd.set_item("vm_pu", *vm)?;
+                        vd.set_item("vm_limit_pu", *limit)?;
+                    }
+                    Violation::NonConvergent { max_mismatch, .. } => {
+                        vd.set_item("violation_type", "NonConvergent")?;
+                        vd.set_item("from_bus", py.None())?;
+                        vd.set_item("to_bus", py.None())?;
+                        vd.set_item("bus_number", py.None())?;
+                        vd.set_item("loading_pct", *max_mismatch)?;
+                        vd.set_item("flow_mw", py.None())?;
+                        vd.set_item("flow_mva", py.None())?;
+                        vd.set_item("limit_mva", py.None())?;
+                        vd.set_item("vm_pu", py.None())?;
+                        vd.set_item("vm_limit_pu", py.None())?;
+                    }
+                    Violation::Islanding { n_components } => {
+                        vd.set_item("violation_type", "Islanding")?;
+                        vd.set_item("from_bus", py.None())?;
+                        vd.set_item("to_bus", py.None())?;
+                        vd.set_item("bus_number", py.None())?;
+                        vd.set_item("loading_pct", *n_components as f64)?;
+                        vd.set_item("flow_mw", py.None())?;
+                        vd.set_item("flow_mva", py.None())?;
+                        vd.set_item("limit_mva", py.None())?;
+                        vd.set_item("vm_pu", py.None())?;
+                        vd.set_item("vm_limit_pu", py.None())?;
+                    }
+                    Violation::FlowgateOverload {
+                        name,
+                        flow_mw,
+                        limit_mw,
+                        loading_pct,
+                    } => {
+                        vd.set_item("violation_type", format!("FlowgateOverload:{name}"))?;
+                        vd.set_item("from_bus", py.None())?;
+                        vd.set_item("to_bus", py.None())?;
+                        vd.set_item("bus_number", py.None())?;
+                        vd.set_item("loading_pct", *loading_pct)?;
+                        vd.set_item("flow_mw", *flow_mw)?;
+                        vd.set_item("flow_mva", *flow_mw)?;
+                        vd.set_item("limit_mva", *limit_mw)?;
+                        vd.set_item("vm_pu", py.None())?;
+                        vd.set_item("vm_limit_pu", py.None())?;
+                    }
+                    Violation::InterfaceOverload {
+                        name,
+                        flow_mw,
+                        limit_mw,
+                        loading_pct,
+                    } => {
+                        vd.set_item("violation_type", format!("InterfaceOverload:{name}"))?;
+                        vd.set_item("from_bus", py.None())?;
+                        vd.set_item("to_bus", py.None())?;
+                        vd.set_item("bus_number", py.None())?;
+                        vd.set_item("loading_pct", *loading_pct)?;
+                        vd.set_item("flow_mw", *flow_mw)?;
+                        vd.set_item("flow_mva", *flow_mw)?;
+                        vd.set_item("limit_mva", *limit_mw)?;
+                        vd.set_item("vm_pu", py.None())?;
+                        vd.set_item("vm_limit_pu", py.None())?;
+                    }
+                }
+                violations.push(vd);
+            }
+        }
+        d.set_item("violations", violations)?;
+        Ok(d)
     }
 
     fn __repr__(&self) -> String {

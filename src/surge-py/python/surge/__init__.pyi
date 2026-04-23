@@ -137,10 +137,28 @@ from . import transfer as transfer
 from . import units as units
 
 
-def load(path: str | PathLike[str]) -> Network: ...
+def load(
+    path: str | PathLike[str],
+    format: str | None = None,
+) -> Network: ...
+
+
+def load_network(
+    path: str | PathLike[str],
+    format: str | None = None,
+) -> Network: ...
 
 
 def save(network: Network, path: str | PathLike[str]) -> None: ...
+
+
+def list_builtin_cases() -> list[str]: ...
+
+
+def load_builtin_case(name: str) -> Network: ...
+
+
+def builtin_case_rated_flags() -> list[tuple[str, bool]]: ...
 
 
 def solve_dc_pf(

@@ -276,6 +276,12 @@ fn _surge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(test_networks::case57, m)?)?;
     m.add_function(wrap_pyfunction!(test_networks::case118, m)?)?;
     m.add_function(wrap_pyfunction!(test_networks::case300, m)?)?;
+    m.add_function(wrap_pyfunction!(test_networks::list_builtin_cases, m)?)?;
+    m.add_function(wrap_pyfunction!(test_networks::load_builtin_case, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        test_networks::builtin_case_rated_flags,
+        m
+    )?)?;
 
     Ok(())
 }

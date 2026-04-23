@@ -29,6 +29,8 @@
 //! which calls `apply_bus_loss_factors` before the initial MIP and
 //! threads the same `dloss_dp` into `iterate_loss_factors`.
 
+#![allow(clippy::needless_range_loop)]
+
 use std::collections::HashMap;
 
 use surge_network::Network;
