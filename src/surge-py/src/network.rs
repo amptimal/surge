@@ -791,6 +791,174 @@ impl Network {
         dict_to_dataframe_with_index(py, dict, &["bus_id", "machine_id"])
     }
 
+    /// Return a pandas DataFrame of loads (or dict if pandas is not installed).
+    ///
+    /// Index: MultiIndex (bus_id, load_id).
+    /// Columns: pd_mw, qd_mvar, in_service, conforming.
+    fn loads_dataframe<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let dict = PyDict::new(py);
+        let n = self.inner.loads.len();
+        let mut bus_id = Vec::with_capacity(n);
+        let mut load_id = Vec::with_capacity(n);
+        let mut pd_mw = Vec::with_capacity(n);
+        let mut qd_mvar = Vec::with_capacity(n);
+        let mut in_service = Vec::with_capacity(n);
+        let mut conforming = Vec::with_capacity(n);
+        for ld in &self.inner.loads {
+            bus_id.push(ld.bus);
+            load_id.push(ld.id.clone());
+            pd_mw.push(ld.active_power_demand_mw);
+            qd_mvar.push(ld.reactive_power_demand_mvar);
+            in_service.push(ld.in_service);
+            conforming.push(ld.conforming);
+        }
+        dict.set_item("bus_id", bus_id)?;
+        dict.set_item("load_id", load_id)?;
+        dict.set_item("pd_mw", pd_mw)?;
+        dict.set_item("qd_mvar", qd_mvar)?;
+        dict.set_item("in_service", in_service)?;
+        dict.set_item("conforming", conforming)?;
+        dict_to_dataframe_with_index(py, dict, &["bus_id", "load_id"])
+    }
+
+    /// Return a pandas DataFrame of fixed shunts (or dict if pandas is not installed).
+    ///
+    /// Index: MultiIndex (bus_id, shunt_id).
+    /// Columns: shunt_type, g_mw, b_mvar, in_service, rated_kv, rated_mvar.
+    fn shunts_dataframe<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let dict = PyDict::new(py);
+        let n = self.inner.fixed_shunts.len();
+        let mut bus_id = Vec::with_capacity(n);
+        let mut shunt_id = Vec::with_capacity(n);
+        let mut shunt_type = Vec::with_capacity(n);
+        let mut g_mw = Vec::with_capacity(n);
+        let mut b_mvar = Vec::with_capacity(n);
+        let mut in_service = Vec::with_capacity(n);
+        let mut rated_kv: Vec<Option<f64>> = Vec::with_capacity(n);
+        let mut rated_mvar: Vec<Option<f64>> = Vec::with_capacity(n);
+        for sh in &self.inner.fixed_shunts {
+            bus_id.push(sh.bus);
+            shunt_id.push(sh.id.clone());
+            shunt_type.push(format!("{:?}", sh.shunt_type));
+            g_mw.push(sh.g_mw);
+            b_mvar.push(sh.b_mvar);
+            in_service.push(sh.in_service);
+            rated_kv.push(sh.rated_kv);
+            rated_mvar.push(sh.rated_mvar);
+        }
+        dict.set_item("bus_id", bus_id)?;
+        dict.set_item("shunt_id", shunt_id)?;
+        dict.set_item("shunt_type", shunt_type)?;
+        dict.set_item("g_mw", g_mw)?;
+        dict.set_item("b_mvar", b_mvar)?;
+        dict.set_item("in_service", in_service)?;
+        dict.set_item("rated_kv", rated_kv)?;
+        dict.set_item("rated_mvar", rated_mvar)?;
+        dict_to_dataframe_with_index(py, dict, &["bus_id", "shunt_id"])
+    }
+
+    /// Return a comprehensive network summary as a JSON-serializable dict.
+    ///
+    /// Keys:
+    ///   * Counts: ``n_buses``, ``n_branches``, ``n_branches_in_service``,
+    ///     ``n_generators``, ``n_generators_in_service``, ``n_loads``,
+    ///     ``n_loads_in_service``, ``n_fixed_shunts``, ``n_hvdc_links``,
+    ///     ``n_areas``, ``n_zones``.
+    ///   * Totals: ``total_generation_mw``, ``total_generation_capacity_mw``,
+    ///     ``total_load_mw``, ``total_load_mvar``, ``base_mva``, ``freq_hz``.
+    ///   * Voltage levels: ``voltage_levels_kv`` — sorted unique base-kV values.
+    ///   * Areas / zones: ``areas`` and ``zones`` — sorted unique IDs.
+    ///   * ``name``: network name.
+    fn summary<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        d.set_item("name", self.inner.name.clone())?;
+        d.set_item("base_mva", self.inner.base_mva)?;
+        d.set_item("freq_hz", self.inner.freq_hz)?;
+
+        d.set_item("n_buses", self.inner.buses.len())?;
+        d.set_item("n_branches", self.inner.branches.len())?;
+        d.set_item(
+            "n_branches_in_service",
+            self.inner.branches.iter().filter(|b| b.in_service).count(),
+        )?;
+        d.set_item("n_generators", self.inner.generators.len())?;
+        d.set_item(
+            "n_generators_in_service",
+            self.inner
+                .generators
+                .iter()
+                .filter(|g| g.in_service)
+                .count(),
+        )?;
+        d.set_item("n_loads", self.inner.loads.len())?;
+        d.set_item(
+            "n_loads_in_service",
+            self.inner.loads.iter().filter(|l| l.in_service).count(),
+        )?;
+        d.set_item("n_fixed_shunts", self.inner.fixed_shunts.len())?;
+        d.set_item("n_hvdc_links", self.inner.hvdc.links.len())?;
+        d.set_item(
+            "n_hvdc_dc_grids",
+            self.inner
+                .hvdc
+                .dc_grids
+                .iter()
+                .filter(|g| !g.is_empty())
+                .count(),
+        )?;
+
+        let total_gen_mw: f64 = self
+            .inner
+            .generators
+            .iter()
+            .filter(|g| g.in_service)
+            .map(|g| g.p)
+            .sum();
+        let total_gen_capacity_mw: f64 = self
+            .inner
+            .generators
+            .iter()
+            .filter(|g| g.in_service)
+            .map(|g| g.pmax)
+            .sum();
+        let total_load_mw: f64 = self
+            .inner
+            .loads
+            .iter()
+            .filter(|l| l.in_service)
+            .map(|l| l.active_power_demand_mw)
+            .sum();
+        let total_load_mvar: f64 = self
+            .inner
+            .loads
+            .iter()
+            .filter(|l| l.in_service)
+            .map(|l| l.reactive_power_demand_mvar)
+            .sum();
+        d.set_item("total_generation_mw", total_gen_mw)?;
+        d.set_item("total_generation_capacity_mw", total_gen_capacity_mw)?;
+        d.set_item("total_load_mw", total_load_mw)?;
+        d.set_item("total_load_mvar", total_load_mvar)?;
+
+        let mut areas: Vec<u32> = self.inner.buses.iter().map(|b| b.area).collect();
+        areas.sort_unstable();
+        areas.dedup();
+        let mut zones: Vec<u32> = self.inner.buses.iter().map(|b| b.zone).collect();
+        zones.sort_unstable();
+        zones.dedup();
+        d.set_item("n_areas", areas.len())?;
+        d.set_item("n_zones", zones.len())?;
+        d.set_item("areas", areas)?;
+        d.set_item("zones", zones)?;
+
+        let mut kvs: Vec<f64> = self.inner.buses.iter().map(|b| b.base_kv).collect();
+        kvs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        kvs.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+        d.set_item("voltage_levels_kv", kvs)?;
+
+        Ok(d)
+    }
+
     /// Detect electrically connected islands in the network.
     ///
     /// Returns the connected components of the in-service branch graph.

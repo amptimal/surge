@@ -47,6 +47,7 @@ _NATIVE_PUBLIC_EXPORTS = (
     "analyze_n1_branch", "analyze_n2_branch", "analyze_n1_generator",
     "analyze_contingencies", "solve_hvdc",
     "case9", "case14", "case30", "market30", "case57", "case118", "case300",
+    "list_builtin_cases", "load_builtin_case", "builtin_case_rated_flags",
 )
 
 # All native exports the package depends on.  The source-tree bootstrap
@@ -252,6 +253,7 @@ _native = _import_native()
 _bind_native_public(_native)
 _native_load = _native.load
 _native_save = _native.save
+_native_load_as = _native._load_as
 from ._study_inputs import HvdcOpfLink, ParSetpoint, VirtualBid  # noqa: F401
 from .opf import (  # noqa: F401
     AcAngleWarmStartMode,
@@ -285,16 +287,40 @@ from .dispatch_request import DispatchRequest  # noqa: F401
 from .powerflow import AcPfOptions, DcPfOptions, solve_ac_pf, solve_dc_pf  # noqa: F401
 
 
-def load(path):
-    """Load a network from a filesystem path."""
+def load(path, format=None):
+    """Load a network from a filesystem path.
 
-    return _native_load(os.fspath(path))
+    Args:
+        path: Filesystem path.
+        format: Optional format override. When ``None`` (default) the format
+            is inferred from the file extension. Explicit values match the
+            :class:`surge.io.Format` enum: ``"matpower"``, ``"psse"``,
+            ``"rawx"``, ``"xiidm"``, ``"ucte"``, ``"surge-json"``,
+            ``"surge-bin"``, ``"dss"``, ``"epc"``. Pass an explicit format
+            when the extension is ambiguous or missing.
+
+    Returns:
+        Network parsed from the file.
+    """
+
+    if format is None:
+        return _native_load(os.fspath(path))
+    return _native_load_as(os.fspath(path), str(format))
 
 
 def save(network, path):
     """Save a network using extension-based format detection."""
 
     return _native_save(network, os.fspath(path))
+
+
+def load_network(path, format=None):
+    """Alias for :func:`surge.load` — explicit-name convenience for MCP hosts.
+
+    See :func:`surge.load` for the full parameter contract.
+    """
+
+    return load(path, format=format)
 
 
 _PYTHON_PUBLIC_EXPORTS = (
@@ -324,6 +350,7 @@ _PYTHON_PUBLIC_EXPORTS = (
     "ParSetpoint",
     "VirtualBid",
     "load",
+    "load_network",
     "save",
     "solve_ac_pf",
     "solve_dc_pf",

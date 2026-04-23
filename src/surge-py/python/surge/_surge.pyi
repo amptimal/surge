@@ -2219,6 +2219,30 @@ class Network:
         qmax_mvar, qmin_mvar, vs_pu, in_service, fuel_type.
         """
         ...
+    def loads_dataframe(self) -> pd.DataFrame:
+        """Return a pandas DataFrame of load data (or dict if pandas is not installed).
+
+        Index: MultiIndex ``(bus_id, load_id)``.
+        Columns: pd_mw, qd_mvar, in_service, conforming.
+        """
+        ...
+    def shunts_dataframe(self) -> pd.DataFrame:
+        """Return a pandas DataFrame of fixed shunt data (or dict if pandas is not installed).
+
+        Index: MultiIndex ``(bus_id, shunt_id)``.
+        Columns: shunt_type, g_mw, b_mvar, in_service, rated_kv, rated_mvar.
+        """
+        ...
+    def summary(self) -> dict[str, Any]:
+        """Return a comprehensive network summary as a JSON-serializable dict.
+
+        Keys include counts (n_buses, n_branches, n_generators, n_loads,
+        n_fixed_shunts, n_hvdc_links, n_areas, n_zones), totals
+        (total_generation_mw, total_generation_capacity_mw, total_load_mw,
+        total_load_mvar, base_mva, freq_hz), and sorted lists of areas,
+        zones, and unique voltage_levels_kv.
+        """
+        ...
     def buses(
         self,
         area: Optional[list[int]] = None,
@@ -3367,6 +3391,9 @@ class DcPfResult:
     def branches(self) -> list[BranchDcSolved]:
         """Return a list of ``BranchDcSolved`` objects with DC power flow results."""
         ...
+    def to_dict(self) -> dict[str, Any]:
+        """Return the DC power flow solution as a JSON-serializable dictionary."""
+        ...
     def __repr__(self) -> str: ...
 
 
@@ -3490,9 +3517,11 @@ class AcPfResult:
           ``actual_mw``, ``error_mw``, ``dispatch_method``.
         """
         ...
+    @property
     def branch_apparent_power(self) -> NDArray[np.float64]:
         """Branch apparent power flows (MVA) as a 1-D numpy array."""
         ...
+    @property
     def branch_loading_pct(self) -> NDArray[np.float64]:
         """Branch loading percentage (% of rating) as a 1-D numpy array."""
         ...
@@ -4076,6 +4105,7 @@ class BindingContingency:
     monitored_branch_idx: int
     loading_pct: float
     shadow_price: float
+    def to_dict(self) -> dict[str, Any]: ...
 
 
 class ContingencyViolation:
@@ -4085,6 +4115,7 @@ class ContingencyViolation:
     outaged_generators: list[int]
     thermal_violations: list[tuple[int, float, float, float]]
     voltage_violations: list[tuple[int, float, float, float]]
+    def to_dict(self) -> dict[str, Any]: ...
 
 
 class ScopfScreeningStats:
@@ -4092,6 +4123,7 @@ class ScopfScreeningStats:
     pre_screened_constraints: int
     cutting_plane_constraints: int
     threshold_fraction: float
+    def to_dict(self) -> dict[str, Any]: ...
 
 
 class FailedContingencyEvaluation:
@@ -4100,6 +4132,7 @@ class FailedContingencyEvaluation:
     outaged_branches: list[int]
     outaged_generators: list[int]
     reason: str
+    def to_dict(self) -> dict[str, Any]: ...
 
 
 class DcOpfResult:
@@ -4113,6 +4146,7 @@ class DcOpfResult:
     def gen_limit_violations(self) -> list[tuple[int, float]]: ...
     @property
     def is_feasible(self) -> bool: ...
+    def to_dict(self) -> dict[str, Any]: ...
 
 
 class ScopfResult:
@@ -4142,6 +4176,7 @@ class ScopfResult:
     def screening_stats(self) -> ScopfScreeningStats: ...
     @property
     def solve_time_secs(self) -> float: ...
+    def to_dict(self) -> dict[str, Any]: ...
 
 
 class AcOpfHvdcResult:
@@ -4153,6 +4188,7 @@ class AcOpfHvdcResult:
     def hvdc_p_loss_mw(self) -> NDArray[np.float64]: ...
     @property
     def hvdc_iterations(self) -> int: ...
+    def to_dict(self) -> dict[str, Any]: ...
 
 
 class OtsResult:
@@ -4543,6 +4579,13 @@ class ContingencyAnalysis:
     ) -> NDArray[np.float64] | None:
         """Post-contingency branch apparent power flows (MVA) for a given contingency."""
         ...
+    def to_dict(self) -> dict[str, Any]:
+        """Return the contingency analysis as a JSON-serializable dictionary.
+
+        Includes summary counts, per-contingency ``results`` list, and a flat
+        ``violations`` list with one dict per violation.
+        """
+        ...
     def __repr__(self) -> str: ...
 
 
@@ -4817,6 +4860,9 @@ class AcAtcResult:
     def limiting_constraint(self) -> str:
         """Which constraint is binding: 'thermal' or 'voltage'."""
         ...
+    def to_dict(self) -> dict[str, Any]:
+        """Return the AC-ATC result as a JSON-serializable dictionary."""
+        ...
     def __repr__(self) -> str: ...
 
 
@@ -5042,6 +5088,18 @@ class PtdfResult:
     def to_dataframe(self) -> "pd.DataFrame":
         """Return a DataFrame with (from_bus, to_bus) row index and bus numbers as columns."""
         ...
+    def to_dict(
+        self,
+        format: str = "summary",
+        top_k_per_branch: int = 10,
+    ) -> dict[str, Any]:
+        """Return the PTDF as a JSON-serializable dict.
+
+        ``format`` is ``"summary"`` (default), ``"sparse"`` (CSR-style), or
+        ``"full"`` (dense nested list). Always includes ``bus_numbers`` and
+        ``monitored_branch_keys``.
+        """
+        ...
     def __repr__(self) -> str: ...
 
 
@@ -5079,6 +5137,17 @@ class LodfResult:
     def to_dataframe(self) -> "pd.DataFrame":
         """Return a DataFrame with (from_bus, to_bus) row index and (outage_from, outage_to) column index."""
         ...
+    def to_dict(
+        self,
+        format: str = "summary",
+        top_k_per_branch: int = 10,
+    ) -> dict[str, Any]:
+        """Return the LODF as a JSON-serializable dict.
+
+        ``format`` is ``"summary"`` (default), ``"sparse"``, or ``"full"``.
+        Always includes ``monitored_keys`` and ``outage_keys``.
+        """
+        ...
     def __repr__(self) -> str: ...
 
 
@@ -5099,6 +5168,17 @@ class LodfMatrixResult:
         ...
     def to_dataframe(self) -> "pd.DataFrame":
         """Return a DataFrame with (from_bus, to_bus) as both row and column index."""
+        ...
+    def to_dict(
+        self,
+        format: str = "summary",
+        top_k_per_branch: int = 10,
+    ) -> dict[str, Any]:
+        """Return the all-pairs LODF as a JSON-serializable dict.
+
+        ``format`` is ``"summary"`` (default), ``"sparse"``, or ``"full"``
+        (refused when ``n_branches > 500``). Always includes ``branch_keys``.
+        """
         ...
     def __repr__(self) -> str: ...
 
@@ -5255,6 +5335,20 @@ class OtdfResult:
     @property
     def outage_to(self) -> list[int]:
         """External to-bus numbers for outage branches."""
+        ...
+    def to_dict(
+        self,
+        format: str = "summary",
+        top_k_per_pair: int = 10,
+    ) -> dict[str, Any]:
+        """Return the OTDF tensor as a JSON-serializable dict.
+
+        ``format`` is ``"summary"`` (default, ``top_k_per_pair`` buses per
+        ``(monitored, outage)`` pair) or ``"sparse"`` (coordinate list of
+        entries with ``|value| > threshold``). ``"full"`` is refused because
+        the 3-D tensor is rarely small enough to serialize. Always includes
+        ``shape``, ``bus_numbers``, ``monitored_keys``, ``outage_keys``.
+        """
         ...
     def __repr__(self) -> str: ...
 
@@ -7071,6 +7165,9 @@ class NercAtcResult:
     @property
     def transfer_ptdf(self) -> list[float]:
         """Transfer PTDFs for each monitored branch."""
+        ...
+    def to_dict(self) -> dict[str, Any]:
+        """Return the NERC ATC result as a JSON-serializable dictionary."""
         ...
     def __repr__(self) -> str: ...
 
@@ -9139,6 +9236,27 @@ def case300() -> Network:
 
     Returns:
         Network: 300 buses, 411 branches, 69 generators, base_mva=100.
+    """
+    ...
+
+def list_builtin_cases() -> list[str]:
+    """Return the names of every built-in case available via :func:`load_builtin_case`.
+
+    The list is stable and sorted by network size ascending.
+    """
+    ...
+
+def load_builtin_case(name: str) -> Network:
+    """Load a built-in case by name.
+
+    Args:
+        name: One of the values returned by :func:`list_builtin_cases`.
+
+    Returns:
+        Network: The loaded benchmark network.
+
+    Raises:
+        ValueError: If ``name`` is not a recognized built-in case.
     """
     ...
 

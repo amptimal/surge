@@ -60,7 +60,7 @@ print("AC flat-start:", ac_flat.converged, ac_flat.iterations, ac_flat.max_misma
 print("FDPF:", fdpf.converged, fdpf.iterations, fdpf.max_mismatch)
 print("DC solve time (s):", dc.solve_time_secs)
 
-loading = ac.branch_loading_pct()
+loading = ac.branch_loading_pct
 print("Worst AC branch loading (%):", float(max(loading)))
 print("First 5 AC bus angles (deg):", ac.va_deg[:5])
 print("First 5 DC bus angles (rad):", dc.va_rad[:5])

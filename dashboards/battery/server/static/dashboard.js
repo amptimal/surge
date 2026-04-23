@@ -121,8 +121,11 @@ class EditableLineChart {
   constructor(container, opts) {
     this.container = container;
     this.data = opts.data || [];
-    this.min = opts.min ?? 0;
-    this.max = opts.max ?? 100;
+    // Use ``!== undefined`` (not ``??``) so an explicit ``null`` — meaning
+    // "no floor", e.g. LMPs that can go negative — is preserved. Same
+    // pattern as setData() below.
+    this.min = opts.min !== undefined ? opts.min : 0;
+    this.max = opts.max !== undefined ? opts.max : 100;
     this.color = opts.color || '#a78bfa';
     this.colorDim = opts.colorDim || 'rgba(167,139,250,0.15)';
     this.onChange = opts.onChange || (() => {});
@@ -601,15 +604,21 @@ class EditableLineChart {
     point.circle.setPointerCapture(e.pointerId);
     point.circle.classList.add('dragging');
 
+    const noFloor = this.min === null || this.min === undefined;
     const onMove = (ev) => {
       const rect = this.svg.getBoundingClientRect();
       const svgY = (ev.clientY - rect.top) * (this.svg.viewBox.baseVal.height / rect.height);
-      const clampedY = Math.max(this._PAD_T, Math.min(this._PAD_T + this._innerH, svgY));
-      const raw = fromY(clampedY);
-      const newVal = (this.min === null || this.min === undefined) ? raw : Math.max(this.min, raw);
+      // Visual position stays inside the chart viewport so the dot never
+      // leaves the plot area. When there's no min floor, the logical
+      // value follows the cursor past the bottom edge so the user can
+      // drag to arbitrarily negative values — the axis rescales on drop.
+      const visualY = Math.max(this._PAD_T, Math.min(this._PAD_T + this._innerH, svgY));
+      const valueY = noFloor ? Math.max(this._PAD_T, svgY) : visualY;
+      const raw = fromY(valueY);
+      const newVal = noFloor ? raw : Math.max(this.min, raw);
       this.data[idx] = newVal;
-      point.circle.setAttribute('cy', clampedY);
-      point.text.setAttribute('y', clampedY - 9);
+      point.circle.setAttribute('cy', visualY);
+      point.text.setAttribute('y', visualY - 9);
       point.text.textContent = this.formatValue(newVal);
       this._updatePathsLive();
     };
@@ -620,6 +629,9 @@ class EditableLineChart {
       point.circle.removeEventListener('pointerup', onUp);
       point.circle.removeEventListener('pointercancel', onUp);
       this.onChange(this.data.slice());
+      // A drag with no floor may have pushed the value below the current
+      // axis yMin; re-render so the axis grows to fit the new value.
+      if (noFloor) this.render();
     };
     point.circle.addEventListener('pointermove', onMove);
     point.circle.addEventListener('pointerup', onUp);
@@ -650,10 +662,20 @@ class EditableLineChart {
         const onMove = (ev) => {
           const rect = this.svg.getBoundingClientRect();
           const svgY = (ev.clientY - rect.top) * (this.svg.viewBox.baseVal.height / rect.height);
-          const clampedY = Math.max(PAD_T, Math.min(PAD_T + innerH, svgY));
-          const newVal = Math.max(0, fromY(clampedY));
+          // Let the cursor leave the chart viewport so the value can
+          // exceed the current yMin/yMax — e.g. pulling the last
+          // discharge segment above the axis top, or the last charge
+          // segment down to $0 when the axis floor is higher. The
+          // economic floor (``Math.max(0, …)``) and the segment-
+          // ordering clamp bound the value; the axis rescales on
+          // release so the dot ends up at the right on-axis position.
+          let newVal = Math.max(0, fromY(svgY));
+          if (rl.editable && rl.editable.clamp) {
+            newVal = rl.editable.clamp(i, newVal);
+          }
           values[i] = newVal;
-          dot.setAttribute('cy', toY(newVal));
+          const dotY = Math.max(PAD_T, Math.min(PAD_T + innerH, toY(newVal)));
+          dot.setAttribute('cy', dotY);
           if (rl.editable && rl.editable.onDrag) {
             rl.editable.onDrag(i, newVal);
           }
@@ -1474,6 +1496,49 @@ function clearPwlOverrides(direction) {
   if (!direction || direction === 'charge')    s.charge_bid_price_per_period = null;
 }
 
+// Clamp a proposed PWL price for (direction, segIdx, periodIdx) so it
+// preserves the ordering invariants the solver relies on:
+//   * discharge prices strictly ascending with segment index
+//   * charge prices strictly descending with segment index
+//   * d[0] > c[0] at every period (no crossed buy/sell spread)
+// Neighbor prices are the *effective* per-period values (override or
+// baseline), so the clamp works identically whether the neighbors have
+// been customised or not.
+function clampPwlPrice(direction, segIdx, periodIdx, raw) {
+  const s = state.scenario.pwl_strategy;
+  if (!s) return raw;
+  const EPS = 1e-3;
+  const neighbor = (dir, i) => {
+    const segs = dir === 'discharge'
+      ? s.discharge_offer_segments : s.charge_bid_segments;
+    if (!segs || i < 0 || i >= segs.length) return null;
+    return effectiveSegmentPrices(dir, i)[periodIdx];
+  };
+  let lo = -Infinity;
+  let hi = Infinity;
+  if (direction === 'discharge') {
+    const prev = neighbor('discharge', segIdx - 1);
+    const next = neighbor('discharge', segIdx + 1);
+    if (prev !== null && isFinite(prev)) lo = Math.max(lo, prev + EPS);
+    if (next !== null && isFinite(next)) hi = Math.min(hi, next - EPS);
+    if (segIdx === 0) {
+      const c0 = neighbor('charge', 0);
+      if (c0 !== null && isFinite(c0)) lo = Math.max(lo, c0 + EPS);
+    }
+  } else {
+    const prev = neighbor('charge', segIdx - 1);
+    const next = neighbor('charge', segIdx + 1);
+    if (prev !== null && isFinite(prev)) hi = Math.min(hi, prev - EPS);
+    if (next !== null && isFinite(next)) lo = Math.max(lo, next + EPS);
+    if (segIdx === 0) {
+      const d0 = neighbor('discharge', 0);
+      if (d0 !== null && isFinite(d0)) hi = Math.min(hi, d0 - EPS);
+    }
+  }
+  if (lo > hi) return raw;
+  return Math.min(hi, Math.max(lo, raw));
+}
+
 // True when there is at least one per-period override set for the
 // given direction + segment.
 function segmentHasOverrides(directionKey, segmentIdx) {
@@ -1897,6 +1962,8 @@ function buildPwlReferenceLines(tab) {
         const isActiveSeg = active && active.direction === direction && active.index === i;
         const editable = isActiveSeg ? {
           direction, index: i,
+          clamp: (periodIdx, rawPrice) =>
+            clampPwlPrice(direction, i, periodIdx, rawPrice),
           onDrag: (periodIdx, newPrice) => {
             setSegmentPriceOverride(direction, i, periodIdx, newPrice);
           },

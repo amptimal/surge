@@ -19,6 +19,142 @@ use crate::pf::build_dc_pf_options;
 use crate::solutions::{DcPfResult, dc_pf_result_from_result};
 use crate::utils::dict_to_dataframe_with_index;
 
+// Default non-zero threshold for "sparse" and sparsity reporting.
+const MATRIX_SPARSE_THRESHOLD: f64 = 1e-6;
+
+/// Serialize a row-major 2-D matrix (`data.len() == n_rows * n_cols`) into a
+/// JSON-friendly dict keyed on the chosen ``format``.
+///
+/// * ``"summary"`` (default, agent-safe): ``shape``, ``nnz``, ``sparsity``,
+///   ``max_abs`` plus ``top_per_row`` — the ``top_k_per_row`` largest-|value|
+///   entries per row as `[(col_idx, value), ...]`. Bounded output regardless
+///   of matrix size.
+/// * ``"sparse"``: CSR triple ``data``, ``indices``, ``indptr`` plus
+///   ``shape`` and ``nnz``. Skips entries where ``|value| <= threshold``.
+/// * ``"full"``: dense ``matrix`` as nested list of rows. Use only when the
+///   caller knows the matrix is small enough to fit in memory / context.
+fn serialize_matrix_2d<'py>(
+    py: Python<'py>,
+    data: &[f64],
+    n_rows: usize,
+    n_cols: usize,
+    format: &str,
+    top_k_per_row: usize,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("shape", (n_rows, n_cols))?;
+
+    // Non-finite-safe scan: radial-branch LODF / OTDF entries become NaN
+    // or +/-inf when an outage disconnects the monitored branch
+    // (islanding). We exclude both from statistics and top-k lists so
+    // agent-facing payloads aren't polluted with JSON null placeholders
+    // or non-standard Infinity literals.
+    let total = n_rows.saturating_mul(n_cols);
+    let mut nan_count: usize = 0;
+    let mut inf_count: usize = 0;
+    let mut nnz: usize = 0;
+    let mut max_abs: f64 = 0.0;
+    for &v in data.iter() {
+        if v.is_nan() {
+            nan_count += 1;
+            continue;
+        }
+        if v.is_infinite() {
+            inf_count += 1;
+            continue;
+        }
+        let av = v.abs();
+        if av > MATRIX_SPARSE_THRESHOLD {
+            nnz += 1;
+        }
+        if av > max_abs {
+            max_abs = av;
+        }
+    }
+    let finite_total = total.saturating_sub(nan_count).saturating_sub(inf_count);
+    let sparsity = if finite_total > 0 {
+        1.0 - (nnz as f64 / finite_total as f64)
+    } else {
+        1.0
+    };
+    d.set_item("nnz", nnz)?;
+    d.set_item("sparsity", sparsity)?;
+    d.set_item("max_abs", max_abs)?;
+    d.set_item("nan_count", nan_count)?;
+    d.set_item("inf_count", inf_count)?;
+
+    match format {
+        "summary" => {
+            let k = top_k_per_row.min(n_cols);
+            let mut top_per_row: Vec<Vec<(usize, f64)>> = Vec::with_capacity(n_rows);
+            for r in 0..n_rows {
+                let start = r * n_cols;
+                // Filter non-finite values before sorting — NaN poisons
+                // partial_cmp and +/-inf would surface as non-standard
+                // "Infinity" JSON literals or degrade the top-k list.
+                let mut pairs: Vec<(usize, f64)> = data[start..start + n_cols]
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(c, v)| if v.is_finite() { Some((c, *v)) } else { None })
+                    .collect();
+                pairs.sort_by(|a, b| {
+                    b.1.abs()
+                        .partial_cmp(&a.1.abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                pairs.truncate(k);
+                top_per_row.push(pairs);
+            }
+            d.set_item("top_per_row", top_per_row)?;
+        }
+        "sparse" => {
+            let mut data_out: Vec<f64> = Vec::new();
+            let mut indices: Vec<usize> = Vec::new();
+            let mut indptr: Vec<usize> = Vec::with_capacity(n_rows + 1);
+            indptr.push(0);
+            for r in 0..n_rows {
+                let start = r * n_cols;
+                for c in 0..n_cols {
+                    let v = data[start + c];
+                    if !v.is_finite() {
+                        continue;
+                    }
+                    if v.abs() > MATRIX_SPARSE_THRESHOLD {
+                        data_out.push(v);
+                        indices.push(c);
+                    }
+                }
+                indptr.push(data_out.len());
+            }
+            d.set_item("data", data_out)?;
+            d.set_item("indices", indices)?;
+            d.set_item("indptr", indptr)?;
+        }
+        "full" => {
+            // Keep the shape intact but represent NaN / +/-inf as Python
+            // None so the serialized payload is strict-JSON-safe (raw
+            // non-finite values would serialize to `null` or the non-
+            // standard `Infinity` literal depending on encoder flags).
+            let rows: Vec<Vec<Option<f64>>> = (0..n_rows)
+                .map(|r| {
+                    let start = r * n_cols;
+                    data[start..start + n_cols]
+                        .iter()
+                        .map(|&v| if v.is_finite() { Some(v) } else { None })
+                        .collect()
+                })
+                .collect();
+            d.set_item("matrix", rows)?;
+        }
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown format {other:?}; expected one of 'summary', 'sparse', 'full'"
+            )));
+        }
+    }
+    Ok(d)
+}
+
 // ---------------------------------------------------------------------------
 // PTDF
 // ---------------------------------------------------------------------------
@@ -139,6 +275,44 @@ impl PtdfResult {
         kwargs.set_item("index", mi)?;
         kwargs.set_item("columns", cols)?;
         pd.call_method("DataFrame", (), Some(&kwargs))
+    }
+
+    /// Return the PTDF result as a JSON-serializable dictionary.
+    ///
+    /// Args:
+    ///     format: One of ``"summary"`` (default, agent-safe), ``"sparse"``
+    ///         (CSR-style), or ``"full"`` (dense nested list).
+    ///     top_k_per_branch: For ``"summary"`` format, the number of
+    ///         largest-|value| bus entries retained per monitored branch.
+    ///
+    /// Always includes ``bus_numbers`` (column axis) and
+    /// ``monitored_branch_keys`` (row axis as ``(from, to, circuit)`` tuples)
+    /// alongside the format-specific payload.
+    #[pyo3(signature = (format = "summary", top_k_per_branch = 10))]
+    fn to_dict<'py>(
+        &self,
+        py: Python<'py>,
+        format: &str,
+        top_k_per_branch: usize,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let d = serialize_matrix_2d(
+            py,
+            &self.ptdf_data,
+            self.n_monitored,
+            self.n_buses,
+            format,
+            top_k_per_branch,
+        )?;
+        d.set_item("bus_numbers", self.bus_numbers_vec.clone())?;
+        let keys: Vec<(u32, u32, String)> = self
+            .branch_from_vec
+            .iter()
+            .zip(self.branch_to_vec.iter())
+            .zip(self.branch_circuit_vec.iter())
+            .map(|((&f, &t), c)| (f, t, c.clone()))
+            .collect();
+        d.set_item("monitored_branch_keys", keys)?;
+        Ok(d)
     }
 
     fn __repr__(&self) -> String {
@@ -469,6 +643,49 @@ impl LodfResult {
         pd.call_method("DataFrame", (), Some(&kwargs))
     }
 
+    /// Return the LODF result as a JSON-serializable dictionary.
+    ///
+    /// Args:
+    ///     format: One of ``"summary"`` (default), ``"sparse"``, or ``"full"``.
+    ///     top_k_per_branch: For ``"summary"``, number of largest-|value|
+    ///         outage entries retained per monitored branch.
+    ///
+    /// Always includes ``monitored_keys`` (row axis) and ``outage_keys``
+    /// (column axis) as ``(from, to, circuit)`` tuples.
+    #[pyo3(signature = (format = "summary", top_k_per_branch = 10))]
+    fn to_dict<'py>(
+        &self,
+        py: Python<'py>,
+        format: &str,
+        top_k_per_branch: usize,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let d = serialize_matrix_2d(
+            py,
+            &self.lodf_data,
+            self.n_monitored,
+            self.n_outages,
+            format,
+            top_k_per_branch,
+        )?;
+        let monitored_keys: Vec<(u32, u32, String)> = self
+            .monitored_from_vec
+            .iter()
+            .zip(self.monitored_to_vec.iter())
+            .zip(self.monitored_circuit_vec.iter())
+            .map(|((&f, &t), c)| (f, t, c.clone()))
+            .collect();
+        let outage_keys: Vec<(u32, u32, String)> = self
+            .outage_from_vec
+            .iter()
+            .zip(self.outage_to_vec.iter())
+            .zip(self.outage_circuit_vec.iter())
+            .map(|((&f, &t), c)| (f, t, c.clone()))
+            .collect();
+        d.set_item("monitored_keys", monitored_keys)?;
+        d.set_item("outage_keys", outage_keys)?;
+        Ok(d)
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "LodfResult(monitored={}, outage={})",
@@ -602,6 +819,51 @@ impl LodfMatrixResult {
         kwargs.set_item("index", mi.clone())?;
         kwargs.set_item("columns", mi)?;
         pd.call_method("DataFrame", (), Some(&kwargs))
+    }
+
+    /// Return the full-LODF matrix result as a JSON-serializable dictionary.
+    ///
+    /// Args:
+    ///     format: One of ``"summary"`` (default), ``"sparse"``, or ``"full"``.
+    ///         ``"full"`` is refused when ``n_branches > 500`` — use
+    ///         ``"sparse"`` or ``"summary"`` for larger networks, or call
+    ///         ``.lodf`` / ``.to_dataframe()`` directly for numpy/pandas
+    ///         access.
+    ///     top_k_per_branch: For ``"summary"``, number of largest-|value|
+    ///         outage entries retained per monitored branch.
+    ///
+    /// Always includes ``branch_keys`` (both row and column axis use the same
+    /// branch ordering).
+    #[pyo3(signature = (format = "summary", top_k_per_branch = 10))]
+    fn to_dict<'py>(
+        &self,
+        py: Python<'py>,
+        format: &str,
+        top_k_per_branch: usize,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        if format == "full" && self.n_branches > 500 {
+            return Err(PyValueError::new_err(format!(
+                "format='full' refused for n_branches={} (> 500); use 'sparse' or 'summary', or access .lodf / .to_dataframe() directly",
+                self.n_branches
+            )));
+        }
+        let d = serialize_matrix_2d(
+            py,
+            &self.lodf_data,
+            self.n_branches,
+            self.n_branches,
+            format,
+            top_k_per_branch,
+        )?;
+        let keys: Vec<(u32, u32, String)> = self
+            .branch_from_vec
+            .iter()
+            .zip(self.branch_to_vec.iter())
+            .zip(self.branch_circuit_vec.iter())
+            .map(|((&f, &t), c)| (f, t, c.clone()))
+            .collect();
+        d.set_item("branch_keys", keys)?;
+        Ok(d)
     }
 
     fn __repr__(&self) -> String {
@@ -1339,6 +1601,155 @@ impl OtdfResult {
             .zip(self.outage_circuit_vec.iter())
             .map(|((&from_bus, &to_bus), circuit)| (from_bus, to_bus, circuit.clone()))
             .collect()
+    }
+
+    /// Return the OTDF tensor as a JSON-serializable dictionary.
+    ///
+    /// OTDF is a 3-D tensor of shape ``(n_monitored, n_outages, n_buses)``;
+    /// a "full" dense dump is almost always impractical and is refused.
+    ///
+    /// Args:
+    ///     format: One of ``"summary"`` (default) or ``"sparse"``.
+    ///         ``"summary"`` returns top-|value| bus entries per
+    ///         (monitored, outage) pair. ``"sparse"`` returns a coordinate
+    ///         list `{indices: [(m, o, b), ...], values: [...]}` of entries
+    ///         with ``|value| > threshold``.
+    ///     top_k_per_pair: For ``"summary"``, number of largest-|value| bus
+    ///         entries retained per (monitored, outage) pair.
+    ///
+    /// Always includes ``shape``, ``bus_numbers``, ``monitored_keys``,
+    /// ``outage_keys``, ``nnz``, ``sparsity``, ``max_abs``.
+    #[pyo3(signature = (format = "summary", top_k_per_pair = 10))]
+    fn to_dict<'py>(
+        &self,
+        py: Python<'py>,
+        format: &str,
+        top_k_per_pair: usize,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        let shape = (self.n_monitored, self.n_outages, self.n_buses);
+        d.set_item("shape", shape)?;
+
+        // Non-finite-safe scan — matches serialize_matrix_2d. Bridge-
+        // line outages can produce NaN or +/-inf OTDF entries
+        // (islanding); we exclude both from nnz / max_abs and surface
+        // the counts separately.
+        let total = self
+            .n_monitored
+            .saturating_mul(self.n_outages)
+            .saturating_mul(self.n_buses);
+        let mut nan_count: usize = 0;
+        let mut inf_count: usize = 0;
+        let mut nnz: usize = 0;
+        let mut max_abs: f64 = 0.0;
+        for &v in self.otdf_data.iter() {
+            if v.is_nan() {
+                nan_count += 1;
+                continue;
+            }
+            if v.is_infinite() {
+                inf_count += 1;
+                continue;
+            }
+            let av = v.abs();
+            if av > MATRIX_SPARSE_THRESHOLD {
+                nnz += 1;
+            }
+            if av > max_abs {
+                max_abs = av;
+            }
+        }
+        let finite_total = total.saturating_sub(nan_count).saturating_sub(inf_count);
+        let sparsity = if finite_total > 0 {
+            1.0 - (nnz as f64 / finite_total as f64)
+        } else {
+            1.0
+        };
+        d.set_item("nnz", nnz)?;
+        d.set_item("sparsity", sparsity)?;
+        d.set_item("max_abs", max_abs)?;
+        d.set_item("nan_count", nan_count)?;
+        d.set_item("inf_count", inf_count)?;
+
+        d.set_item("bus_numbers", self.bus_numbers_vec.clone())?;
+        let monitored_keys: Vec<(u32, u32, String)> = self
+            .monitored_from_vec
+            .iter()
+            .zip(self.monitored_to_vec.iter())
+            .zip(self.monitored_circuit_vec.iter())
+            .map(|((&f, &t), c)| (f, t, c.clone()))
+            .collect();
+        let outage_keys: Vec<(u32, u32, String)> = self
+            .outage_from_vec
+            .iter()
+            .zip(self.outage_to_vec.iter())
+            .zip(self.outage_circuit_vec.iter())
+            .map(|((&f, &t), c)| (f, t, c.clone()))
+            .collect();
+        d.set_item("monitored_keys", monitored_keys)?;
+        d.set_item("outage_keys", outage_keys)?;
+
+        match format {
+            "summary" => {
+                let k = top_k_per_pair.min(self.n_buses);
+                let pair_stride = self.n_buses;
+                let mut top_per_pair: Vec<((usize, usize), Vec<(usize, f64)>)> =
+                    Vec::with_capacity(self.n_monitored * self.n_outages);
+                for m in 0..self.n_monitored {
+                    for o in 0..self.n_outages {
+                        let start = (m * self.n_outages + o) * pair_stride;
+                        // Filter non-finite before sorting — same
+                        // reasoning as serialize_matrix_2d.
+                        let mut pairs: Vec<(usize, f64)> = self.otdf_data
+                            [start..start + self.n_buses]
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(b, v)| if v.is_finite() { Some((b, *v)) } else { None })
+                            .collect();
+                        pairs.sort_by(|a, b| {
+                            b.1.abs()
+                                .partial_cmp(&a.1.abs())
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        pairs.truncate(k);
+                        top_per_pair.push(((m, o), pairs));
+                    }
+                }
+                d.set_item("top_per_pair", top_per_pair)?;
+            }
+            "sparse" => {
+                let mut indices: Vec<(usize, usize, usize)> = Vec::new();
+                let mut values: Vec<f64> = Vec::new();
+                for m in 0..self.n_monitored {
+                    for o in 0..self.n_outages {
+                        for b in 0..self.n_buses {
+                            let flat = (m * self.n_outages + o) * self.n_buses + b;
+                            let v = self.otdf_data[flat];
+                            if !v.is_finite() {
+                                continue;
+                            }
+                            if v.abs() > MATRIX_SPARSE_THRESHOLD {
+                                indices.push((m, o, b));
+                                values.push(v);
+                            }
+                        }
+                    }
+                }
+                d.set_item("indices", indices)?;
+                d.set_item("values", values)?;
+            }
+            "full" => {
+                return Err(PyValueError::new_err(
+                    "format='full' is not supported for OTDF (3-D tensor); use 'summary' or 'sparse', or access .otdf / .get(m, o) directly",
+                ));
+            }
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown format {other:?}; expected 'summary' or 'sparse'"
+                )));
+            }
+        }
+        Ok(d)
     }
 
     fn __repr__(&self) -> String {

@@ -81,6 +81,10 @@ class DcOpfResult:
     def feasible(self) -> bool:
         return self._native_result.is_feasible
 
+    def to_dict(self):
+        """Return the DC-OPF result as a JSON-serializable dictionary."""
+        return self._native_result.to_dict()
+
     def __getattr__(self, name: str):
         return getattr(self.opf, name)
 
@@ -118,6 +122,10 @@ class AcOpfResult:
         if discrete is not None:
             return bool(discrete)
         return bool(self.opf.converged)
+
+    def to_dict(self):
+        """Return the AC-OPF result as a JSON-serializable dictionary."""
+        return self._native_result.to_dict()
 
     def __getattr__(self, name: str):
         return getattr(self.opf, name)
@@ -189,6 +197,10 @@ class ScopfResult:
     @property
     def solve_time_secs(self) -> float:
         return self._native_result.solve_time_secs
+
+    def to_dict(self):
+        """Return the SCOPF result as a JSON-serializable dictionary."""
+        return self._native_result.to_dict()
 
     def __getattr__(self, name: str):
         return getattr(self.opf, name)

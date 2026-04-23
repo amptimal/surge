@@ -70,6 +70,8 @@ fn parse_embedded_zst(zst_bytes: &[u8], name: &str) -> PyResult<Network> {
 ///
 /// Returns:
 ///   Network: 9 buses, 9 branches, 3 generators, base_mva=100.
+///   **Branch thermal ratings: present on all 9 branches** (150 - 300 MVA).
+///   Suitable for NERC ATC / transfer-capability studies.
 #[pyfunction]
 pub fn case9() -> PyResult<Network> {
     parse_embedded_zst(CASE9_ZST, "case9")
@@ -82,6 +84,10 @@ pub fn case9() -> PyResult<Network> {
 ///
 /// Returns:
 ///   Network: 14 buses, 20 branches, 5 generators, base_mva=100.
+///   **Branch thermal ratings: NOT set** (rate_a_mva = 0 on all branches) —
+///   the original IEEE 14-bus dataset has no thermal ratings. Use
+///   ``case9``, ``case30``, or ``market30`` for transfer-capability
+///   studies that need real thermal limits.
 #[pyfunction]
 pub fn case14() -> PyResult<Network> {
     parse_embedded_zst(CASE14_ZST, "case14")
@@ -94,6 +100,8 @@ pub fn case14() -> PyResult<Network> {
 ///
 /// Returns:
 ///   Network: 30 buses, 41 branches, 6 generators, base_mva=100.
+///   **Branch thermal ratings: present on all 41 branches** (16 - 130 MVA).
+///   Good default for ATC / OPF studies that need realistic thermal limits.
 #[pyfunction]
 pub fn case30() -> PyResult<Network> {
     parse_embedded_zst(CASE30_ZST, "case30")
@@ -106,6 +114,10 @@ pub fn case30() -> PyResult<Network> {
 ///
 /// Returns:
 ///   Network: 30 buses, 41 branches, 10 generators, base_mva=100.
+///   **Branch thermal ratings: present on all 41 branches** (64 - 520 MVA).
+///   The richest built-in case: includes storage (battery + pumped hydro),
+///   one HVDC link, and three operating areas. Best for SCED / SCUC /
+///   ATC workflows.
 #[pyfunction]
 pub fn market30() -> PyResult<Network> {
     parse_embedded_zst(MARKET30_ZST, "market30")
@@ -118,6 +130,10 @@ pub fn market30() -> PyResult<Network> {
 ///
 /// Returns:
 ///   Network: 57 buses, 80 branches, 7 generators, base_mva=100.
+///   **Branch thermal ratings: NOT set** (rate_a_mva = 0 on all branches).
+///   OK for power-flow / OPF studies that don't bind thermal limits, but
+///   transfer-capability studies will return "unconstrained". Add ratings
+///   manually via ``Network.set_branch_rating`` if needed.
 #[pyfunction]
 pub fn case57() -> PyResult<Network> {
     parse_embedded_zst(CASE57_ZST, "case57")
@@ -130,6 +146,11 @@ pub fn case57() -> PyResult<Network> {
 ///
 /// Returns:
 ///   Network: 118 buses, 186 branches, 54 generators, base_mva=100.
+///   **Branch thermal ratings: NOT set** (rate_a_mva = 0 on all branches) —
+///   the canonical IEEE 118-bus dataset ships without thermal ratings.
+///   Transfer-capability (``compute_nerc_atc`` / ``compute_ac_atc``) and
+///   thermal-based contingency metrics will degrade to "unconstrained" on
+///   this case. Use ``market30`` when a thermally-rated case is needed.
 #[pyfunction]
 pub fn case118() -> PyResult<Network> {
     parse_embedded_zst(CASE118_ZST, "case118")
@@ -142,7 +163,83 @@ pub fn case118() -> PyResult<Network> {
 ///
 /// Returns:
 ///   Network: 300 buses, 411 branches, 69 generators, base_mva=100.
+///   **Branch thermal ratings: NOT set** (rate_a_mva = 0 on all branches).
+///   Same caveat as case118: transfer-capability studies will return
+///   "unconstrained". Useful for solver-speed and scaling tests where
+///   thermal binding isn't important.
 #[pyfunction]
 pub fn case300() -> PyResult<Network> {
     parse_embedded_zst(CASE300_ZST, "case300")
+}
+
+/// Return the names of every built-in case available via
+/// :func:`load_builtin_case`.
+///
+/// The list is stable and sorted by network size ascending so that
+/// callers iterating in order start from the smallest case.
+///
+/// See :func:`builtin_case_rated_flags` for a quick-lookup of which
+/// cases have realistic branch thermal ratings.
+#[pyfunction]
+pub fn list_builtin_cases() -> Vec<&'static str> {
+    vec![
+        "case9", "case14", "case30", "market30", "case57", "case118", "case300",
+    ]
+}
+
+/// Report which built-in cases ship with branch thermal ratings.
+///
+/// Returns a list of ``(name, has_ratings)`` tuples. Cases without
+/// ratings will see transfer-capability tools (``compute_nerc_atc``,
+/// ``compute_ac_atc``) return "unconstrained" — use a rated case for
+/// those workflows.
+///
+/// As of v0.1.5 the rated cases are ``case9``, ``case30``, and
+/// ``market30``; the unrated cases (per their upstream IEEE datasets)
+/// are ``case14``, ``case57``, ``case118``, and ``case300``.
+#[pyfunction]
+pub fn builtin_case_rated_flags() -> Vec<(&'static str, bool)> {
+    vec![
+        ("case9", true),
+        ("case14", false),
+        ("case30", true),
+        ("market30", true),
+        ("case57", false),
+        ("case118", false),
+        ("case300", false),
+    ]
+}
+
+/// Load a built-in case by name.
+///
+/// Args:
+///     name: One of the values returned by :func:`list_builtin_cases`
+///         (``"case9"``, ``"case14"``, ``"case30"``, ``"market30"``,
+///         ``"case57"``, ``"case118"``, ``"case300"``).
+///
+/// Note:
+///     Not every case has branch thermal ratings. See
+///     :func:`builtin_case_rated_flags` for a quick reference.
+///     Transfer-capability tools will return "unconstrained" on
+///     unrated cases.
+///
+/// Returns:
+///     Network: The loaded benchmark network.
+///
+/// Raises:
+///     ValueError: If ``name`` is not a recognized built-in case.
+#[pyfunction]
+pub fn load_builtin_case(name: &str) -> PyResult<Network> {
+    match name {
+        "case9" => case9(),
+        "case14" => case14(),
+        "case30" => case30(),
+        "market30" => market30(),
+        "case57" => case57(),
+        "case118" => case118(),
+        "case300" => case300(),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown built-in case {other:?}; available: case9, case14, case30, market30, case57, case118, case300"
+        ))),
+    }
 }

@@ -6,6 +6,65 @@ this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows Semantic Versioning intent.
 
+## [0.1.5] — 2026-04-22
+
+Python-side release: agent / MCP integration helpers, a PyPSA netCDF
+bridge, and accessor consistency fixes. No Rust crate API changes.
+
+### Added
+
+- **Agent-friendly MCP helpers on `surge-py`.** `.to_dict()` now exists
+  on every solver result (`AcPfResult`, `DcPfResult`, `DcOpfResult`,
+  `ScopfResult`, `AcOpfHvdcResult`, `ContingencyAnalysis`,
+  `AcAtcResult`, `PtdfResult`, `LodfResult`, `LodfMatrixResult`,
+  `OtdfResult`, and the nested contingency / screening types) so MCP
+  hosts and tool-calling agents can serialize results with one call.
+  Matrix results accept `format={"summary","sparse","full"}` and a
+  `top_k_per_branch` knob.
+- **Network convenience accessors.** `Network.summary()`,
+  `Network.loads_dataframe()`, `Network.shunts_dataframe()` round out
+  the existing generator / bus / branch DataFrame surface.
+- **Built-in case helpers.** `surge.list_builtin_cases()` and
+  `surge.load_builtin_case(name)` enumerate the packaged IEEE / market
+  cases by string name. `surge.builtin_case_rated_flags()` reports
+  which built-ins ship with branch thermal ratings (relevant for
+  transfer-capability studies).
+- **Explicit format override on load.** `surge.load(path, format=...)`
+  and the `surge.load_network` alias let MCP hosts pass an explicit
+  format when the extension is ambiguous or missing.
+- **PyPSA netCDF bridge.** New `surge.io.pypsa_nc.load(path)` reads
+  PyPSA netCDF directly into a Surge `Network`, preserving per-bus
+  `v_mag_pu_set` that the MATPOWER round-trip path cannot always
+  carry through. Requires the optional `pypsa` package.
+- **Format interop guide.** New [`docs/format-interop.md`](docs/format-interop.md)
+  documents per-format round-trip caveats and when to prefer the
+  PyPSA bridge over a MATPOWER hop.
+
+### Changed
+
+- **Accessor consistency on `AcPfResult`.** `branch_apparent_power`
+  and `branch_loading_pct` are now properties, matching the rest of
+  the result surface. **Breaking for callers using `()`** — drop the
+  parentheses: `result.branch_loading_pct` (not
+  `result.branch_loading_pct()`).
+- **Branch type auto-detection on `Network.add_branch`.** An
+  off-nominal tap (|tap − 1| > 1e-6) or non-zero phase shift now
+  tags the branch as a `Transformer`, matching the MATPOWER reader
+  convention. Previously Python-built networks landed as `Line`
+  regardless.
+- **Strict-JSON-safe matrix serialization.** PTDF / LODF / OTDF
+  `to_dict` now filters non-finite entries (NaN / ±∞ from radial /
+  islanding outages) from `nnz`, `max_abs`, and top-k lists, surfaces
+  `nan_count` / `inf_count` separately, and emits Python `None` for
+  non-finite cells in `format="full"` so the payload round-trips
+  through strict JSON encoders.
+
+### Build
+
+- **Docker image builds HiGHS 1.14.0 from source** rather than relying
+  on the Debian `libhighs-dev` package, which lagged behind the
+  workspace's vendored HiGHS.
+
 ## [0.1.4] — 2026-04-20
 
 ### Added
