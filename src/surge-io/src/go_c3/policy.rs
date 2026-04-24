@@ -289,6 +289,71 @@ pub struct GoC3Policy {
     /// paying the warm-start tax by default isn't worth it. Set `false`
     /// explicitly when a scenario needs the warm start to converge.
     pub disable_scuc_warm_start: bool,
+
+    /// Diagnostic knob: when `true`, pin every per-bus power-balance
+    /// slack column in SCUC to `col_upper = 0`, turning the bus-balance
+    /// rows into firm constraints. Used to measure the LP weight of the
+    /// soft-balance slack family. Off by default — production solves
+    /// need the slacks so infeasible inputs still produce a solve.
+    pub scuc_firm_bus_balance_slacks: bool,
+
+    /// Diagnostic knob: when `true`, pin every branch thermal slack
+    /// column in SCUC to `col_upper = 0`, turning the thermal rows into
+    /// firm constraints. Different from `enforce_thermal_limits = false`
+    /// on the DispatchRequest (which skips the rows entirely); this
+    /// preserves the rows but removes the slack escape hatch. Off by
+    /// default.
+    pub scuc_firm_branch_thermal_slacks: bool,
+
+    /// When `true`, drop SCUC branch thermal enforcement entirely —
+    /// sets `DispatchRequest.network.thermal_limits.enforce = false` for
+    /// the DC SCUC stage. Diagnostic knob to measure the MIP cost
+    /// contributed by the thermal-limit row family (and its slacks).
+    /// Off by default; production solves need this `false`.
+    pub disable_scuc_thermal_limits: bool,
+
+    /// Diagnostic: zero out the `power_balance_penalty` on the SCUC
+    /// request so per-bus balance slack is free. Combined with a loose
+    /// thermal cap this effectively decouples the network — the MIP
+    /// solver sees only commitment + capacity + reserves. Useful to
+    /// probe whether the UC part is solvable independently of DC-PF.
+    /// Off by default.
+    pub scuc_copperplate: bool,
+
+    /// Scaling multiplier applied to both segments of the SCUC
+    /// `power_balance_penalty` (curtailment and excess). The default
+    /// `1.0` preserves the `$1e7/MW curtailment, $1e5/MW excess`
+    /// ship-penalty. On stressed networks the LP relaxation exploits
+    /// the large gap between fractional-commitment (cheap) and
+    /// integer-commitment (forces bus slack at $1e7/MW) to produce a
+    /// dual bound Gurobi can't close inside heuristics — 6049-bus D1
+    /// observed this pattern, with Gurobi returning obj=1e14 dummy
+    /// incumbents and zero simplex iterations. Lowering the
+    /// multiplier makes bus slack cheaper so integer-commitment
+    /// solutions don't blow up. Typical values:
+    ///   * `0.01` → $1e5 / $1e3 — strong reduction, often enough to
+    ///     unstick large SCUCs.
+    ///   * `0.1` → $1e6 / $1e4 — moderate.
+    ///   * `0.0` → effectively [`scuc_copperplate`].
+    ///
+    /// Ignored when `scuc_copperplate` is `true`.
+    pub scuc_power_balance_penalty_multiplier: f64,
+
+    /// When `true`, drop the SCUC per-bus power-balance row family
+    /// and its `pb_*` slack column blocks from the LP entirely,
+    /// replacing them with a single system-balance row per period.
+    /// The `theta` / thermal row blocks remain allocated but become
+    /// vestigial (no KCL couples them to `pg`), so the MIP sees a
+    /// copperplate commitment problem. DC branch losses are accounted
+    /// for at the system level via the `loss_factor_warm_start_mode`
+    /// rate times total period load.
+    ///
+    /// Use when per-bus balance is blocking Gurobi convergence on
+    /// large networks (observed on 6049-bus D1 where default pb
+    /// penalties produced obj=1e14 dummy incumbents with zero simplex
+    /// iterations). AC SCED still enforces full nodal physics when
+    /// it runs downstream. Off by default.
+    pub scuc_disable_bus_power_balance: bool,
 }
 
 impl Default for GoC3Policy {
@@ -325,6 +390,12 @@ impl Default for GoC3Policy {
             commitment_mip_gap_schedule: None,
             disable_flowgates: false,
             disable_scuc_warm_start: true,
+            scuc_firm_bus_balance_slacks: false,
+            scuc_firm_branch_thermal_slacks: false,
+            disable_scuc_thermal_limits: false,
+            scuc_copperplate: false,
+            scuc_power_balance_penalty_multiplier: 1.0,
+            scuc_disable_bus_power_balance: true,
         }
     }
 }

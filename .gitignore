@@ -1,5 +1,5 @@
 # Rust
-/target
+target/
 **/*.rs.bk
 
 # Python
@@ -75,3 +75,8 @@ license.key
 
 # Research scratch — not shipped
 research/
+
+# One-off debug / probe scripts that live alongside the repo but
+# aren't meant to ship. Put throwaway diagnostic scripts here; keep
+# `scripts/` for probes that are worth versioning.
+debug-scripts/

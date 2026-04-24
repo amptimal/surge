@@ -746,7 +746,30 @@ fn zonal_requirement_mw_for_period(
     problem_spec: &DispatchProblemSpec<'_>,
     active_dispatchable_loads: &[(usize, &DispatchableLoad)],
     in_service_gen_bus_numbers: &[u32],
+    participant_set: Option<&HashSet<u32>>,
 ) -> f64 {
+    // Fast bus-match helpers that use the precomputed `participant_set`
+    // (O(1) contains) in preference to `requirement.participant_bus_numbers`
+    // (O(N) linear scan). When the requirement has no explicit participant
+    // list, both variants fall back to the same `zone_id == study_area`
+    // check used by `zonal_participant_bus_matches`.
+    let bus_matches_gen_bus = |bus_number: u32, fallback_area: Option<usize>| -> bool {
+        match participant_set {
+            Some(set) => set.contains(&bus_number),
+            None => fallback_area.unwrap_or(0) == requirement.zone_id,
+        }
+    };
+    let bus_matches_dl_bus = |bus_number: u32| -> bool {
+        match participant_set {
+            Some(set) => set.contains(&bus_number),
+            None => {
+                let fallback_area =
+                    crate::common::network::study_area_for_bus(network, problem_spec, bus_number);
+                fallback_area.unwrap_or(0) == requirement.zone_id
+            }
+        }
+    };
+
     let base_requirement_mw = requirement.requirement_mw_for_period(period_idx);
     let served_dispatchable_load_mw = requirement
         .served_dispatchable_load_coefficient
@@ -760,14 +783,7 @@ fn zonal_requirement_mw_for_period(
                     .filter_map(|(k, load_result)| {
                         active_dispatchable_loads
                             .get(k)
-                            .filter(|(_, dl)| {
-                                crate::common::network::zonal_requirement_matches_bus(
-                                    network,
-                                    problem_spec,
-                                    requirement,
-                                    dl.bus,
-                                )
-                            })
+                            .filter(|(_, dl)| bus_matches_dl_bus(dl.bus))
                             .map(|_| load_result.p_served_pu * network.base_mva)
                     })
                     .sum::<f64>()
@@ -782,9 +798,7 @@ fn zonal_requirement_mw_for_period(
                     .iter()
                     .enumerate()
                     .filter_map(|(j, pg_mw)| {
-                        crate::common::network::zonal_participant_bus_matches(
-                            requirement.zone_id,
-                            requirement.participant_bus_numbers.as_deref(),
+                        bus_matches_gen_bus(
                             in_service_gen_bus_numbers
                                 .get(j)
                                 .copied()
@@ -845,6 +859,7 @@ fn zonal_balance_requirement_mw_for_period(
     active_dispatchable_loads: &[(usize, &DispatchableLoad)],
     in_service_gen_bus_numbers: &[u32],
     reserve_products_by_id: &HashMap<&str, &surge_network::market::ReserveProduct>,
+    zonal_participant_sets: &[Option<HashSet<u32>>],
 ) -> f64 {
     reserve_balance_product_ids(product_id, reserve_products_by_id)
         .into_iter()
@@ -852,10 +867,13 @@ fn zonal_balance_requirement_mw_for_period(
             problem_spec
                 .zonal_reserve_requirements
                 .iter()
-                .filter(|requirement| {
+                .enumerate()
+                .filter(|(_, requirement)| {
                     requirement.product_id == balance_product_id && requirement.zone_id == zone_id
                 })
-                .map(|requirement| {
+                .map(|(req_idx, requirement)| {
+                    let participant_set =
+                        zonal_participant_sets.get(req_idx).and_then(|s| s.as_ref());
                     zonal_requirement_mw_for_period(
                         requirement,
                         period_idx,
@@ -864,6 +882,7 @@ fn zonal_balance_requirement_mw_for_period(
                         problem_spec,
                         active_dispatchable_loads,
                         in_service_gen_bus_numbers,
+                        participant_set,
                     )
                 })
                 .sum::<f64>()
@@ -1360,11 +1379,66 @@ fn attach_keyed_period_views(
         .iter()
         .map(|product| (product.id.as_str(), product))
         .collect();
+    // Precompute HashSet<u32> views of each zonal reserve requirement's
+    // `participant_bus_numbers`. The inner loops in the zonal reserve
+    // result builder (`provided_mw`, `zonal_requirement_mw_for_period`)
+    // run `participants.contains(&bus_number)` — O(P_zone) per check —
+    // against every gen and every DL, for every zone, every period.
+    // With 4224-bus scenarios this was ~112s of pure overhead. Hoisting
+    // the conversion to HashSets collapses the per-check cost to O(1).
+    let zonal_participant_sets: Vec<Option<HashSet<u32>>> = normalized
+        .input
+        .zonal_reserve_requirements
+        .iter()
+        .map(|req| {
+            req.participant_bus_numbers
+                .as_ref()
+                .map(|p| p.iter().copied().collect::<HashSet<u32>>())
+        })
+        .collect();
     let mut total_energy_cost = 0.0;
     let mut total_reserve_cost = 0.0;
     let mut total_no_load_cost = 0.0;
     let mut total_startup_cost = 0.0;
     let mut startup_costs_by_generator = vec![0.0; n_in_service_gens];
+
+    // Per-section timing accumulators for `attach_keyed_period_views`
+    // sub-phase instrumentation. See the `info!` at the end of the
+    // period loop for where these are reported.
+    let mut akpv_gen_secs = 0.0_f64;
+    let mut akpv_dl_secs = 0.0_f64;
+    let mut akpv_reserve_secs = 0.0_f64;
+    let mut akpv_branch_secs = 0.0_f64;
+    let mut akpv_flowgate_secs = 0.0_f64;
+    let mut akpv_interface_secs = 0.0_f64;
+    let mut akpv_reserve_build_secs = 0.0_f64;
+    let mut akpv_reserve_system_secs = 0.0_f64;
+    let mut akpv_reserve_zonal_secs = 0.0_f64;
+    let mut akpv_post_reserve_secs = 0.0_f64;
+
+    // Pre-compute constraint_id strings for the thermal/flowgate/
+    // interface shadow-price loops. Previously these were built inline
+    // via `network.branches.iter().filter(...).nth(idx)` per iter —
+    // an O(N²) trap that accounted for ~90s on 4224-bus SCUC (more
+    // than half the non-MIP overhead). Hoisting them outside the
+    // period loop reduces the work from O(N_periods × N² ) to O(N).
+    let branch_constraint_ids: Vec<String> = network
+        .branches
+        .iter()
+        .filter(|branch| branch.in_service && branch.rating_a_mva >= normalized.input.min_rate_a)
+        .map(|branch| {
+            format!(
+                "branch:{}:{}:{}",
+                branch.from_bus, branch.to_bus, branch.circuit
+            )
+        })
+        .collect();
+    let flowgate_constraint_ids: Vec<String> = network
+        .flowgates
+        .iter()
+        .filter(|fg| fg.in_service && fg.contingency_branch.is_none())
+        .map(|fg| fg.name.clone())
+        .collect();
 
     for (t, period) in result.periods.iter_mut().enumerate() {
         let period_spec = problem_spec.period(t);
@@ -1393,6 +1467,7 @@ fn attach_keyed_period_views(
                 .get(t)
                 .is_some_and(|values| !values.is_empty());
 
+        let _akpv_gen_t0 = std::time::Instant::now();
         for (j, ((gi, generator), resource_id)) in in_service_gens
             .iter()
             .zip(gen_resource_ids.iter())
@@ -1520,7 +1595,9 @@ fn attach_keyed_period_views(
             total_reserve_cost += reserve_costs.values().sum::<f64>();
             startup_costs_by_generator[j] += startup_cost.unwrap_or(0.0);
         }
+        akpv_gen_secs += _akpv_gen_t0.elapsed().as_secs_f64();
 
+        let _akpv_dl_t0 = std::time::Instant::now();
         for (global_dl_idx, dl) in &active_dispatchable_loads {
             let Some(local_dl_idx) = catalog.local_dispatchable_load_index(*global_dl_idx) else {
                 continue;
@@ -1589,7 +1666,9 @@ fn attach_keyed_period_views(
             total_energy_cost += load_result.cost_contribution;
             total_reserve_cost += reserve_cost_total;
         }
+        akpv_dl_secs += _akpv_dl_t0.elapsed().as_secs_f64();
 
+        let _akpv_bus_results_t0 = std::time::Instant::now();
         let mut bus_hvdc_delta_mw: HashMap<u32, f64> = HashMap::new();
         let hvdc_results: Vec<RawHvdcPeriodResult> = normalized
             .input
@@ -1698,6 +1777,9 @@ fn attach_keyed_period_views(
             })
             .collect();
 
+        akpv_reserve_secs += _akpv_bus_results_t0.elapsed().as_secs_f64();
+
+        let _akpv_freq_t0 = std::time::Instant::now();
         let frequency_results = if !normalized
             .input
             .frequency_security
@@ -1729,6 +1811,9 @@ fn attach_keyed_period_views(
             None
         };
 
+        akpv_interface_secs += _akpv_freq_t0.elapsed().as_secs_f64();
+
+        let _akpv_reserve_build_t0 = std::time::Instant::now();
         let reserve_results_system =
             normalized
                 .input
@@ -1778,107 +1863,121 @@ fn attach_keyed_period_views(
                         shortfall_cost,
                     }
                 });
-        let reserve_results_zonal =
-            normalized
-                .input
-                .zonal_reserve_requirements
-                .iter()
-                .map(|requirement| {
-                    let key = format!("{}:{}", requirement.zone_id, requirement.product_id);
-                    let shortfall = period
-                        .zonal_reserve_shortfall
+        let reserve_results_zonal = normalized
+            .input
+            .zonal_reserve_requirements
+            .iter()
+            .enumerate()
+            .map(|(req_idx, requirement)| {
+                let participant_set = zonal_participant_sets.get(req_idx).and_then(|s| s.as_ref());
+                let bus_matches_gen = |j: usize| -> bool {
+                    let bus_number = in_service_gen_bus_numbers
+                        .get(j)
+                        .copied()
+                        .unwrap_or_default();
+                    let fallback_area = normalized.input.generator_area.get(j).copied();
+                    match participant_set {
+                        Some(set) => set.contains(&bus_number),
+                        None => fallback_area.unwrap_or(0) == requirement.zone_id,
+                    }
+                };
+                let bus_matches_dl_bus = |bus_number: u32| -> bool {
+                    match participant_set {
+                        Some(set) => set.contains(&bus_number),
+                        None => {
+                            let fallback_area = crate::common::network::study_area_for_bus(
+                                network,
+                                &problem_spec,
+                                bus_number,
+                            );
+                            fallback_area.unwrap_or(0) == requirement.zone_id
+                        }
+                    }
+                };
+                let key = format!("{}:{}", requirement.zone_id, requirement.product_id);
+                let shortfall = period
+                    .zonal_reserve_shortfall
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(0.0);
+                RawReservePeriodResult {
+                    product_id: requirement.product_id.clone(),
+                    scope: keyed::ReserveScope::Zone,
+                    zone_id: Some(requirement.zone_id),
+                    requirement_mw: zonal_balance_requirement_mw_for_period(
+                        &requirement.product_id,
+                        requirement.zone_id,
+                        t,
+                        period,
+                        network,
+                        &problem_spec,
+                        &active_dispatchable_loads,
+                        &in_service_gen_bus_numbers,
+                        &reserve_products_by_id,
+                        &zonal_participant_sets,
+                    ),
+                    provided_mw: reserve_balance_product_ids(
+                        requirement.product_id.as_str(),
+                        &reserve_products_by_id,
+                    )
+                    .into_iter()
+                    .map(|balance_product_id| {
+                        let gen_mw: f64 = period
+                            .reserve_awards
+                            .get(balance_product_id)
+                            .map(|awards| {
+                                awards
+                                    .iter()
+                                    .enumerate()
+                                    .filter_map(|(j, award)| bus_matches_gen(j).then_some(*award))
+                                    .sum()
+                            })
+                            .unwrap_or(0.0);
+                        let dl_mw: f64 = period
+                            .dr_reserve_awards
+                            .get(balance_product_id)
+                            .map(|awards| {
+                                awards
+                                    .iter()
+                                    .enumerate()
+                                    .filter_map(|(k, award)| {
+                                        active_dispatchable_loads
+                                            .get(k)
+                                            .filter(|(_, dl)| bus_matches_dl_bus(dl.bus))
+                                            .map(|_| *award)
+                                    })
+                                    .sum()
+                            })
+                            .unwrap_or(0.0);
+                        gen_mw + dl_mw
+                    })
+                    .sum::<f64>(),
+                    shortfall_mw: shortfall,
+                    clearing_price: period
+                        .zonal_reserve_prices
                         .get(&key)
                         .copied()
-                        .unwrap_or(0.0);
-                    RawReservePeriodResult {
-                        product_id: requirement.product_id.clone(),
-                        scope: keyed::ReserveScope::Zone,
-                        zone_id: Some(requirement.zone_id),
-                        requirement_mw: zonal_balance_requirement_mw_for_period(
-                            &requirement.product_id,
-                            requirement.zone_id,
-                            t,
-                            period,
-                            network,
-                            &problem_spec,
-                            &active_dispatchable_loads,
-                            &in_service_gen_bus_numbers,
-                            &reserve_products_by_id,
-                        ),
-                        provided_mw: reserve_balance_product_ids(
-                            requirement.product_id.as_str(),
-                            &reserve_products_by_id,
-                        )
-                        .into_iter()
-                        .map(|balance_product_id| {
-                            let gen_mw: f64 = period
-                                .reserve_awards
-                                .get(balance_product_id)
-                                .map(|awards| {
-                                    awards
-                                        .iter()
-                                        .enumerate()
-                                        .filter_map(|(j, award)| {
-                                            crate::common::network::zonal_participant_bus_matches(
-                                                requirement.zone_id,
-                                                requirement
-                                                    .participant_bus_numbers
-                                                    .as_deref(),
-                                                in_service_gen_bus_numbers
-                                                    .get(j)
-                                                    .copied()
-                                                    .unwrap_or_default(),
-                                                normalized.input.generator_area.get(j).copied(),
-                                            )
-                                            .then_some(*award)
-                                        })
-                                        .sum()
-                                })
-                                .unwrap_or(0.0);
-                            let dl_mw: f64 = period
-                                .dr_reserve_awards
-                                .get(balance_product_id)
-                                .map(|awards| {
-                                    awards
-                                        .iter()
-                                        .enumerate()
-                                        .filter_map(|(k, award)| {
-                                            active_dispatchable_loads
-                                                .get(k)
-                                                .filter(|(_, dl)| {
-                                                    crate::common::network::zonal_requirement_matches_bus(
-                                                        network,
-                                                        &problem_spec,
-                                                        requirement,
-                                                        dl.bus,
-                                                    )
-                                                })
-                                                .map(|_| *award)
-                                        })
-                                        .sum()
-                                })
-                                .unwrap_or(0.0);
-                            gen_mw + dl_mw
-                        })
-                        .sum::<f64>(),
-                        shortfall_mw: shortfall,
-                        clearing_price: period
-                            .zonal_reserve_prices
-                            .get(&key)
-                            .copied()
-                            .unwrap_or(0.0),
-                        shortfall_cost: shortfall
-                            * reserve_products_by_id
-                                .get(requirement.product_id.as_str())
-                                .map(|p| p.demand_curve.marginal_cost_at(0.0))
-                                .unwrap_or(0.0)
-                            * dt_h,
-                    }
-                });
-        let reserve_results: Vec<RawReservePeriodResult> = reserve_results_system
-            .chain(reserve_results_zonal)
-            .collect();
+                        .unwrap_or(0.0),
+                    shortfall_cost: shortfall
+                        * reserve_products_by_id
+                            .get(requirement.product_id.as_str())
+                            .map(|p| p.demand_curve.marginal_cost_at(0.0))
+                            .unwrap_or(0.0)
+                        * dt_h,
+                }
+            });
+        let reserve_results: Vec<RawReservePeriodResult> = {
+            let _t0 = std::time::Instant::now();
+            let sys: Vec<RawReservePeriodResult> = reserve_results_system.collect();
+            akpv_reserve_system_secs += _t0.elapsed().as_secs_f64();
+            let _t1 = std::time::Instant::now();
+            let zonal: Vec<RawReservePeriodResult> = reserve_results_zonal.collect();
+            akpv_reserve_zonal_secs += _t1.elapsed().as_secs_f64();
+            sys.into_iter().chain(zonal).collect()
+        };
+        akpv_reserve_build_secs += _akpv_reserve_build_t0.elapsed().as_secs_f64();
 
+        let _akpv_post_reserve_t0 = std::time::Instant::now();
         let mut constraint_results = std::mem::take(&mut period.constraint_results);
         for reserve in &reserve_results {
             if reserve.requirement_mw.abs() < 1e-9
@@ -1909,20 +2008,11 @@ fn attach_keyed_period_views(
                     .map(|rate| reserve.shortfall_mw * rate * dt_h),
             });
         }
+        let _akpv_branch_t0 = std::time::Instant::now();
         for (idx, price) in period.branch_shadow_prices.iter().copied().enumerate() {
-            let constraint_id = network
-                .branches
-                .iter()
-                .filter(|branch| {
-                    branch.in_service && branch.rating_a_mva >= normalized.input.min_rate_a
-                })
-                .nth(idx)
-                .map(|branch| {
-                    format!(
-                        "branch:{}:{}:{}",
-                        branch.from_bus, branch.to_bus, branch.circuit
-                    )
-                })
+            let constraint_id = branch_constraint_ids
+                .get(idx)
+                .cloned()
                 .unwrap_or_else(|| format!("branch:{idx}"));
             constraint_results.push(RawConstraintPeriodResult {
                 constraint_id,
@@ -1932,13 +2022,13 @@ fn attach_keyed_period_views(
                 ..Default::default()
             });
         }
+        akpv_branch_secs += _akpv_branch_t0.elapsed().as_secs_f64();
+
+        let _akpv_flowgate_t0 = std::time::Instant::now();
         for (idx, price) in period.flowgate_shadow_prices.iter().copied().enumerate() {
-            let constraint_id = network
-                .flowgates
-                .iter()
-                .filter(|fg| fg.in_service && fg.contingency_branch.is_none())
-                .nth(idx)
-                .map(|fg| fg.name.clone())
+            let constraint_id = flowgate_constraint_ids
+                .get(idx)
+                .cloned()
                 .unwrap_or_else(|| format!("flowgate:{idx}"));
             constraint_results.push(RawConstraintPeriodResult {
                 constraint_id,
@@ -1948,6 +2038,7 @@ fn attach_keyed_period_views(
                 ..Default::default()
             });
         }
+        akpv_flowgate_secs += _akpv_flowgate_t0.elapsed().as_secs_f64();
         for (idx, price) in period.interface_shadow_prices.iter().copied().enumerate() {
             let constraint_id = network
                 .interfaces
@@ -2204,6 +2295,7 @@ fn attach_keyed_period_views(
             by_resource_t: emissions_by_resource,
         });
         period.frequency_results = frequency_results;
+        akpv_post_reserve_secs += _akpv_post_reserve_t0.elapsed().as_secs_f64();
     }
 
     result.commitment = Some(
@@ -2251,6 +2343,24 @@ fn attach_keyed_period_views(
         ac_opf_stats: result.diagnostics.ac_opf_stats.clone(),
         commitment_mip_trace: result.diagnostics.commitment_mip_trace.clone(),
     };
+    info!(
+        stage = "attach_keyed_period_views.sub_phases",
+        gen_loop_secs = akpv_gen_secs,
+        dl_loop_secs = akpv_dl_secs,
+        bus_hvdc_bus_results_secs = akpv_reserve_secs,
+        frequency_secs = akpv_interface_secs,
+        reserve_build_secs = akpv_reserve_build_secs,
+        reserve_system_secs = akpv_reserve_system_secs,
+        reserve_zonal_secs = akpv_reserve_zonal_secs,
+        post_reserve_secs = akpv_post_reserve_secs,
+        branch_constraint_id_secs = akpv_branch_secs,
+        flowgate_constraint_id_secs = akpv_flowgate_secs,
+        n_branch_constraint_ids = branch_constraint_ids.len(),
+        n_flowgate_constraint_ids = flowgate_constraint_ids.len(),
+        n_zonal_reserve_reqs = normalized.input.zonal_reserve_requirements.len(),
+        n_system_reserve_reqs = normalized.input.system_reserve_requirements.len(),
+        "attach_keyed_period_views sub-phase timings"
+    );
 }
 
 fn infer_resource_kind(
@@ -6452,6 +6562,9 @@ mod tests {
                 ac_target_tracking: input.ac_target_tracking.clone(),
                 sced_ac_benders: input.sced_ac_benders.clone(),
                 capture_model_diagnostics: false,
+                scuc_firm_bus_balance_slacks: false,
+                scuc_firm_branch_thermal_slacks: false,
+                scuc_disable_bus_power_balance: false,
                 ac_sced_period_concurrency: None,
             },
         }

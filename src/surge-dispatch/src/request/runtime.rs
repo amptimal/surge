@@ -344,6 +344,41 @@ pub struct DispatchRuntime {
     /// Cost: a single scan over the primal/dual vectors (negligible vs solve time).
     #[serde(default)]
     pub capture_model_diagnostics: bool,
+    /// Diagnostic knob: when `true`, pin every per-bus power-balance slack
+    /// column (`pb_curtailment_bus`, `pb_excess_bus`, `pb_curtailment_seg`,
+    /// `pb_excess_seg`) to `col_upper = 0`, making the DC SCUC bus-balance
+    /// rows firm. Useful for measuring the LP weight of the soft-balance
+    /// slack family on large scenarios. Off by default — production solves
+    /// need slacks so infeasible inputs still produce a solve rather than
+    /// an infeasibility status.
+    #[serde(default)]
+    pub scuc_firm_bus_balance_slacks: bool,
+    /// Diagnostic knob: when `true`, pin every branch thermal slack column
+    /// (`branch_lower_slack`, `branch_upper_slack`) to `col_upper = 0`,
+    /// making the SCUC branch thermal rows firm. Different from
+    /// [`crate::request::ThermalLimitPolicy::enforce`] = `false`, which
+    /// skips the thermal rows entirely; this preserves the rows but
+    /// removes the slack escape hatch. Off by default.
+    #[serde(default)]
+    pub scuc_firm_branch_thermal_slacks: bool,
+    /// When `true`, drop the SCUC per-bus power-balance row family and
+    /// the associated `pb_curtailment_bus` / `pb_excess_bus` /
+    /// `pb_curtailment_seg` / `pb_excess_seg` column blocks from the
+    /// layout entirely, replacing them with a single system-wide
+    /// balance row per period. The `theta` and per-branch thermal rows
+    /// remain allocated but become vestigial (no KCL couples them to
+    /// `pg`), so this flag effectively produces a copperplate SCUC
+    /// with soft reserves and all intertemporal logic intact.
+    ///
+    /// Motivation: on stressed large networks (6049-bus D1 and above)
+    /// the per-bus balance + pb-slack families dominate the MIP's LP
+    /// relaxation time and leave Gurobi trapped with dummy objectives.
+    /// Enabling this knob lets the commitment search converge against
+    /// a trivial transportation model; the AC SCED stage still
+    /// enforces full nodal physics afterwards when it runs. Off by
+    /// default — production solves keep per-bus balance.
+    #[serde(default)]
+    pub scuc_disable_bus_power_balance: bool,
     /// Per-period AC SCED concurrency.
     ///
     /// * `None` (default) — sequential per-period AC SCED. Each period
@@ -381,6 +416,9 @@ impl Default for DispatchRuntime {
             ac_target_tracking: AcDispatchTargetTracking::default(),
             sced_ac_benders: ScedAcBendersRuntime::default(),
             capture_model_diagnostics: false,
+            scuc_firm_bus_balance_slacks: false,
+            scuc_firm_branch_thermal_slacks: false,
+            scuc_disable_bus_power_balance: false,
             ac_sced_period_concurrency: None,
         }
     }

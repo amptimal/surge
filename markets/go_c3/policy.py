@@ -95,6 +95,40 @@ class GoC3Policy:
     # GO C3 default of 1 refinement pass.
     scuc_loss_factor_max_iterations: int | None = 0
     disable_flowgates: bool = False
+    # Diagnostic: pin every per-bus power-balance slack column in SCUC
+    # to 0 (firm bus balance). Measures LP weight of the soft-balance
+    # slack family. Off by default.
+    scuc_firm_bus_balance_slacks: bool = False
+    # Diagnostic: pin every branch thermal slack column in SCUC to 0
+    # (firm thermal). Preserves the rows but removes the slack escape
+    # hatch. Off by default.
+    scuc_firm_branch_thermal_slacks: bool = False
+    # Diagnostic: drop SCUC branch thermal enforcement entirely (skips
+    # the row family). Off by default.
+    disable_scuc_thermal_limits: bool = False
+    # Diagnostic: zero out power-balance slack penalty so per-bus
+    # balance is free. Combined with disable_scuc_thermal_limits this
+    # decouples the network entirely — tests whether UC + reserves
+    # alone is solvable. Off by default.
+    scuc_copperplate: bool = False
+    # Scales the SCUC power-balance penalty (both curtailment and
+    # excess segments). Default 1.0 preserves the $1e7/MW curt, $1e5/MW
+    # excess ship penalty. Lower values (0.01 / 0.1) make bus slack
+    # cheaper — useful on stressed networks where integer commitment
+    # forces bus slack usage that the $1e7 penalty blows up into dummy
+    # objective values. 0.0 is equivalent to scuc_copperplate.
+    scuc_power_balance_penalty_multiplier: float = 1.0
+
+    # When True, drop the SCUC per-bus power-balance row family and its
+    # pb_* slack columns from the LP entirely, replacing them with a
+    # single system-balance row per period. theta / thermal rows stay
+    # but become vestigial (no KCL couples them to pg). DC branch losses
+    # are held at the system level via the loss warm-start rate × total
+    # period load. The security loop re-solves theta via DC PF before
+    # screening so N-1 cuts chase real overloads rather than phantom
+    # ones. Default True — speeds up large-network SCUC 10-30x at the
+    # cost of relying on security cuts + AC SCED for nodal physics.
+    scuc_disable_bus_power_balance: bool = True
 
     # ── runtime
     ac_sced_period_concurrency: int | None = 2

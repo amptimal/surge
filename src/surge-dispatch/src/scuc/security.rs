@@ -258,13 +258,26 @@ pub(crate) fn solve_security_dispatch(
         ));
     }
 
+    let _t_hourly_nets = std::time::Instant::now();
     let hourly_networks: Vec<Network> = (0..n_periods)
         .map(|hour| super::snapshot::network_at_hour_with_spec(network, &scuc_spec, hour))
         .collect();
+    let hourly_networks_secs = _t_hourly_nets.elapsed().as_secs_f64();
+
+    let _t_hourly_ctx = std::time::Instant::now();
     let hourly_contexts: Vec<HourlySecurityContext> = hourly_networks
         .iter()
         .map(|hourly_network| build_hourly_security_context(hourly_network, options, min_rate))
         .collect::<Result<_, _>>()?;
+    let hourly_contexts_secs = _t_hourly_ctx.elapsed().as_secs_f64();
+    info!(
+        stage = "security_setup",
+        hourly_networks_secs,
+        hourly_contexts_secs,
+        n_periods,
+        n_contingency_branches = options.contingency_branches.len(),
+        "Security SCUC setup: hourly network snapshots + contingency contexts built"
+    );
 
     let mut constrained_pairs: HashSet<(usize, usize, usize)> = HashSet::new();
     let mut hvdc_constrained_pairs: HashSet<(usize, usize, usize)> = HashSet::new();
@@ -349,7 +362,13 @@ pub(crate) fn solve_security_dispatch(
     // Falls through gracefully to `None` if the compute fails; the
     // security loop then falls back to lossless-MIP + refinement-LP as
     // before.
+    // The cold-start warm-start pre-adjusts the per-bus balance row RHS
+    // with an estimate of `dloss_dp`. When bus balance rows don't exist
+    // (disable knob), the warm-start has nowhere to land — skip it.
+    // System-level expected loss is handled directly in
+    // `build_system_power_balance_row`'s RHS instead.
     if scuc_spec.use_loss_factors
+        && !scuc_spec.scuc_disable_bus_power_balance
         && n_bus > 1
         && !matches!(
             scuc_spec.loss_factor_warm_start_mode,
@@ -380,8 +399,10 @@ pub(crate) fn solve_security_dispatch(
     for iter in 0..options.max_iterations {
         let iter_start = std::time::Instant::now();
         // Build network with accumulated security flowgates
+        let _t_net_clone = std::time::Instant::now();
         let mut net = network.clone();
         net.flowgates.extend(security_flowgates.iter().cloned());
+        let net_clone_secs = _t_net_clone.elapsed().as_secs_f64();
 
         // Build a per-iter CommitmentMode carrying the prior iter's
         // commitment as `warm_start_commitment`. For iter 0 we reuse
@@ -487,6 +508,22 @@ pub(crate) fn solve_security_dispatch(
         }
         let inner_solve_secs = iter_start.elapsed().as_secs_f64();
 
+        // With per-bus balance disabled, the MIP's theta is unbound by
+        // KCL and meaningless as a flow proxy. Re-solve a DC PF per
+        // period with injections matching the SCUC dispatch so the
+        // screen below sees physical angles. Sub-second on 6049-bus.
+        let mut sol = sol;
+        if scuc_spec.scuc_disable_bus_power_balance {
+            let t0 = std::time::Instant::now();
+            repair_theta_from_dc_pf(&mut sol, &hourly_networks, &scuc_spec)?;
+            info!(
+                stage = "security.repair_theta_from_dc_pf",
+                secs = t0.elapsed().as_secs_f64(),
+                n_periods = sol.bus_angles_rad.len(),
+                "Security SCUC: rebuilt theta via DC PF (disable_bus_power_balance mode)"
+            );
+        }
+
         // Check N-1 violations across all periods
         let mut violations: Vec<BranchSecurityViolation> = Vec::new();
         let mut hvdc_violations: Vec<HvdcSecurityCut> = Vec::new();
@@ -537,6 +574,10 @@ pub(crate) fn solve_security_dispatch(
         });
 
         let screen_secs = iter_start.elapsed().as_secs_f64() - inner_solve_secs;
+        info!(
+            iter,
+            net_clone_secs, inner_solve_secs, screen_secs, "Security SCUC iter breakdown"
+        );
 
         if violations.is_empty() && hvdc_violations.is_empty() {
             info!(
@@ -563,6 +604,7 @@ pub(crate) fn solve_security_dispatch(
             ));
         }
 
+        let _t_cut_build = std::time::Instant::now();
         // Sort by severity (worst first) and take top max_cuts_per_iteration unique pairs
         violations.sort_by(|a, b| {
             b.severity_pu
@@ -661,6 +703,7 @@ pub(crate) fn solve_security_dispatch(
             total_cuts,
             inner_solve_secs,
             screen_secs,
+            cut_build_secs = _t_cut_build.elapsed().as_secs_f64(),
             "Security SCUC: added cuts, re-solving"
         );
 
@@ -1256,6 +1299,91 @@ fn build_hourly_security_context(
         connectivity_contingency_branches,
         hvdc_contingencies,
     })
+}
+
+/// Recompute per-period bus angles by solving a DC power flow whose
+/// bus injections match the SCUC dispatch. Used only on the
+/// `scuc_disable_bus_power_balance` path: without per-bus KCL rows, the
+/// LP's theta is vestigial (unconstrained by generation pattern), so
+/// the angles returned from the MIP have no physical meaning and the
+/// security screen — which computes pre/post-contingency flows via
+/// `b·Δθ` and LODFs — would enumerate phantom violations.
+///
+/// The repair clones each hourly network, overwrites in-service
+/// generator `p_mw` with the solved `pg_mw`, and adds
+/// `external_p_injections_mw` deltas for DL served MW and HVDC
+/// dispatch (not native to the base network). Running `surge_dc`'s
+/// DC power flow under the classical single-bus slack convention
+/// gives valid theta per period that respects the SCUC commitment.
+///
+/// No-op when `spec.scuc_disable_bus_power_balance` is false — the
+/// default bus-balanced SCUC already produces physical theta from
+/// its own per-bus KCL rows.
+fn repair_theta_from_dc_pf(
+    sol: &mut RawDispatchSolution,
+    hourly_networks: &[Network],
+    spec: &DispatchProblemSpec<'_>,
+) -> Result<(), ScedError> {
+    use std::collections::HashMap as StdHashMap;
+
+    for (t, period) in sol.periods.iter().enumerate() {
+        if sol.bus_angles_rad.get(t).is_none() {
+            continue;
+        }
+        let hourly_network = match hourly_networks.get(t) {
+            Some(n) => n,
+            None => continue,
+        };
+        let base_mva = hourly_network.base_mva;
+
+        // Clone and override in-service generators' dispatch from the
+        // SCUC solution. `pg_mw` is one per in-service generator in the
+        // same iteration order, which matches the ordering the layout
+        // and extract paths use.
+        let mut net = hourly_network.clone();
+        let mut pg_iter = period.pg_mw.iter();
+        for g in net.generators.iter_mut() {
+            if g.in_service {
+                if let Some(&pg) = pg_iter.next() {
+                    g.p = pg;
+                }
+            }
+        }
+
+        // External injections = deltas not carried by base-network
+        // state (DL served beyond any fixed-load portion already in
+        // `net.loads`, HVDC dispatch since GO C3 links live in
+        // `spec.hvdc_links` rather than `net.hvdc`).
+        let mut ext: StdHashMap<u32, f64> = StdHashMap::new();
+        for ld in &period.dr_results.loads {
+            // DL served is a withdrawal: negative injection in MW.
+            *ext.entry(ld.bus).or_insert(0.0) -= ld.p_served_pu * base_mva;
+        }
+        for (k, hvdc) in spec.hvdc_links.iter().enumerate() {
+            let p_mw = period.hvdc_dispatch_mw.get(k).copied().unwrap_or(0.0);
+            if p_mw.abs() > 1e-12 {
+                *ext.entry(hvdc.from_bus).or_insert(0.0) += p_mw;
+                *ext.entry(hvdc.to_bus).or_insert(0.0) -= p_mw * (1.0 - hvdc.loss_b_frac);
+            }
+        }
+        let external: Vec<(u32, f64)> = ext.into_iter().collect();
+
+        let opts = surge_dc::DcPfOptions {
+            external_p_injections_mw: external,
+            ..Default::default()
+        };
+        match surge_dc::solve_dc_opts(&net, &opts) {
+            Ok(pf) => {
+                if pf.theta.len() == sol.bus_angles_rad[t].len() {
+                    sol.bus_angles_rad[t] = pf.theta;
+                }
+            }
+            Err(e) => {
+                warn!(period = t, error = %e, "DC PF theta repair failed; keeping vestigial angles");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn screen_branch_violations(

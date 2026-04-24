@@ -192,12 +192,30 @@ fn apply_fixed_commitment_pricing_transform(
     enforce_shutdown_deloading: bool,
     offline_commitment_trajectories: bool,
 ) {
+    let skip_bus_pb = spec.scuc_disable_bus_power_balance;
     for t in 0..n_hours {
-        for bus_idx in 0..n_bus {
-            for col in [
-                layout.pb_curtailment_bus_col(t, bus_idx),
-                layout.pb_excess_bus_col(t, bus_idx),
-            ] {
+        if !skip_bus_pb {
+            for bus_idx in 0..n_bus {
+                for col in [
+                    layout.pb_curtailment_bus_col(t, bus_idx),
+                    layout.pb_excess_bus_col(t, bus_idx),
+                ] {
+                    if primary_state
+                        .solution
+                        .x
+                        .get(col)
+                        .copied()
+                        .unwrap_or(0.0)
+                        .abs()
+                        <= 1e-9
+                    {
+                        lp_prob.col_lower[col] = 0.0;
+                        lp_prob.col_upper[col] = 0.0;
+                    }
+                }
+            }
+            for seg_idx in 0..n_pb_curt_segs {
+                let col = layout.pb_curtailment_seg_col(t, seg_idx);
                 if primary_state
                     .solution
                     .x
@@ -211,35 +229,20 @@ fn apply_fixed_commitment_pricing_transform(
                     lp_prob.col_upper[col] = 0.0;
                 }
             }
-        }
-        for seg_idx in 0..n_pb_curt_segs {
-            let col = layout.pb_curtailment_seg_col(t, seg_idx);
-            if primary_state
-                .solution
-                .x
-                .get(col)
-                .copied()
-                .unwrap_or(0.0)
-                .abs()
-                <= 1e-9
-            {
-                lp_prob.col_lower[col] = 0.0;
-                lp_prob.col_upper[col] = 0.0;
-            }
-        }
-        for seg_idx in 0..n_pb_excess_segs {
-            let col = layout.pb_excess_seg_col(t, seg_idx);
-            if primary_state
-                .solution
-                .x
-                .get(col)
-                .copied()
-                .unwrap_or(0.0)
-                .abs()
-                <= 1e-9
-            {
-                lp_prob.col_lower[col] = 0.0;
-                lp_prob.col_upper[col] = 0.0;
+            for seg_idx in 0..n_pb_excess_segs {
+                let col = layout.pb_excess_seg_col(t, seg_idx);
+                if primary_state
+                    .solution
+                    .x
+                    .get(col)
+                    .copied()
+                    .unwrap_or(0.0)
+                    .abs()
+                    <= 1e-9
+                {
+                    lp_prob.col_lower[col] = 0.0;
+                    lp_prob.col_upper[col] = 0.0;
+                }
             }
         }
 
@@ -904,37 +907,52 @@ pub(super) fn run_pricing(input: PricingRunInput<'_>) -> Result<PricingRunState<
     // inherits the SCUC commitment, so the initial coefficients are
     // already close to the converged loss-adjusted state via the
     // prior SCUC iteration's outputs.
+    //
+    // Skipped entirely when per-bus balance is disabled — loss
+    // factors require the per-bus KCL rows to read and adjust.
     let n_flow_pricing = primary_state.problem.n_branch_flow
         + primary_state.problem.n_fg_rows
         + network_plan.iface_rows.len();
-    let pricing_prep = crate::scuc::losses::build_loss_factor_prep(
-        &lp_prob,
-        &model_plan.hourly_networks,
-        &solve.bus_map,
-        layout,
-        &setup.gen_bus_idx,
-        &primary_state.problem.hour_row_bases,
-        n_flow_pricing,
-        n_bus,
-    )?;
-    let loss_result = iterate_loss_factors(
-        ScucLossIterationInput {
-            solver,
-            spec,
-            hourly_networks: &model_plan.hourly_networks,
-            bus_map: &solve.bus_map,
+    let dloss_dp_out: Vec<Vec<f64>>;
+    if spec.scuc_disable_bus_power_balance {
+        // Per-bus balance is disabled, so loss-factor refinement
+        // (which rewrites per-bus pg coefficients and bus-balance
+        // RHS) is not applicable. Solve the pricing LP once with the
+        // system-level expected loss already baked into the RHS by
+        // `build_system_power_balance_row`.
+        lp_sol = crate::common::dc::solve_sparse_problem(solver, &lp_prob, spec.tolerance, None)?;
+        dloss_dp_out = vec![vec![0.0_f64; n_bus]; n_hours];
+    } else {
+        let pricing_prep = crate::scuc::losses::build_loss_factor_prep(
+            &lp_prob,
+            &model_plan.hourly_networks,
+            &solve.bus_map,
             layout,
-            gen_bus_idx: &setup.gen_bus_idx,
-            hour_row_bases: &primary_state.problem.hour_row_bases,
-            n_flow: n_flow_pricing,
+            &setup.gen_bus_idx,
+            &primary_state.problem.hour_row_bases,
+            n_flow_pricing,
             n_bus,
-            time_limit_secs: None,
-            problem: &mut lp_prob,
-            solution: &mut lp_sol,
-        },
-        &pricing_prep,
-        None,
-    )?;
+        )?;
+        let loss_result = iterate_loss_factors(
+            ScucLossIterationInput {
+                solver,
+                spec,
+                hourly_networks: &model_plan.hourly_networks,
+                bus_map: &solve.bus_map,
+                layout,
+                gen_bus_idx: &setup.gen_bus_idx,
+                hour_row_bases: &primary_state.problem.hour_row_bases,
+                n_flow: n_flow_pricing,
+                n_bus,
+                time_limit_secs: None,
+                problem: &mut lp_prob,
+                solution: &mut lp_sol,
+            },
+            &pricing_prep,
+            None,
+        )?;
+        dloss_dp_out = loss_result.dloss_dp;
+    }
 
     if let Some(path) = std::env::var_os("SURGE_DEBUG_DUMP_SCUC_PRICING_DUALS") {
         let path = Path::new(&path);
@@ -1079,7 +1097,7 @@ pub(super) fn run_pricing(input: PricingRunInput<'_>) -> Result<PricingRunState<
         &mut summary.hourly_reserve_results,
         &primary_hourly_reserve_results,
     );
-    summary.dloss_dp_out = loss_result.dloss_dp;
+    summary.dloss_dp_out = dloss_dp_out;
 
     Ok(PricingRunState {
         primary_state,

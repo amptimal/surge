@@ -140,6 +140,9 @@ pub(crate) fn build_input(
         ac_relax_committed_pmin_to_zero: request.runtime.ac_relax_committed_pmin_to_zero,
         lp_solver: solve_options.lp_solver.clone(),
         capture_model_diagnostics: request.runtime.capture_model_diagnostics,
+        scuc_firm_bus_balance_slacks: request.runtime.scuc_firm_bus_balance_slacks,
+        scuc_firm_branch_thermal_slacks: request.runtime.scuc_firm_branch_thermal_slacks,
+        scuc_disable_bus_power_balance: request.runtime.scuc_disable_bus_power_balance,
         ac_sced_period_concurrency: request.runtime.ac_sced_period_concurrency,
     };
 

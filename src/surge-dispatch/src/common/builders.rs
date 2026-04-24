@@ -717,6 +717,190 @@ pub(crate) fn build_power_balance_rows(
     block
 }
 
+/// Build a single system-wide power-balance row (`Σ injections = Σ load`)
+/// used by the SCUC disable-bus-power-balance mode. The emitted row
+/// contains the same triplets as [`build_power_balance_rows`] would —
+/// generator `pg`, storage charge/discharge, HVDC bands, dispatchable
+/// loads, virtual bids, and caller-supplied extra terms — but every
+/// triplet is anchored on `row_base` instead of `row_base + bus_idx`,
+/// which collapses KCL to a single equation. Branch `b·Δθ` and
+/// switchable `pf_l` injections are deliberately omitted: summed
+/// across all buses the branch contributions telescope to zero, so
+/// including them would be wasted triplets. The `pb_*` slack extra
+/// terms are not emitted by the caller because the skip path drops
+/// those columns entirely.
+///
+/// Row bound RHS is `- Σ_b (Pd_b + Gs_b + pbusinj_b + hvdc_loss_a_b)`
+/// — the sum of the per-bus RHS values.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_system_power_balance_row(
+    network: &Network,
+    setup: &DispatchSetup,
+    gen_indices: &[usize],
+    gen_bus_idx: &[usize],
+    spec: &DispatchProblemSpec<'_>,
+    bus_map: &HashMap<u32, usize>,
+    col_base: usize,
+    row: usize,
+    pbusinj: &[f64],
+    hvdc_loss_a_bus: &[f64],
+    hvdc_from_idx: &[Option<usize>],
+    hvdc_to_idx: &[Option<usize>],
+    hvdc_band_offsets: &[usize],
+    dl_list: &[&surge_network::market::DispatchableLoad],
+    active_vbids: &[usize],
+    extra_terms: &[PowerBalanceExtraTerm],
+    pg_off: usize,
+    sto_ch_off: usize,
+    sto_dis_off: usize,
+    hvdc_off: usize,
+    dl_off: usize,
+    vbid_off: usize,
+    storage_in_pu: bool,
+    base: f64,
+    // `expected_loss_pu` is the per-period system-wide expected loss
+    // in per-unit power. It is subtracted from the row RHS so the
+    // balance reads `Σ pg = Σ load + Σ expected_loss` in aggregate.
+    // Zero keeps the row lossless (equivalent to the `mult=0`
+    // copperplate LP).
+    expected_loss_pu: f64,
+) -> LpBlock {
+    let n_bus = network.n_buses();
+    let n_storage = setup.n_storage;
+    let has_hvdc = !spec.hvdc_links.is_empty();
+    let n_hvdc_terms: usize = spec.hvdc_links.iter().map(|hvdc| 2 * hvdc.n_vars()).sum();
+
+    let mut block = LpBlock {
+        triplets: Vec::with_capacity(
+            gen_indices.len()
+                + 2 * n_storage
+                + n_hvdc_terms
+                + dl_list.len()
+                + active_vbids.len()
+                + extra_terms.len(),
+        ),
+        row_lower: vec![0.0; 1],
+        row_upper: vec![0.0; 1],
+    };
+
+    // Non-storage generators: `-pg_k` on the system row (injection).
+    for (j, &_bus_idx) in gen_bus_idx.iter().enumerate() {
+        if network.generators[gen_indices[j]].is_storage() {
+            continue;
+        }
+        block.triplets.push(Triplet {
+            row,
+            col: col_base + pg_off + j,
+            val: -1.0,
+        });
+    }
+
+    if n_storage > 0 {
+        let sto_scale = if storage_in_pu { 1.0 } else { 1.0 / base };
+        for &(s, _, _gi) in &setup.storage_gen_local {
+            block.triplets.push(Triplet {
+                row,
+                col: col_base + sto_dis_off + s,
+                val: -sto_scale,
+            });
+            block.triplets.push(Triplet {
+                row,
+                col: col_base + sto_ch_off + s,
+                val: sto_scale,
+            });
+        }
+    }
+
+    // HVDC: from-bus +band, to-bus -(1-loss)·band. The two endpoints
+    // collapse into a single row, leaving the band's loss term as the
+    // net contribution to system balance.
+    if has_hvdc {
+        for (k, hvdc) in spec.hvdc_links.iter().enumerate() {
+            if hvdc.is_banded() {
+                for (b, band) in hvdc.bands.iter().enumerate() {
+                    let col = col_base + hvdc_off + hvdc_band_offsets[k] + b;
+                    if hvdc_from_idx[k].is_some() {
+                        block.triplets.push(Triplet { row, col, val: 1.0 });
+                    }
+                    if hvdc_to_idx[k].is_some() {
+                        block.triplets.push(Triplet {
+                            row,
+                            col,
+                            val: -(1.0 - band.loss_b_frac),
+                        });
+                    }
+                }
+            } else {
+                let col = col_base + hvdc_off + hvdc_band_offsets[k];
+                if hvdc_from_idx[k].is_some() {
+                    block.triplets.push(Triplet { row, col, val: 1.0 });
+                }
+                if hvdc_to_idx[k].is_some() {
+                    block.triplets.push(Triplet {
+                        row,
+                        col,
+                        val: -(1.0 - hvdc.loss_b_frac),
+                    });
+                }
+            }
+        }
+    }
+
+    // DL served MW is a withdrawal, so +1 on the system row.
+    for (k, dl) in dl_list.iter().enumerate() {
+        if bus_map.contains_key(&dl.bus) {
+            block.triplets.push(Triplet {
+                row,
+                col: col_base + dl_off + k,
+                val: 1.0,
+            });
+        }
+    }
+
+    for (k, &bi) in active_vbids.iter().enumerate() {
+        let vb = &spec.virtual_bids[bi];
+        if bus_map.contains_key(&vb.bus) {
+            let coeff = match vb.direction {
+                surge_network::market::VirtualBidDirection::Inc => -1.0,
+                surge_network::market::VirtualBidDirection::Dec => 1.0,
+            };
+            block.triplets.push(Triplet {
+                row,
+                col: col_base + vbid_off + k,
+                val: coeff,
+            });
+        }
+    }
+
+    // Extra terms (e.g. DR rebound) — bus_idx is irrelevant on the
+    // system row; just take their column and coefficient.
+    for term in extra_terms {
+        block.triplets.push(Triplet {
+            row,
+            col: term.col,
+            val: term.coeff,
+        });
+    }
+
+    // System RHS = Σ_b per-bus RHS − expected_loss (loss is a
+    // withdrawal, so it reduces the generation-side RHS the same way
+    // load does). The row reads:
+    //   `Σ injections  =  − Σ load  − expected_loss`
+    // which rearranges to `Σ pg = Σ load + Σ expected_loss`.
+    let bus_pd_mw = network.bus_load_p_mw_with_map(bus_map);
+    let mut rhs = 0.0_f64;
+    for i in 0..n_bus {
+        let pd_pu = bus_pd_mw[i] / base;
+        let gs_pu = network.buses[i].shunt_conductance_mw / base;
+        rhs += -pd_pu - gs_pu - pbusinj[i] - hvdc_loss_a_bus[i];
+    }
+    rhs -= expected_loss_pu;
+    block.row_lower[0] = rhs;
+    block.row_upper[0] = rhs;
+
+    block
+}
+
 /// Shared DC network row family: thermal, flowgate, interface, and power balance.
 #[allow(clippy::too_many_arguments)]
 pub(crate) struct DcNetworkRowsInput<'a> {
@@ -763,6 +947,12 @@ pub(crate) struct DcNetworkRowsInput<'a> {
     /// switch to the `pf_l` formulation described on those functions;
     /// when `None`, they use the y-bus formulation.
     pub switching_pf_l_cols: Option<&'a [usize]>,
+    /// When `true`, skip emitting the per-bus power-balance row family
+    /// entirely. The caller is responsible for emitting a replacement
+    /// system-balance row if one is desired. Thermal, flowgate, and
+    /// interface rows are still emitted. Used by the SCUC disable-
+    /// bus-power-balance path.
+    pub skip_bus_balance: bool,
 }
 
 pub(crate) fn build_dc_network_rows(input: DcNetworkRowsInput<'_>) -> LpBlock {
@@ -826,38 +1016,40 @@ pub(crate) fn build_dc_network_rows(input: DcNetworkRowsInput<'_>) -> LpBlock {
         ),
     );
 
-    append_block(
-        &mut block,
-        build_power_balance_rows(
-            input.dispatch_network,
-            input.setup,
-            input.gen_indices,
-            input.gen_bus_idx,
-            input.spec,
-            input.bus_map,
-            input.col_base,
-            input.row_base + n_flow,
-            input.pbusinj,
-            input.hvdc_loss_a_bus,
-            input.hvdc_from_idx,
-            input.hvdc_to_idx,
-            input.hvdc_band_offsets,
-            input.dl_list,
-            input.active_vbids,
-            input.par_branch_set,
-            input.extra_terms,
-            input.theta_off,
-            input.pg_off,
-            input.sto_ch_off,
-            input.sto_dis_off,
-            input.hvdc_off,
-            input.dl_off,
-            input.vbid_off,
-            input.storage_in_pu,
-            input.base,
-            input.switching_pf_l_cols,
-        ),
-    );
+    if !input.skip_bus_balance {
+        append_block(
+            &mut block,
+            build_power_balance_rows(
+                input.dispatch_network,
+                input.setup,
+                input.gen_indices,
+                input.gen_bus_idx,
+                input.spec,
+                input.bus_map,
+                input.col_base,
+                input.row_base + n_flow,
+                input.pbusinj,
+                input.hvdc_loss_a_bus,
+                input.hvdc_from_idx,
+                input.hvdc_to_idx,
+                input.hvdc_band_offsets,
+                input.dl_list,
+                input.active_vbids,
+                input.par_branch_set,
+                input.extra_terms,
+                input.theta_off,
+                input.pg_off,
+                input.sto_ch_off,
+                input.sto_dis_off,
+                input.hvdc_off,
+                input.dl_off,
+                input.vbid_off,
+                input.storage_in_pu,
+                input.base,
+                input.switching_pf_l_cols,
+            ),
+        );
+    }
 
     block
 }

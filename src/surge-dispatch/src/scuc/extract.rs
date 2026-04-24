@@ -662,53 +662,55 @@ fn build_period_objective_terms(
         );
     }
 
-    for (seg_idx, _) in input
-        .spec
-        .power_balance_penalty
-        .curtailment
-        .iter()
-        .enumerate()
-    {
-        let col = input.layout.pb_curtailment_seg_col(t, seg_idx);
-        if col >= sol.x.len() || col >= input.col_cost.len() {
-            continue;
+    if !input.spec.scuc_disable_bus_power_balance {
+        for (seg_idx, _) in input
+            .spec
+            .power_balance_penalty
+            .curtailment
+            .iter()
+            .enumerate()
+        {
+            let col = input.layout.pb_curtailment_seg_col(t, seg_idx);
+            if col >= sol.x.len() || col >= input.col_cost.len() {
+                continue;
+            }
+            let mw = sol.x[col] * base;
+            push_term(
+                &mut terms,
+                make_term(
+                    format!("curtailment_segment_{seg_idx}"),
+                    ObjectiveBucket::Penalty,
+                    ObjectiveTermKind::PowerBalancePenalty,
+                    ObjectiveSubjectKind::System,
+                    SYSTEM_SUBJECT_ID,
+                    sol.x[col] * input.col_cost[col],
+                    Some(mw),
+                    Some(ObjectiveQuantityUnit::Mw),
+                    (dt_h > 0.0 && base > 0.0).then_some(input.col_cost[col] / (base * dt_h)),
+                ),
+            );
         }
-        let mw = sol.x[col] * base;
-        push_term(
-            &mut terms,
-            make_term(
-                format!("curtailment_segment_{seg_idx}"),
-                ObjectiveBucket::Penalty,
-                ObjectiveTermKind::PowerBalancePenalty,
-                ObjectiveSubjectKind::System,
-                SYSTEM_SUBJECT_ID,
-                sol.x[col] * input.col_cost[col],
-                Some(mw),
-                Some(ObjectiveQuantityUnit::Mw),
-                (dt_h > 0.0 && base > 0.0).then_some(input.col_cost[col] / (base * dt_h)),
-            ),
-        );
-    }
-    for (seg_idx, _) in input.spec.power_balance_penalty.excess.iter().enumerate() {
-        let col = input.layout.pb_excess_seg_col(t, seg_idx);
-        if col >= sol.x.len() || col >= input.col_cost.len() {
-            continue;
+        for (seg_idx, _) in input.spec.power_balance_penalty.excess.iter().enumerate() {
+            let col = input.layout.pb_excess_seg_col(t, seg_idx);
+            if col >= sol.x.len() || col >= input.col_cost.len() {
+                continue;
+            }
+            let mw = sol.x[col] * base;
+            push_term(
+                &mut terms,
+                make_term(
+                    format!("excess_segment_{seg_idx}"),
+                    ObjectiveBucket::Penalty,
+                    ObjectiveTermKind::PowerBalancePenalty,
+                    ObjectiveSubjectKind::System,
+                    SYSTEM_SUBJECT_ID,
+                    sol.x[col] * input.col_cost[col],
+                    Some(mw),
+                    Some(ObjectiveQuantityUnit::Mw),
+                    (dt_h > 0.0 && base > 0.0).then_some(input.col_cost[col] / (base * dt_h)),
+                ),
+            );
         }
-        let mw = sol.x[col] * base;
-        push_term(
-            &mut terms,
-            make_term(
-                format!("excess_segment_{seg_idx}"),
-                ObjectiveBucket::Penalty,
-                ObjectiveTermKind::PowerBalancePenalty,
-                ObjectiveSubjectKind::System,
-                SYSTEM_SUBJECT_ID,
-                sol.x[col] * input.col_cost[col],
-                Some(mw),
-                Some(ObjectiveQuantityUnit::Mw),
-                (dt_h > 0.0 && base > 0.0).then_some(input.col_cost[col] / (base * dt_h)),
-            ),
-        );
     }
 
     for (row_idx, &branch_idx) in input.constrained_branches.iter().enumerate() {
@@ -854,38 +856,45 @@ fn build_period_objective_terms(
         }
     }
 
-    for branch_local_idx in 0..input.network.branches.len() {
-        let branch = &input.network.branches[branch_local_idx];
-        let startup_col = input.layout.branch_startup_col(t, branch_local_idx);
-        let shutdown_col = input.layout.branch_shutdown_col(t, branch_local_idx);
-        push_term(
-            &mut terms,
-            make_term(
-                "branch_startup",
-                ObjectiveBucket::Other,
-                ObjectiveTermKind::BranchSwitchingStartup,
-                ObjectiveSubjectKind::Branch,
-                branch_subject_id(branch),
-                sol.x[startup_col] * input.col_cost[startup_col],
-                Some(sol.x[startup_col]),
-                Some(ObjectiveQuantityUnit::Event),
-                Some(input.col_cost[startup_col]),
-            ),
-        );
-        push_term(
-            &mut terms,
-            make_term(
-                "branch_shutdown",
-                ObjectiveBucket::Other,
-                ObjectiveTermKind::BranchSwitchingShutdown,
-                ObjectiveSubjectKind::Branch,
-                branch_subject_id(branch),
-                sol.x[shutdown_col] * input.col_cost[shutdown_col],
-                Some(sol.x[shutdown_col]),
-                Some(ObjectiveQuantityUnit::Event),
-                Some(input.col_cost[shutdown_col]),
-            ),
-        );
+    // Branch switching startup/shutdown events are only meaningful
+    // when the branch on/off binaries are part of the LP (SW1). In
+    // SW0 the binary columns aren't allocated and the branch state
+    // is fixed — no transition events can occur, so skip the term
+    // emission entirely.
+    if input.spec.allow_branch_switching {
+        for branch_local_idx in 0..input.network.branches.len() {
+            let branch = &input.network.branches[branch_local_idx];
+            let startup_col = input.layout.branch_startup_col(t, branch_local_idx);
+            let shutdown_col = input.layout.branch_shutdown_col(t, branch_local_idx);
+            push_term(
+                &mut terms,
+                make_term(
+                    "branch_startup",
+                    ObjectiveBucket::Other,
+                    ObjectiveTermKind::BranchSwitchingStartup,
+                    ObjectiveSubjectKind::Branch,
+                    branch_subject_id(branch),
+                    sol.x[startup_col] * input.col_cost[startup_col],
+                    Some(sol.x[startup_col]),
+                    Some(ObjectiveQuantityUnit::Event),
+                    Some(input.col_cost[startup_col]),
+                ),
+            );
+            push_term(
+                &mut terms,
+                make_term(
+                    "branch_shutdown",
+                    ObjectiveBucket::Other,
+                    ObjectiveTermKind::BranchSwitchingShutdown,
+                    ObjectiveSubjectKind::Branch,
+                    branch_subject_id(branch),
+                    sol.x[shutdown_col] * input.col_cost[shutdown_col],
+                    Some(sol.x[shutdown_col]),
+                    Some(ObjectiveQuantityUnit::Event),
+                    Some(input.col_cost[shutdown_col]),
+                ),
+            );
+        }
     }
 
     if t == 0 {
@@ -1243,14 +1252,24 @@ pub(super) fn build_period_results(input: PeriodAssemblyInput<'_>) -> PeriodAsse
             |off| input.layout.col(t, off),
         );
 
-        let pb_curtailment_by_bus_mw: Vec<f64> = (0..input.n_bus)
-            .map(|bus_idx| {
-                input.sol.x[input.layout.pb_curtailment_bus_col(t, bus_idx)] * input.base
-            })
-            .collect();
-        let pb_excess_by_bus_mw: Vec<f64> = (0..input.n_bus)
-            .map(|bus_idx| input.sol.x[input.layout.pb_excess_bus_col(t, bus_idx)] * input.base)
-            .collect();
+        let (pb_curtailment_by_bus_mw, pb_excess_by_bus_mw): (Vec<f64>, Vec<f64>) =
+            if input.spec.scuc_disable_bus_power_balance {
+                (vec![0.0; input.n_bus], vec![0.0; input.n_bus])
+            } else {
+                (
+                    (0..input.n_bus)
+                        .map(|bus_idx| {
+                            input.sol.x[input.layout.pb_curtailment_bus_col(t, bus_idx)]
+                                * input.base
+                        })
+                        .collect(),
+                    (0..input.n_bus)
+                        .map(|bus_idx| {
+                            input.sol.x[input.layout.pb_excess_bus_col(t, bus_idx)] * input.base
+                        })
+                        .collect(),
+                )
+            };
         let pb_curtailment_mw: f64 = pb_curtailment_by_bus_mw.iter().sum();
         let pb_excess_mw: f64 = pb_excess_by_bus_mw.iter().sum();
         if pb_curtailment_mw > 1e-4 {

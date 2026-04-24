@@ -133,6 +133,9 @@ pub(super) fn build_problem(input: ScedProblemBuildInput<'_>) -> ScedProblemBuil
         // SCED never enters switchable-branch mode: it reconciles a
         // fixed commitment the upstream SCUC has already decided.
         switching_pf_l_cols: None,
+        // SCED always keeps per-bus balance — AC SCED depends on
+        // the per-bus KCL rows that this builder emits.
+        skip_bus_balance: false,
     })
     .extend_into(&mut triplets, &mut row_lower, &mut row_upper);
 

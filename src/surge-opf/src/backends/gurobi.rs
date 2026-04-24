@@ -133,6 +133,7 @@ mod impl_ {
         // ── Parameter name strings (null-terminated byte literals) ────────────
         pub const PAR_OUTPUTFLAG: &[u8] = b"OutputFlag\0";
         pub const PAR_LOGTOCONSOLE: &[u8] = b"LogToConsole\0";
+        pub const PAR_LOGFILE: &[u8] = b"LogFile\0";
         pub const PAR_METHOD: &[u8] = b"Method\0";
         pub const PAR_FEASIBILITYTOL: &[u8] = b"FeasibilityTol\0";
         pub const PAR_OPTIMALITYTOL: &[u8] = b"OptimalityTol\0";

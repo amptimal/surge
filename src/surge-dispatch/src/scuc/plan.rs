@@ -164,6 +164,12 @@ pub(super) struct ScucColumnBuildInput<'spec, 'input> {
     pub n_bp: usize,
     pub n_sbp: usize,
     pub n_branch_flow: usize,
+    /// Map from LP thermal-row index to `network.branches` index.
+    /// Carried so the bounds layer can cap `col_upper` on per-branch
+    /// thermal slack columns at a finite multiple of branch rating
+    /// (prevents LP-relaxation hallucination — see
+    /// [`crate::scuc::bounds::ScucBoundsInput::constrained_branches`]).
+    pub constrained_branches: &'input [usize],
     pub n_fg_rows: usize,
     /// Map from LP flowgate row index to `network.flowgates` index.
     /// Carried so the bounds layer can look up per-row breach_sides +
@@ -379,6 +385,7 @@ pub(super) fn build_problem_plan<'a>(input: ScucProblemPlanInput<'a, 'a>) -> Scu
         n_bp: input.model_plan.n_bp,
         n_sbp: input.model_plan.n_sbp,
         n_branch_flow: input.model_plan.network_plan.constrained_branches.len(),
+        constrained_branches: &input.model_plan.network_plan.constrained_branches,
         n_fg_rows: input.model_plan.network_plan.fg_rows.len(),
         fg_rows: &input.model_plan.network_plan.fg_rows,
         n_iface_rows: input.model_plan.network_plan.iface_rows.len(),
@@ -536,6 +543,7 @@ pub(super) fn build_column_state(input: ScucColumnBuildInput<'_, '_>) -> ScucCol
         n_bp: input.n_bp,
         n_sbp: input.n_sbp,
         n_branch_flow: input.n_branch_flow,
+        constrained_branches: input.constrained_branches,
         n_fg_rows: input.n_fg_rows,
         fg_rows: input.fg_rows,
         n_iface_rows: input.n_iface_rows,

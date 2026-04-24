@@ -479,11 +479,30 @@ class HvdcDispatchLink(_HvdcDispatchLinkRequired, total=False):
     id: str
 
 
+class LossFactorWarmStartMode_Variant0(TypedDict):
+    """No cold-start warm-start on iter 0. The first MIP is solved lossless; the refinement LP corrects for losses after. Subsequent security iterations still warm-start from the prior iteration's `dloss_dp` if available."""
+    mode: Literal['disabled']
+class LossFactorWarmStartMode_Variant1(TypedDict):
+    """Seed every bus's `dloss` to the same rate `rate ∈ [0, 0.5]` (typical `0.02` for 2%). `total_losses_mw = rate × total_load`. No per-bus variation; cheapest cold-start. Good when the network's losses are dominated by a roughly uniform background loss rate rather than strong per-bus asymmetries."""
+    mode: Literal['uniform']
+    rate: float
+class LossFactorWarmStartMode_Variant2(TypedDict):
+    """Seed `dloss` from the loss-PTDF applied to the per-bus load vector, normalised so total weighted losses match `rate × total_load`. No DC PF invocation. Captures per-bus variation from network topology + load pattern alone."""
+    mode: Literal['load_pattern']
+    rate: float
+class LossFactorWarmStartMode_Variant3(TypedDict):
+    """Seed from a DC power flow on each hourly network's initial- condition dispatch. Most accurate cold-start; costs one DC PF per period (sub-ms on 617-bus). Falls back to `Uniform { rate: 0.02 }` if the DC PF fails."""
+    mode: Literal['dc_pf']
+# Cold-start strategy for the SCUC loss-factor warm-start on the first security iteration.
+LossFactorWarmStartMode = Union[LossFactorWarmStartMode_Variant0, LossFactorWarmStartMode_Variant1, LossFactorWarmStartMode_Variant2, LossFactorWarmStartMode_Variant3]
+
+
 class LossFactorPolicy(TypedDict, total=False):
     """Iterative DC loss-factor policy."""
     enabled: bool
     max_iterations: int
     tolerance: float
+    warm_start_mode: LossFactorWarmStartMode
 
 
 class PhHeadCurve(TypedDict):
@@ -708,6 +727,9 @@ class DispatchRuntime(TypedDict, total=False):
     ac_target_tracking: AcDispatchTargetTracking
     sced_ac_benders: ScedAcBendersRuntime
     capture_model_diagnostics: bool
+    scuc_firm_bus_balance_slacks: bool
+    scuc_firm_branch_thermal_slacks: bool
+    scuc_disable_bus_power_balance: bool
     ac_sced_period_concurrency: Union[int, None]
 
 
@@ -800,6 +822,7 @@ __all__ = [
     'HvdcPeriodPowerSeries',
     'IntervalCoupling',
     'LossFactorPolicy',
+    'LossFactorWarmStartMode',
     'MustRunUnits',
     'PhHeadCurve',
     'PhModeConstraint',
