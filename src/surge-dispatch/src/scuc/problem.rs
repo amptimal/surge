@@ -799,8 +799,10 @@ fn describe_reserve_column(
 ) -> Option<String> {
     for product in &layout_plan.active.reserve_layout.products {
         let product_id = product.product.id.as_str();
-        if (product.gen_var_offset..product.gen_var_offset + setup.n_gen).contains(&local) {
-            let gen_idx = local - product.gen_var_offset;
+        let gen_block_end = product.gen_var_offset + product.gen_participation.len();
+        if (product.gen_var_offset..gen_block_end).contains(&local) {
+            let offset_in_block = local - product.gen_var_offset;
+            let gen_idx = product.gen_participation[offset_in_block];
             let generator = setup
                 .gen_indices
                 .get(gen_idx)
@@ -810,13 +812,24 @@ fn describe_reserve_column(
                 describe_generator(generator, gen_idx)
             ));
         }
-        if (product.dl_var_offset..product.dl_var_offset + layout_plan.active.dl_list.len())
-            .contains(&local)
-        {
-            let dl_idx = local - product.dl_var_offset;
+        let dl_block_end = product.dl_var_offset + product.dl_group_participation.len();
+        if (product.dl_var_offset..dl_block_end).contains(&local) {
+            let offset_in_block = local - product.dl_var_offset;
+            let group_idx = product.dl_group_participation[offset_in_block];
+            let group = &layout_plan.active.reserve_layout.dl_consumer_groups[group_idx];
+            // Use the group's canonical (first) member for the
+            // descriptive label; the group key (if any) is also
+            // informative.
+            let canonical_dl_idx = group.member_dl_indices.first().copied().unwrap_or(0);
+            let key_label = group
+                .key
+                .as_deref()
+                .map(|k| format!("group:{k}"))
+                .unwrap_or_else(|| "group:singleton".to_string());
             return Some(format!(
-                "h{hour}:reserve:{product_id}:dl:{}",
-                describe_dispatchable_load(dl_idx, layout_plan, network)
+                "h{hour}:reserve:{product_id}:dl:{}::{}",
+                describe_dispatchable_load(canonical_dl_idx, layout_plan, network),
+                key_label,
             ));
         }
         if (product.slack_offset..product.slack_offset + product.n_penalty_slacks).contains(&local)
@@ -1530,9 +1543,18 @@ fn count_rows(input: &ScucProblemBuildInput<'_>) -> (usize, usize, usize, usize,
     );
     // Each angle-constrained branch yields 2 constraint rows (upper + lower) per hour.
     let n_angle_diff_rows_per_hour = 2 * model_plan.network_plan.angle_constrained_branches.len();
+    // Bus-balance row family. Normally emits one row per bus plus two
+    // `pb_agg` coupling rows (Σ pb_*_bus == Σ pb_*_seg). When the
+    // disable-bus-power-balance knob is set, the layout drops the
+    // `pb_*` columns and the per-bus rows; a single system-balance
+    // row per period takes their place.
+    let bus_balance_rows_per_hour = if spec.scuc_disable_bus_power_balance {
+        1
+    } else {
+        input.network.n_buses() + 2
+    };
     let rows_per_hour = n_flow
-        + input.network.n_buses()
-        + 2
+        + bus_balance_rows_per_hour
         + if skip_capacity_logic {
             0
         } else {
@@ -1836,6 +1858,22 @@ pub(super) fn build_problem(input: ScucProblemBuildInput<'_>) -> ScucProblemBuil
         builders::compute_hvdc_loss_injection(spec, &network_plan.hvdc_from_idx, n_bus, base);
     let offsets = &layout.dispatch;
     let _build_problem_per_period_t0 = std::time::Instant::now();
+    // Atomic sub-phase timing accumulators for the per-period row
+    // builders, aggregated across rayon tasks. Reported as a single
+    // `info!` once the par_iter completes.
+    use std::sync::atomic::AtomicU64;
+    let t_dc_network = AtomicU64::new(0);
+    let t_capacity_logic = AtomicU64::new(0);
+    let t_storage = AtomicU64::new(0);
+    let t_foz = AtomicU64::new(0);
+    let t_pumped_hydro = AtomicU64::new(0);
+    let t_branch_state = AtomicU64::new(0);
+    let t_branch_flow_def = AtomicU64::new(0);
+    let t_dr_activation = AtomicU64::new(0);
+    let t_dr_rebound = AtomicU64::new(0);
+    let t_dl_ramp_group = AtomicU64::new(0);
+    let t_cc = AtomicU64::new(0);
+    let t_other = AtomicU64::new(0);
 
     // SAFETY: each rayon task writes strictly to its own disjoint row
     // slice `[t*rows_per_hour, (t+1)*rows_per_hour)` of row_lower /
@@ -1923,17 +1961,22 @@ pub(super) fn build_problem(input: ScucProblemBuildInput<'_>) -> ScucProblemBuil
                 coeff: 1.0,
             });
         }
-        for bus_idx in 0..n_bus {
-            power_balance_extra_terms.push(builders::PowerBalanceExtraTerm {
-                bus_idx,
-                col: layout.pb_curtailment_bus_col(hour, bus_idx),
-                coeff: -1.0,
-            });
-            power_balance_extra_terms.push(builders::PowerBalanceExtraTerm {
-                bus_idx,
-                col: layout.pb_excess_bus_col(hour, bus_idx),
-                coeff: 1.0,
-            });
+        // Per-bus pb slack terms are only emitted when per-bus balance
+        // rows are allocated. With `scuc_disable_bus_power_balance`
+        // the whole family is skipped.
+        if !spec.scuc_disable_bus_power_balance {
+            for bus_idx in 0..n_bus {
+                power_balance_extra_terms.push(builders::PowerBalanceExtraTerm {
+                    bus_idx,
+                    col: layout.pb_curtailment_bus_col(hour, bus_idx),
+                    coeff: -1.0,
+                });
+                power_balance_extra_terms.push(builders::PowerBalanceExtraTerm {
+                    bus_idx,
+                    col: layout.pb_excess_bus_col(hour, bus_idx),
+                    coeff: 1.0,
+                });
+            }
         }
 
         // Inject startup/shutdown trajectory power into the bus balance.
@@ -1999,6 +2042,8 @@ pub(super) fn build_problem(input: ScucProblemBuildInput<'_>) -> ScucProblemBuil
             }
         }
 
+        let skip_bus_pb = spec.scuc_disable_bus_power_balance;
+        let _t_dc_t0 = std::time::Instant::now();
         builders::build_dc_network_rows(builders::DcNetworkRowsInput {
             flow_network: input.network,
             dispatch_network: net_t,
@@ -2047,6 +2092,7 @@ pub(super) fn build_problem(input: ScucProblemBuildInput<'_>) -> ScucProblemBuil
             base,
             hour,
             switching_pf_l_cols: switching_pf_l_cols_vec.as_deref(),
+            skip_bus_balance: skip_bus_pb,
         })
         .write_into_preallocated(
             &mut triplets,
@@ -2054,53 +2100,136 @@ pub(super) fn build_problem(input: ScucProblemBuildInput<'_>) -> ScucProblemBuil
             row_upper,
             current_row,
         );
-        let pb_agg_row = current_row + n_flow + n_bus;
-        for bus_idx in 0..n_bus {
-            triplets.push(Triplet {
-                row: pb_agg_row,
-                col: layout.pb_curtailment_bus_col(hour, bus_idx),
-                val: 1.0,
-            });
-            triplets.push(Triplet {
-                row: pb_agg_row + 1,
-                col: layout.pb_excess_bus_col(hour, bus_idx),
-                val: 1.0,
-            });
-        }
-        for seg_idx in 0..layout_plan.n_pb_curt_segs {
-            triplets.push(Triplet {
-                row: pb_agg_row,
-                col: layout.pb_curtailment_seg_col(hour, seg_idx),
-                val: -1.0,
-            });
-        }
-        for seg_idx in 0..layout_plan.n_pb_excess_segs {
-            triplets.push(Triplet {
-                row: pb_agg_row + 1,
-                col: layout.pb_excess_seg_col(hour, seg_idx),
-                val: -1.0,
-            });
-        }
-        row_lower[pb_agg_row] = 0.0;
-        row_upper[pb_agg_row] = 0.0;
-        row_lower[pb_agg_row + 1] = 0.0;
-        row_upper[pb_agg_row + 1] = 0.0;
+        t_dc_network.fetch_add(
+            _t_dc_t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
-        for (i, label) in row_labels[current_row..current_row + n_flow + n_bus + 2]
-            .iter_mut()
-            .enumerate()
-        {
-            if i < n_flow {
-                *label = format!("h{hour}:flow_{i}");
-            } else if i < n_flow + n_bus {
-                *label = format!("h{hour}:bus_{}", i - n_flow);
+        if skip_bus_pb {
+            // Single system-balance row replaces the per-bus family.
+            //
+            // With per-bus KCL gone we can't run the classical
+            // `iterate_loss_factors` machinery (it rewrites per-bus
+            // pg coefficients and RHS), but the system-level loss
+            // expectation is still preserved: we subtract an
+            // aggregate `expected_loss_pu` from the row RHS so the
+            // equality reads `Σ pg = Σ load + Σ expected_loss` in
+            // aggregate. Rate comes from the existing loss warm-
+            // start mode:
+            //   * Uniform { rate }     → rate
+            //   * LoadPattern { rate } → rate
+            //   * DcPf                 → 0.02 (default uniform rate)
+            //   * Disabled             → 0
+            // Gated on `spec.use_loss_factors` so SCUC runs with
+            // `use_loss_factors = false` stay lossless by construction.
+            let expected_loss_pu = if spec.use_loss_factors {
+                let rate = match spec.loss_factor_warm_start_mode {
+                    crate::request::network::LossFactorWarmStartMode::Uniform { rate } => rate,
+                    crate::request::network::LossFactorWarmStartMode::LoadPattern { rate } => rate,
+                    crate::request::network::LossFactorWarmStartMode::DcPf => 0.02,
+                    crate::request::network::LossFactorWarmStartMode::Disabled => 0.0,
+                };
+                let total_load_mw: f64 = net_t
+                    .bus_load_p_mw_with_map(bus_map)
+                    .iter()
+                    .copied()
+                    .sum();
+                (rate.clamp(0.0, 0.5)) * total_load_mw / base
             } else {
-                *label = format!("h{hour}:pb_agg_{}", i - n_flow - n_bus);
+                0.0
+            };
+            let sys_row = current_row + n_flow;
+            let sys_block = builders::build_system_power_balance_row(
+                net_t,
+                setup,
+                &setup.gen_indices,
+                &setup.gen_bus_idx,
+                spec,
+                bus_map,
+                col_base,
+                sys_row,
+                &pbusinj_t,
+                &hvdc_loss_a_bus,
+                &network_plan.hvdc_from_idx,
+                &network_plan.hvdc_to_idx,
+                &setup.hvdc_band_offsets_rel,
+                &active_inputs.dl_list,
+                &active_inputs.active_vbids,
+                &power_balance_extra_terms,
+                offsets.pg,
+                offsets.sto_ch,
+                offsets.sto_dis,
+                offsets.hvdc,
+                offsets.dl,
+                offsets.vbid,
+                false,
+                base,
+                expected_loss_pu,
+            );
+            triplets.extend(sys_block.triplets);
+            row_lower[sys_row] = sys_block.row_lower[0];
+            row_upper[sys_row] = sys_block.row_upper[0];
+            for (i, label) in row_labels[current_row..current_row + n_flow + 1]
+                .iter_mut()
+                .enumerate()
+            {
+                if i < n_flow {
+                    *label = format!("h{hour}:flow_{i}");
+                } else {
+                    *label = format!("h{hour}:sys_balance");
+                }
             }
+            current_row += n_flow + 1;
+        } else {
+            let pb_agg_row = current_row + n_flow + n_bus;
+            for bus_idx in 0..n_bus {
+                triplets.push(Triplet {
+                    row: pb_agg_row,
+                    col: layout.pb_curtailment_bus_col(hour, bus_idx),
+                    val: 1.0,
+                });
+                triplets.push(Triplet {
+                    row: pb_agg_row + 1,
+                    col: layout.pb_excess_bus_col(hour, bus_idx),
+                    val: 1.0,
+                });
+            }
+            for seg_idx in 0..layout_plan.n_pb_curt_segs {
+                triplets.push(Triplet {
+                    row: pb_agg_row,
+                    col: layout.pb_curtailment_seg_col(hour, seg_idx),
+                    val: -1.0,
+                });
+            }
+            for seg_idx in 0..layout_plan.n_pb_excess_segs {
+                triplets.push(Triplet {
+                    row: pb_agg_row + 1,
+                    col: layout.pb_excess_seg_col(hour, seg_idx),
+                    val: -1.0,
+                });
+            }
+            row_lower[pb_agg_row] = 0.0;
+            row_upper[pb_agg_row] = 0.0;
+            row_lower[pb_agg_row + 1] = 0.0;
+            row_upper[pb_agg_row + 1] = 0.0;
+
+            for (i, label) in row_labels[current_row..current_row + n_flow + n_bus + 2]
+                .iter_mut()
+                .enumerate()
+            {
+                if i < n_flow {
+                    *label = format!("h{hour}:flow_{i}");
+                } else if i < n_flow + n_bus {
+                    *label = format!("h{hour}:bus_{}", i - n_flow);
+                } else {
+                    *label = format!("h{hour}:pb_agg_{}", i - n_flow - n_bus);
+                }
+            }
+            current_row += n_flow + n_bus + 2;
         }
-        current_row += n_flow + n_bus + 2;
         hour_reserve_row_bases[hour] = current_row + 4 * n_gen;
 
+        let _t_cap_t0 = std::time::Instant::now();
         if !skip_capacity_logic {
             super::rows::build_capacity_logic_reserve_rows(ScucCapacityLogicReserveRowsInput {
                 network: input.network,
@@ -2133,7 +2262,12 @@ pub(super) fn build_problem(input: ScucProblemBuildInput<'_>) -> ScucProblemBuil
             }
         }
         current_row += n_capacity_logic_reserve_rows_per_hour;
+        t_capacity_logic.fetch_add(
+            _t_cap_t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
+        let _t_other_t0 = std::time::Instant::now();
         if model_plan.use_plc {
             build_plc_rows(
                 input.network,
@@ -2321,6 +2455,10 @@ pub(super) fn build_problem(input: ScucProblemBuildInput<'_>) -> ScucProblemBuil
             row_labels[lower_row] = format!("h{hour}:angle_diff_lower_{row_idx}");
         }
         current_row += n_angle_diff_rows_per_hour;
+        t_other.fetch_add(
+            _t_other_t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
             } // end original loop body block
             // Invariant: per-period emitters advanced `current_row` to
             // this hour's base + fixed `rows_per_hour` + the hour's
@@ -2347,6 +2485,22 @@ pub(super) fn build_problem(input: ScucProblemBuildInput<'_>) -> ScucProblemBuil
     let mut current_row = total_per_period;
     tracing::info!(
         stage = "build_problem.per_period_loop",
+        dc_network_secs = t_dc_network.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+        capacity_logic_secs =
+            t_capacity_logic.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+        other_per_period_secs = t_other.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+        storage_secs = t_storage.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+        foz_secs = t_foz.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+        pumped_hydro_secs = t_pumped_hydro.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+        branch_state_secs = t_branch_state.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+        branch_flow_def_secs =
+            t_branch_flow_def.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+        dr_activation_secs =
+            t_dr_activation.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+        dr_rebound_secs = t_dr_rebound.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+        dl_ramp_group_secs =
+            t_dl_ramp_group.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
+        cc_secs = t_cc.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9,
         secs = _build_problem_per_period_t0.elapsed().as_secs_f64(),
         n_triplets = triplets.len(),
         "SCUC build_problem timing"
@@ -2625,6 +2779,7 @@ pub(super) fn build_problem(input: ScucProblemBuildInput<'_>) -> ScucProblemBuil
             layout,
             n_hours,
             row_base: current_row,
+            allow_branch_switching: spec.allow_branch_switching,
         })
         .write_into_preallocated(
             &mut triplets,
@@ -5348,7 +5503,13 @@ pub(super) fn solve_problem(
     // the optional pre-MIP warm-start application and the post-MIP
     // refinement iteration. Costs one O(n_nz) column walk + per-period
     // loss-PTDF build — shared so the refinement loop doesn't rebuild.
-    let loss_prep = if spec.use_loss_factors && network.n_buses() > 1 {
+    // Loss factor prep requires per-bus KCL rows to read/adjust RHS
+    // values. It is skipped when the caller has disabled per-bus
+    // balance — those rows no longer exist in the LP.
+    let loss_prep = if spec.use_loss_factors
+        && !spec.scuc_disable_bus_power_balance
+        && network.n_buses() > 1
+    {
         let _prep_t0 = Instant::now();
         let prep = crate::scuc::losses::build_loss_factor_prep(
             &prob,

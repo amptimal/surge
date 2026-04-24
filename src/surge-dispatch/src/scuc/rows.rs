@@ -14,7 +14,7 @@ use super::layout::ScucLayout;
 use crate::common::builders;
 use crate::common::costs::resolve_dl_for_period_from_spec;
 use crate::common::layout::LpBlock;
-use crate::common::network::study_area_for_bus;
+use crate::common::network::study_area_for_bus_index;
 use crate::common::reserves::{
     ReserveLpLayout, dispatchable_load_reserve_offer_for_period, generator_reserve_offer_for_period,
 };
@@ -273,6 +273,7 @@ fn add_footroom_terms(triplets: &mut Vec<Triplet<f64>>, input: CommitmentCouplin
     }
 }
 
+#[allow(clippy::needless_late_init)]
 pub(super) fn build_capacity_logic_reserve_rows(
     input: ScucCapacityLogicReserveRowsInput<'_>,
 ) -> LpBlock {
@@ -283,6 +284,62 @@ pub(super) fn build_capacity_logic_reserve_rows(
         row_lower: vec![0.0; n_rows],
         row_upper: vec![0.0; n_rows],
     };
+
+    // Precompute study_area-per-bus ONCE for all DLs and gens in this
+    // period so the inner zonal_participant_bus_matches calls don't
+    // rebuild `network.bus_index_map()` per iteration. With 16,000+
+    // DLs × multiple zonal requirements this was the dominant cost in
+    // capacity_logic row building (~7s wall per period on 4224-bus).
+    let bus_index_map: HashMap<u32, usize> = input
+        .network
+        .buses
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.number, i))
+        .collect();
+    let fallback_area_by_dl: Vec<Option<usize>> = input
+        .dl_list
+        .iter()
+        .map(|dl| {
+            bus_index_map
+                .get(&dl.bus)
+                .copied()
+                .and_then(|bus_idx| study_area_for_bus_index(input.network, input.spec, bus_idx))
+        })
+        .collect();
+    let fallback_area_by_gen: Vec<Option<usize>> = input
+        .gen_indices
+        .iter()
+        .enumerate()
+        .map(|(j, _gi)| input.spec.generator_area.get(j).copied())
+        .collect();
+    let fallback_area_by_group: Vec<Option<usize>> = input
+        .reserve_layout
+        .dl_consumer_groups
+        .iter()
+        .map(|group| {
+            let canonical_k = group.member_dl_indices.first().copied();
+            canonical_k
+                .and_then(|k| input.dl_list.get(k))
+                .and_then(|dl| bus_index_map.get(&dl.bus).copied())
+                .and_then(|bus_idx| study_area_for_bus_index(input.network, input.spec, bus_idx))
+        })
+        .collect();
+
+    // Diagnostic sub-phase timers; only emit for hour 0 to avoid
+    // flooding logs. The per-hour work is similar enough that hour 0
+    // gives a representative breakdown.
+    let trace_timings = input.hour == 0;
+    let t_gen_coupling;
+    let t_commitment_state;
+    let t_cross_headroom;
+    let t_cross_footroom;
+    let t_dl_cross_headroom;
+    let t_dl_cross_footroom;
+    let t_shared_gen;
+    let t_shared_dl;
+    let t_per_product;
+    let _t_gc_t0 = std::time::Instant::now();
 
     let mut local_row = 0usize;
 
@@ -374,6 +431,8 @@ pub(super) fn build_capacity_logic_reserve_rows(
     }
     local_row += n_gen;
 
+    t_gen_coupling = _t_gc_t0.elapsed().as_secs_f64();
+    let _t_cs_t0 = std::time::Instant::now();
     for j in 0..n_gen {
         let row = input.row_base + local_row + j;
         push_triplet(
@@ -435,11 +494,27 @@ pub(super) fn build_capacity_logic_reserve_rows(
     }
     local_row += n_gen;
 
+    t_commitment_state = _t_cs_t0.elapsed().as_secs_f64();
+    let _t_ch_t0 = std::time::Instant::now();
     if input.reserve_layout.n_cross_headroom_rows > 0 {
+        // Phase 4: emit cross-headroom rows only for gens that
+        // participate in at least one Headroom product. A
+        // non-participant's cross row would collapse to the same
+        // commitment-coupling shape already emitted by
+        // `build_capacity_logic_reserve_rows` (same terms, no reserve
+        // addend), and HiGHS presolve would collapse the duplicates.
+        let mut emitted = 0;
         for (j, &gi) in input.gen_indices.iter().enumerate() {
+            let participates = input.reserve_layout.products.iter().any(|ap| {
+                ap.product.energy_coupling == surge_network::market::EnergyCoupling::Headroom
+                    && ap.gen_reserve_col(j).is_some()
+            });
+            if !participates {
+                continue;
+            }
             let generator = &input.network.generators[gi];
             let pmax_pu = input.hourly_network.generators[gi].pmax / input.base;
-            let row = input.row_base + local_row + j;
+            let row = input.row_base + local_row + emitted;
             let startup_dt_hours = input.spec.period_hours(input.hour);
             let shutdown_dt_hours = if input.hour + 1 < input.n_hours {
                 input.spec.period_hours(input.hour + 1)
@@ -477,25 +552,39 @@ pub(super) fn build_capacity_logic_reserve_rows(
             );
             for ap in &input.reserve_layout.products {
                 if ap.product.energy_coupling == surge_network::market::EnergyCoupling::Headroom {
-                    push_triplet(
-                        &mut block.triplets,
-                        row,
-                        input.layout.col(input.hour, ap.gen_var_offset + j),
-                        1.0,
-                    );
+                    if let Some(intra) = ap.gen_reserve_col(j) {
+                        push_triplet(
+                            &mut block.triplets,
+                            row,
+                            input.layout.col(input.hour, intra),
+                            1.0,
+                        );
+                    }
                 }
             }
-            block.row_lower[local_row + j] = -BIG_M;
-            block.row_upper[local_row + j] = 0.0;
+            block.row_lower[local_row + emitted] = -BIG_M;
+            block.row_upper[local_row + emitted] = 0.0;
+            emitted += 1;
         }
-        local_row += n_gen;
+        debug_assert_eq!(emitted, input.reserve_layout.n_cross_headroom_rows);
+        local_row += input.reserve_layout.n_cross_headroom_rows;
     }
 
+    t_cross_headroom = _t_ch_t0.elapsed().as_secs_f64();
+    let _t_cf_t0 = std::time::Instant::now();
     if input.reserve_layout.n_cross_footroom_rows > 0 {
+        let mut emitted = 0;
         for (j, &gi) in input.gen_indices.iter().enumerate() {
+            let participates = input.reserve_layout.products.iter().any(|ap| {
+                ap.product.energy_coupling == surge_network::market::EnergyCoupling::Footroom
+                    && ap.gen_reserve_col(j).is_some()
+            });
+            if !participates {
+                continue;
+            }
             let generator = &input.network.generators[gi];
             let pmin_pu = input.hourly_network.generators[gi].pmin / input.base;
-            let row = input.row_base + local_row + j;
+            let row = input.row_base + local_row + emitted;
             let startup_dt_hours = input.spec.period_hours(input.hour);
             let shutdown_dt_hours = if input.hour + 1 < input.n_hours {
                 input.spec.period_hours(input.hour + 1)
@@ -533,102 +622,160 @@ pub(super) fn build_capacity_logic_reserve_rows(
             );
             for ap in &input.reserve_layout.products {
                 if ap.product.energy_coupling == surge_network::market::EnergyCoupling::Footroom {
-                    push_triplet(
-                        &mut block.triplets,
-                        row,
-                        input.layout.col(input.hour, ap.gen_var_offset + j),
-                        1.0,
-                    );
+                    if let Some(intra) = ap.gen_reserve_col(j) {
+                        push_triplet(
+                            &mut block.triplets,
+                            row,
+                            input.layout.col(input.hour, intra),
+                            1.0,
+                        );
+                    }
                 }
             }
-            block.row_lower[local_row + j] = -BIG_M;
-            block.row_upper[local_row + j] = 0.0;
+            block.row_lower[local_row + emitted] = -BIG_M;
+            block.row_upper[local_row + emitted] = 0.0;
+            emitted += 1;
         }
-        local_row += n_gen;
+        debug_assert_eq!(emitted, input.reserve_layout.n_cross_footroom_rows);
+        local_row += input.reserve_layout.n_cross_footroom_rows;
     }
 
+    t_cross_footroom = _t_cf_t0.elapsed().as_secs_f64();
+    let _t_dch_t0 = std::time::Instant::now();
+    let n_dl_groups = input.reserve_layout.dl_consumer_groups.len();
     if input.reserve_layout.n_dl_cross_headroom_rows > 0 {
-        for (k, dl) in input.dl_list.iter().enumerate() {
-            let row = input.row_base + local_row + k;
-            push_triplet(
-                &mut block.triplets,
-                row,
-                input.layout.col(input.hour, input.layout.dispatch.dl + k),
-                1.0,
-            );
+        let mut emitted = 0;
+        for (gi, group) in input.reserve_layout.dl_consumer_groups.iter().enumerate() {
+            let participates = input.reserve_layout.products.iter().any(|ap| {
+                dl_energy_coupling(&ap.product) == surge_network::market::EnergyCoupling::Headroom
+                    && ap.dl_group_reserve_col(gi).is_some()
+            });
+            if !participates {
+                continue;
+            }
+            let row = input.row_base + local_row + emitted;
+            let mut pmax_sum_pu = 0.0;
+            for &k in &group.member_dl_indices {
+                push_triplet(
+                    &mut block.triplets,
+                    row,
+                    input.layout.col(input.hour, input.layout.dispatch.dl + k),
+                    1.0,
+                );
+                pmax_sum_pu += dispatchable_load_pmax_pu(&input, k, input.dl_list[k]);
+            }
             for ap in &input.reserve_layout.products {
                 if dl_energy_coupling(&ap.product)
                     == surge_network::market::EnergyCoupling::Headroom
                 {
-                    push_triplet(
-                        &mut block.triplets,
-                        row,
-                        input.layout.col(input.hour, ap.dl_var_offset + k),
-                        1.0,
-                    );
+                    if let Some(intra) = ap.dl_group_reserve_col(gi) {
+                        push_triplet(
+                            &mut block.triplets,
+                            row,
+                            input.layout.col(input.hour, intra),
+                            1.0,
+                        );
+                    }
                 }
             }
-            block.row_lower[local_row + k] = -BIG_M;
-            block.row_upper[local_row + k] = dispatchable_load_pmax_pu(&input, k, dl);
+            block.row_lower[local_row + emitted] = -BIG_M;
+            block.row_upper[local_row + emitted] = pmax_sum_pu;
+            emitted += 1;
         }
-        local_row += input.dl_list.len();
+        debug_assert_eq!(emitted, input.reserve_layout.n_dl_cross_headroom_rows);
+        local_row += input.reserve_layout.n_dl_cross_headroom_rows;
     }
 
+    t_dl_cross_headroom = _t_dch_t0.elapsed().as_secs_f64();
+    let _t_dcf_t0 = std::time::Instant::now();
     if input.reserve_layout.n_dl_cross_footroom_rows > 0 {
-        for (k, dl) in input.dl_list.iter().enumerate() {
-            let row = input.row_base + local_row + k;
-            push_triplet(
-                &mut block.triplets,
-                row,
-                input.layout.col(input.hour, input.layout.dispatch.dl + k),
-                -1.0,
-            );
+        let mut emitted = 0;
+        for (gi, group) in input.reserve_layout.dl_consumer_groups.iter().enumerate() {
+            let participates = input.reserve_layout.products.iter().any(|ap| {
+                dl_energy_coupling(&ap.product) == surge_network::market::EnergyCoupling::Footroom
+                    && ap.dl_group_reserve_col(gi).is_some()
+            });
+            if !participates {
+                continue;
+            }
+            let row = input.row_base + local_row + emitted;
+            let mut pmin_sum_pu = 0.0;
+            for &k in &group.member_dl_indices {
+                push_triplet(
+                    &mut block.triplets,
+                    row,
+                    input.layout.col(input.hour, input.layout.dispatch.dl + k),
+                    -1.0,
+                );
+                pmin_sum_pu += input.dl_list[k].p_min_pu;
+            }
             for ap in &input.reserve_layout.products {
                 if dl_energy_coupling(&ap.product)
                     == surge_network::market::EnergyCoupling::Footroom
                 {
-                    push_triplet(
-                        &mut block.triplets,
-                        row,
-                        input.layout.col(input.hour, ap.dl_var_offset + k),
-                        1.0,
-                    );
+                    if let Some(intra) = ap.dl_group_reserve_col(gi) {
+                        push_triplet(
+                            &mut block.triplets,
+                            row,
+                            input.layout.col(input.hour, intra),
+                            1.0,
+                        );
+                    }
                 }
             }
-            block.row_lower[local_row + k] = -BIG_M;
-            block.row_upper[local_row + k] = -dl.p_min_pu;
+            block.row_lower[local_row + emitted] = -BIG_M;
+            block.row_upper[local_row + emitted] = -pmin_sum_pu;
+            emitted += 1;
         }
-        local_row += input.dl_list.len();
+        debug_assert_eq!(emitted, input.reserve_layout.n_dl_cross_footroom_rows);
+        local_row += input.reserve_layout.n_dl_cross_footroom_rows;
     }
 
+    t_dl_cross_footroom = _t_dcf_t0.elapsed().as_secs_f64();
+    let _t_sg_t0 = std::time::Instant::now();
     for ap in &input.reserve_layout.products {
         if ap.product.shared_limit_products.is_empty() {
             continue;
         }
+        // Precompute the overlapping shared-limit products for `ap`.
+        let shared_products_for_ap: Vec<_> = ap
+            .product
+            .shared_limit_products
+            .iter()
+            .filter_map(|shared_id| {
+                input.reserve_layout.products.iter().find(|candidate| {
+                    candidate.product.id == *shared_id
+                        && qualifications_can_overlap(
+                            &ap.product.qualification,
+                            &candidate.product.qualification,
+                        )
+                })
+            })
+            .collect();
+        let mut emitted = 0;
         for (j, _) in input.gen_indices.iter().enumerate() {
-            let row = input.row_base + local_row + j;
-            push_triplet(
-                &mut block.triplets,
-                row,
-                input.layout.col(input.hour, ap.gen_var_offset + j),
-                1.0,
-            );
-            for shared_id in &ap.product.shared_limit_products {
-                if let Some(shared_product) =
-                    input.reserve_layout.products.iter().find(|candidate| {
-                        candidate.product.id == *shared_id
-                            && qualifications_can_overlap(
-                                &ap.product.qualification,
-                                &candidate.product.qualification,
-                            )
-                    })
-                {
+            let contributes = ap.gen_reserve_col(j).is_some()
+                || shared_products_for_ap
+                    .iter()
+                    .any(|sp: &&_| sp.gen_reserve_col(j).is_some());
+            if !contributes {
+                continue;
+            }
+            let row = input.row_base + local_row + emitted;
+            if let Some(intra) = ap.gen_reserve_col(j) {
+                push_triplet(
+                    &mut block.triplets,
+                    row,
+                    input.layout.col(input.hour, intra),
+                    1.0,
+                );
+            }
+            for sp in &shared_products_for_ap {
+                if let Some(intra) = sp.gen_reserve_col(j) {
                     push_triplet(
                         &mut block.triplets,
                         row,
-                        input
-                            .layout
-                            .col(input.hour, shared_product.gen_var_offset + j),
+                        input.layout.col(input.hour, intra),
                         1.0,
                     );
                 }
@@ -651,12 +798,12 @@ pub(super) fn build_capacity_logic_reserve_rows(
                         input.layout.commitment_col(input.hour, j),
                         offer_cap,
                     );
-                    block.row_lower[local_row + j] = -BIG_M;
-                    block.row_upper[local_row + j] = offer_cap;
+                    block.row_lower[local_row + emitted] = -BIG_M;
+                    block.row_upper[local_row + emitted] = offer_cap;
                 }
                 surge_network::market::QualificationRule::QuickStart => {
-                    block.row_lower[local_row + j] = -BIG_M;
-                    block.row_upper[local_row + j] = offer_cap;
+                    block.row_lower[local_row + emitted] = -BIG_M;
+                    block.row_upper[local_row + emitted] = offer_cap;
                 }
                 _ => {
                     push_triplet(
@@ -665,69 +812,99 @@ pub(super) fn build_capacity_logic_reserve_rows(
                         input.layout.commitment_col(input.hour, j),
                         -offer_cap,
                     );
-                    block.row_lower[local_row + j] = -BIG_M;
-                    block.row_upper[local_row + j] = 0.0;
+                    block.row_lower[local_row + emitted] = -BIG_M;
+                    block.row_upper[local_row + emitted] = 0.0;
                 }
             }
+            emitted += 1;
         }
-        local_row += n_gen;
+        local_row += emitted;
     }
+    t_shared_gen = _t_sg_t0.elapsed().as_secs_f64();
 
+    let _t_sd_t0 = std::time::Instant::now();
     for ap in &input.reserve_layout.products {
         if ap.product.shared_limit_products.is_empty() {
             continue;
         }
-        for (k, dl) in input.dl_list.iter().enumerate() {
-            let row = input.row_base + local_row + k;
-            push_triplet(
-                &mut block.triplets,
-                row,
-                input.layout.col(input.hour, ap.dl_var_offset + k),
-                1.0,
-            );
-            for shared_id in &ap.product.shared_limit_products {
-                if let Some(shared_product) =
-                    input.reserve_layout.products.iter().find(|candidate| {
-                        candidate.product.id == *shared_id
-                            && qualifications_can_overlap(
-                                &ap.product.qualification,
-                                &candidate.product.qualification,
-                            )
-                    })
-                {
+        let shared_products_for_ap: Vec<_> = ap
+            .product
+            .shared_limit_products
+            .iter()
+            .filter_map(|shared_id| {
+                input.reserve_layout.products.iter().find(|candidate| {
+                    candidate.product.id == *shared_id
+                        && qualifications_can_overlap(
+                            &ap.product.qualification,
+                            &candidate.product.qualification,
+                        )
+                })
+            })
+            .collect();
+        let mut emitted = 0;
+        for (gi, group) in input.reserve_layout.dl_consumer_groups.iter().enumerate() {
+            let contributes = ap.dl_group_reserve_col(gi).is_some()
+                || shared_products_for_ap
+                    .iter()
+                    .any(|sp: &&_| sp.dl_group_reserve_col(gi).is_some());
+            if !contributes {
+                continue;
+            }
+            let row = input.row_base + local_row + emitted;
+            if let Some(intra) = ap.dl_group_reserve_col(gi) {
+                push_triplet(
+                    &mut block.triplets,
+                    row,
+                    input.layout.col(input.hour, intra),
+                    1.0,
+                );
+            }
+            for sp in &shared_products_for_ap {
+                if let Some(intra) = sp.dl_group_reserve_col(gi) {
                     push_triplet(
                         &mut block.triplets,
                         row,
-                        input
-                            .layout
-                            .col(input.hour, shared_product.dl_var_offset + k),
+                        input.layout.col(input.hour, intra),
                         1.0,
                     );
                 }
             }
-            let offer_cap = dispatchable_load_reserve_offer_for_period(
-                input.spec,
-                input.dl_orig_idx.get(k).copied().unwrap_or(k),
-                dl,
-                &ap.product.id,
-                input.hour,
-            )
-            .map(|offer| offer.capacity_mw)
-            .unwrap_or(0.0)
+            let offer_cap: f64 = group
+                .member_dl_indices
+                .iter()
+                .map(|&k| {
+                    dispatchable_load_reserve_offer_for_period(
+                        input.spec,
+                        input.dl_orig_idx.get(k).copied().unwrap_or(k),
+                        input.dl_list[k],
+                        &ap.product.id,
+                        input.hour,
+                    )
+                    .map(|offer| offer.capacity_mw)
+                    .unwrap_or(0.0)
+                })
+                .sum::<f64>()
                 / input.base;
-            block.row_lower[local_row + k] = -BIG_M;
-            block.row_upper[local_row + k] = offer_cap;
+            block.row_lower[local_row + emitted] = -BIG_M;
+            block.row_upper[local_row + emitted] = offer_cap;
+            emitted += 1;
         }
-        local_row += input.dl_list.len();
+        local_row += emitted;
     }
+    t_shared_dl = _t_sd_t0.elapsed().as_secs_f64();
 
+    let _t_pp_t0 = std::time::Instant::now();
     for ap in &input.reserve_layout.products {
         match ap.product.energy_coupling {
             surge_network::market::EnergyCoupling::Headroom => {
-                for (j, &gi) in input.gen_indices.iter().enumerate() {
+                // Phase 4: only participating gens need a row.
+                // Non-participants collapse to commitment coupling
+                // already provided by `build_capacity_logic_reserve_rows`.
+                for (offset, &j) in ap.gen_participation.iter().enumerate() {
+                    let gi = input.gen_indices[j];
                     let generator = &input.network.generators[gi];
                     let pmax_pu = input.hourly_network.generators[gi].pmax / input.base;
-                    let row = input.row_base + local_row + j;
+                    let row = input.row_base + local_row + offset;
                     if matches!(
                         ap.product.qualification,
                         surge_network::market::QualificationRule::QuickStart
@@ -738,20 +915,22 @@ pub(super) fn build_capacity_logic_reserve_rows(
                             input.layout.pg_col(input.hour, j),
                             1.0,
                         );
-                        push_triplet(
-                            &mut block.triplets,
-                            row,
-                            input.layout.col(input.hour, ap.gen_var_offset + j),
-                            1.0,
-                        );
+                        if let Some(intra) = ap.gen_reserve_col(j) {
+                            push_triplet(
+                                &mut block.triplets,
+                                row,
+                                input.layout.col(input.hour, intra),
+                                1.0,
+                            );
+                        }
                         push_triplet(
                             &mut block.triplets,
                             row,
                             input.layout.headroom_slack_col(input.hour, j),
                             -1.0,
                         );
-                        block.row_lower[local_row + j] = -BIG_M;
-                        block.row_upper[local_row + j] = pmax_pu;
+                        block.row_lower[local_row + offset] = -BIG_M;
+                        block.row_upper[local_row + offset] = pmax_pu;
                         continue;
                     }
                     let startup_dt_hours = input.spec.period_hours(input.hour);
@@ -766,9 +945,9 @@ pub(super) fn build_capacity_logic_reserve_rows(
                             cols: CommitmentCouplingCols {
                                 row,
                                 pg_col: input.layout.pg_col(input.hour, j),
-                                reserve_col: Some(
-                                    input.layout.col(input.hour, ap.gen_var_offset + j),
-                                ),
+                                reserve_col: ap
+                                    .gen_reserve_col(j)
+                                    .map(|intra| input.layout.col(input.hour, intra)),
                                 commitment_col: input.layout.commitment_col(input.hour, j),
                                 startup_col: input.layout.startup_col(input.hour, j),
                                 shutdown_next_col: (input.hour + 1 < input.n_hours)
@@ -795,16 +974,17 @@ pub(super) fn build_capacity_logic_reserve_rows(
                                 .offline_commitment_trajectories,
                         },
                     );
-                    block.row_lower[local_row + j] = -BIG_M;
-                    block.row_upper[local_row + j] = 0.0;
+                    block.row_lower[local_row + offset] = -BIG_M;
+                    block.row_upper[local_row + offset] = 0.0;
                 }
-                local_row += n_gen;
+                local_row += ap.gen_participation.len();
             }
             surge_network::market::EnergyCoupling::Footroom => {
-                for (j, &gi) in input.gen_indices.iter().enumerate() {
+                for (offset, &j) in ap.gen_participation.iter().enumerate() {
+                    let gi = input.gen_indices[j];
                     let generator = &input.network.generators[gi];
                     let pmin_pu = input.hourly_network.generators[gi].pmin / input.base;
-                    let row = input.row_base + local_row + j;
+                    let row = input.row_base + local_row + offset;
                     let startup_dt_hours = input.spec.period_hours(input.hour);
                     let shutdown_dt_hours = if input.hour + 1 < input.n_hours {
                         input.spec.period_hours(input.hour + 1)
@@ -817,9 +997,9 @@ pub(super) fn build_capacity_logic_reserve_rows(
                             cols: CommitmentCouplingCols {
                                 row,
                                 pg_col: input.layout.pg_col(input.hour, j),
-                                reserve_col: Some(
-                                    input.layout.col(input.hour, ap.gen_var_offset + j),
-                                ),
+                                reserve_col: ap
+                                    .gen_reserve_col(j)
+                                    .map(|intra| input.layout.col(input.hour, intra)),
                                 commitment_col: input.layout.commitment_col(input.hour, j),
                                 startup_col: input.layout.startup_col(input.hour, j),
                                 shutdown_next_col: (input.hour + 1 < input.n_hours)
@@ -846,54 +1026,73 @@ pub(super) fn build_capacity_logic_reserve_rows(
                                 .offline_commitment_trajectories,
                         },
                     );
-                    block.row_lower[local_row + j] = -BIG_M;
-                    block.row_upper[local_row + j] = 0.0;
+                    block.row_lower[local_row + offset] = -BIG_M;
+                    block.row_upper[local_row + offset] = 0.0;
                 }
-                local_row += n_gen;
+                local_row += ap.gen_participation.len();
             }
             surge_network::market::EnergyCoupling::None => {}
         }
 
         match dl_energy_coupling(&ap.product) {
             surge_network::market::EnergyCoupling::Headroom => {
-                for (k, dl) in input.dl_list.iter().enumerate() {
-                    let row = input.row_base + local_row + k;
-                    push_triplet(
-                        &mut block.triplets,
-                        row,
-                        input.layout.col(input.hour, ap.dl_var_offset + k),
-                        1.0,
-                    );
-                    push_triplet(
-                        &mut block.triplets,
-                        row,
-                        input.layout.col(input.hour, input.layout.dispatch.dl + k),
-                        1.0,
-                    );
-                    block.row_lower[local_row + k] = -BIG_M;
-                    block.row_upper[local_row + k] = dispatchable_load_pmax_pu(&input, k, dl);
+                // Group-level headroom, emitted only for participating
+                // groups. Non-participants collapse to `Σ p_served ≤
+                // Σ pmax` — redundant with per-block p_served col
+                // bounds.
+                //   r_group + Σ_{m ∈ group} p_served[m] ≤ Σ pmax[m]
+                for (offset, &gi) in ap.dl_group_participation.iter().enumerate() {
+                    let group = &input.reserve_layout.dl_consumer_groups[gi];
+                    let row = input.row_base + local_row + offset;
+                    if let Some(intra) = ap.dl_group_reserve_col(gi) {
+                        push_triplet(
+                            &mut block.triplets,
+                            row,
+                            input.layout.col(input.hour, intra),
+                            1.0,
+                        );
+                    }
+                    let mut pmax_sum_pu = 0.0;
+                    for &k in &group.member_dl_indices {
+                        push_triplet(
+                            &mut block.triplets,
+                            row,
+                            input.layout.col(input.hour, input.layout.dispatch.dl + k),
+                            1.0,
+                        );
+                        pmax_sum_pu += dispatchable_load_pmax_pu(&input, k, input.dl_list[k]);
+                    }
+                    block.row_lower[local_row + offset] = -BIG_M;
+                    block.row_upper[local_row + offset] = pmax_sum_pu;
                 }
-                local_row += input.dl_list.len();
+                local_row += ap.dl_group_participation.len();
             }
             surge_network::market::EnergyCoupling::Footroom => {
-                for (k, dl) in input.dl_list.iter().enumerate() {
-                    let row = input.row_base + local_row + k;
-                    push_triplet(
-                        &mut block.triplets,
-                        row,
-                        input.layout.col(input.hour, ap.dl_var_offset + k),
-                        1.0,
-                    );
-                    push_triplet(
-                        &mut block.triplets,
-                        row,
-                        input.layout.col(input.hour, input.layout.dispatch.dl + k),
-                        -1.0,
-                    );
-                    block.row_lower[local_row + k] = -BIG_M;
-                    block.row_upper[local_row + k] = -dl.p_min_pu;
+                for (offset, &gi) in ap.dl_group_participation.iter().enumerate() {
+                    let group = &input.reserve_layout.dl_consumer_groups[gi];
+                    let row = input.row_base + local_row + offset;
+                    if let Some(intra) = ap.dl_group_reserve_col(gi) {
+                        push_triplet(
+                            &mut block.triplets,
+                            row,
+                            input.layout.col(input.hour, intra),
+                            1.0,
+                        );
+                    }
+                    let mut pmin_sum_pu = 0.0;
+                    for &k in &group.member_dl_indices {
+                        push_triplet(
+                            &mut block.triplets,
+                            row,
+                            input.layout.col(input.hour, input.layout.dispatch.dl + k),
+                            -1.0,
+                        );
+                        pmin_sum_pu += input.dl_list[k].p_min_pu;
+                    }
+                    block.row_lower[local_row + offset] = -BIG_M;
+                    block.row_upper[local_row + offset] = -pmin_sum_pu;
                 }
-                local_row += input.dl_list.len();
+                local_row += ap.dl_group_participation.len();
             }
             surge_network::market::EnergyCoupling::None => {}
         }
@@ -905,24 +1104,24 @@ pub(super) fn build_capacity_logic_reserve_rows(
                     continue;
                 };
                 for j in 0..n_gen {
-                    push_triplet(
-                        &mut block.triplets,
-                        row,
-                        input
-                            .layout
-                            .col(input.hour, balance_product.gen_var_offset + j),
-                        1.0,
-                    );
+                    if let Some(intra) = balance_product.gen_reserve_col(j) {
+                        push_triplet(
+                            &mut block.triplets,
+                            row,
+                            input.layout.col(input.hour, intra),
+                            1.0,
+                        );
+                    }
                 }
-                for k in 0..input.dl_list.len() {
-                    push_triplet(
-                        &mut block.triplets,
-                        row,
-                        input
-                            .layout
-                            .col(input.hour, balance_product.dl_var_offset + k),
-                        1.0,
-                    );
+                for gi in 0..input.reserve_layout.dl_consumer_groups.len() {
+                    if let Some(intra) = balance_product.dl_group_reserve_col(gi) {
+                        push_triplet(
+                            &mut block.triplets,
+                            row,
+                            input.layout.col(input.hour, intra),
+                            1.0,
+                        );
+                    }
                 }
             }
             push_triplet(
@@ -950,33 +1149,60 @@ pub(super) fn build_capacity_logic_reserve_rows(
                 .filter_map(|&idx| input.r_zonal_reqs.get(idx))
                 .map(|item| item.requirement_mw_for_period(input.hour))
                 .sum::<f64>();
+            // Zone membership lookups use the pre-computed
+            // `fallback_area_by_*` slices so `study_area_for_bus` isn't
+            // re-invoked per DL (which would rebuild the network's bus
+            // index map inside every filter call). With the HashSet on
+            // `req.participant_bus_set`, the common case is an O(1)
+            // lookup per iteration.
+            let bus_matches_gen = |j: usize| -> bool {
+                let bus_number = input.network.generators[input.gen_indices[j]].bus;
+                match &req.participant_bus_set {
+                    Some(set) => set.contains(&bus_number),
+                    None => {
+                        fallback_area_by_gen.get(j).copied().flatten().unwrap_or(0) == req.zone_id
+                    }
+                }
+            };
+            let bus_matches_dl = |k: usize, dl_bus: u32| -> bool {
+                match &req.participant_bus_set {
+                    Some(set) => set.contains(&dl_bus),
+                    None => {
+                        fallback_area_by_dl.get(k).copied().flatten().unwrap_or(0) == req.zone_id
+                    }
+                }
+            };
+            let bus_matches_group = |gi: usize, canonical_bus: u32| -> bool {
+                match &req.participant_bus_set {
+                    Some(set) => set.contains(&canonical_bus),
+                    None => {
+                        fallback_area_by_group
+                            .get(gi)
+                            .copied()
+                            .flatten()
+                            .unwrap_or(0)
+                            == req.zone_id
+                    }
+                }
+            };
             let zone_gen_indices: Vec<usize> = input
                 .gen_indices
                 .iter()
                 .enumerate()
-                .filter_map(|(j, _)| {
-                    crate::common::network::zonal_participant_bus_matches(
-                        req.zone_id,
-                        req.participant_bus_numbers.as_deref(),
-                        input.network.generators[input.gen_indices[j]].bus,
-                        input.spec.generator_area.get(j).copied(),
-                    )
-                    .then_some(j)
-                })
+                .filter_map(|(j, _)| bus_matches_gen(j).then_some(j))
                 .collect();
             let zone_dl_indices: Vec<usize> = input
                 .dl_list
                 .iter()
                 .enumerate()
-                .filter_map(|(k, dl)| {
-                    crate::common::network::zonal_participant_bus_matches(
-                        req.zone_id,
-                        req.participant_bus_numbers.as_deref(),
-                        dl.bus,
-                        study_area_for_bus(input.network, input.spec, dl.bus),
-                    )
-                    .then_some(k)
-                })
+                .filter_map(|(k, dl)| bus_matches_dl(k, dl.bus).then_some(k))
+                .collect();
+            let zone_group_indices: Vec<usize> = input
+                .reserve_layout
+                .dl_consumer_groups
+                .iter()
+                .enumerate()
+                .filter_map(|(gi, group)| bus_matches_group(gi, group.canonical_bus).then_some(gi))
                 .collect();
             // NOTE: see `common/reserves.rs::build_constraints`. These are
             // dimensionless fractions (e.g. 0.03 for "3% of served consumer
@@ -999,24 +1225,24 @@ pub(super) fn build_capacity_logic_reserve_rows(
                         continue;
                     };
                     for &j in &zone_gen_indices {
-                        push_triplet(
-                            &mut block.triplets,
-                            row,
-                            input
-                                .layout
-                                .col(input.hour, balance_product.gen_var_offset + j),
-                            1.0,
-                        );
+                        if let Some(intra) = balance_product.gen_reserve_col(j) {
+                            push_triplet(
+                                &mut block.triplets,
+                                row,
+                                input.layout.col(input.hour, intra),
+                                1.0,
+                            );
+                        }
                     }
-                    for &k in &zone_dl_indices {
-                        push_triplet(
-                            &mut block.triplets,
-                            row,
-                            input
-                                .layout
-                                .col(input.hour, balance_product.dl_var_offset + k),
-                            1.0,
-                        );
+                    for &gi in &zone_group_indices {
+                        if let Some(intra) = balance_product.dl_group_reserve_col(gi) {
+                            push_triplet(
+                                &mut block.triplets,
+                                row,
+                                input.layout.col(input.hour, intra),
+                                1.0,
+                            );
+                        }
                     }
                 }
                 for &k in &zone_dl_indices {
@@ -1115,12 +1341,14 @@ pub(super) fn build_capacity_logic_reserve_rows(
                     ap.product.qualification,
                     surge_network::market::QualificationRule::OfflineQuickStart
                 ) {
-                    push_triplet(
-                        &mut block.triplets,
-                        row,
-                        input.layout.col(input.hour, ap.gen_var_offset + j),
-                        1.0,
-                    );
+                    if let Some(intra) = ap.gen_reserve_col(j) {
+                        push_triplet(
+                            &mut block.triplets,
+                            row,
+                            input.layout.col(input.hour, intra),
+                            1.0,
+                        );
+                    }
                 }
             }
 
@@ -1138,6 +1366,36 @@ pub(super) fn build_capacity_logic_reserve_rows(
         local_row += n_gen;
     }
 
+    t_per_product = _t_pp_t0.elapsed().as_secs_f64();
+    if trace_timings {
+        tracing::info!(
+            stage = "build_capacity_logic_reserve_rows.hour0",
+            total_secs = t_gen_coupling
+                + t_commitment_state
+                + t_cross_headroom
+                + t_cross_footroom
+                + t_dl_cross_headroom
+                + t_dl_cross_footroom
+                + t_shared_gen
+                + t_shared_dl
+                + t_per_product,
+            gen_coupling_secs = t_gen_coupling,
+            commitment_state_secs = t_commitment_state,
+            cross_headroom_secs = t_cross_headroom,
+            cross_footroom_secs = t_cross_footroom,
+            dl_cross_headroom_secs = t_dl_cross_headroom,
+            dl_cross_footroom_secs = t_dl_cross_footroom,
+            shared_gen_secs = t_shared_gen,
+            shared_dl_secs = t_shared_dl,
+            per_product_secs = t_per_product,
+            n_cross_headroom_rows = input.reserve_layout.n_cross_headroom_rows,
+            n_cross_footroom_rows = input.reserve_layout.n_cross_footroom_rows,
+            n_dl_cross_headroom_rows = input.reserve_layout.n_dl_cross_headroom_rows,
+            n_dl_cross_footroom_rows = input.reserve_layout.n_dl_cross_footroom_rows,
+            n_dl_groups = n_dl_groups,
+            "SCUC capacity_logic sub-phase (hour 0)"
+        );
+    }
     debug_assert!(local_row <= n_rows);
     block
 }
@@ -1235,12 +1493,14 @@ pub(super) fn build_storage_rows(input: ScucStorageRowsInput<'_>) -> LpBlock {
                 if let Some(factors) = products.get(&ap.product.id) {
                     let impact = factors.get(input.hour).copied().unwrap_or(0.0);
                     if impact > 0.0 {
-                        push_triplet(
-                            &mut block.triplets,
-                            row,
-                            input.layout.col(input.hour, ap.gen_var_offset + j),
-                            -impact * period_hours * input.base,
-                        );
+                        if let Some(intra) = ap.gen_reserve_col(j) {
+                            push_triplet(
+                                &mut block.triplets,
+                                row,
+                                input.layout.col(input.hour, intra),
+                                -impact * period_hours * input.base,
+                            );
+                        }
                     }
                 }
             }
@@ -1268,12 +1528,14 @@ pub(super) fn build_storage_rows(input: ScucStorageRowsInput<'_>) -> LpBlock {
                 if let Some(factors) = products.get(&ap.product.id) {
                     let impact = factors.get(input.hour).copied().unwrap_or(0.0);
                     if impact < 0.0 {
-                        push_triplet(
-                            &mut block.triplets,
-                            row,
-                            input.layout.col(input.hour, ap.gen_var_offset + j),
-                            -impact * period_hours * input.base,
-                        );
+                        if let Some(intra) = ap.gen_reserve_col(j) {
+                            push_triplet(
+                                &mut block.triplets,
+                                row,
+                                input.layout.col(input.hour, intra),
+                                -impact * period_hours * input.base,
+                            );
+                        }
                     }
                 }
             }
@@ -3464,25 +3726,26 @@ pub(super) fn build_commitment_policy_rows(input: ScucCommitmentPolicyRowsInput<
 //     u^on_j0 − u^on,0_j     = u^su_j0 − u^sd_j0           (first period)
 //     u^su_jt + u^sd_jt ≤ 1                                (no simultaneous transition)
 //
-// We allocate the rows unconditionally (the count flows through
-// `count_rows` so the LP layout stays stable across both
-// `allow_branch_switching = false` and `true`). When the policy is
-// `false` the bounds layer pins the columns to their static initial
-// state, so the rows reduce to `0 = 0` (state evolution) and `0 ≤ 1`
-// (simul) — trivially satisfied with zero impact on the LP optimum.
+// Emitted only when `allow_branch_switching = true`. In SW0 the
+// branch-state binary columns (`u^on`, `u^su`, `u^sd`) are not
+// allocated by the layout, so these rows have nothing to reference —
+// they'd collapse to `0 = 0` / `0 ≤ 1` anyway. Skipping them up
+// front saves `~2 × n_ac_branches × n_hours` rows plus ~5× that in
+// triplets on every SCUC build.
 
 /// Number of branch state-evolution rows the SCUC LP needs.
 ///
-/// `2 × n_ac_branches × n_hours`: one state-evolution equality and one
-/// simultaneous-transition inequality per branch per period. Returns 0
-/// when there are no AC branches; the row family is unconditional on
-/// `allow_branch_switching` so the LP layout stays consistent across
-/// both modes.
+/// `2 × n_ac_branches × n_hours` when branch switching is allowed
+/// (one state-evolution equality and one simultaneous-transition
+/// inequality per branch per period), zero otherwise.
 pub(super) fn branch_state_rows_count(
     network: &Network,
     n_hours: usize,
-    _allow_branch_switching: bool,
+    allow_branch_switching: bool,
 ) -> usize {
+    if !allow_branch_switching {
+        return 0;
+    }
     2 * network.branches.len() * n_hours
 }
 
@@ -3491,11 +3754,13 @@ pub(super) struct ScucBranchStateRowsInput<'a> {
     pub layout: &'a ScucLayout,
     pub n_hours: usize,
     pub row_base: usize,
+    pub allow_branch_switching: bool,
 }
 
 pub(super) fn build_branch_state_rows(input: ScucBranchStateRowsInput<'_>) -> LpBlock {
     let n_branches = input.network.branches.len();
-    let n_rows = branch_state_rows_count(input.network, input.n_hours, true);
+    let n_rows =
+        branch_state_rows_count(input.network, input.n_hours, input.allow_branch_switching);
     if n_rows == 0 {
         return LpBlock::empty();
     }

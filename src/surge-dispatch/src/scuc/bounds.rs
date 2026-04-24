@@ -100,6 +100,15 @@ pub(super) struct ScucBoundsInput<'a> {
     pub n_bp: usize,
     pub n_sbp: usize,
     pub n_branch_flow: usize,
+    /// Maps thermal-row index `row_idx` to the source branch index in
+    /// `network.branches`. Used when bounding `col_upper` on the lower/
+    /// upper thermal slack columns — we cap each at `slack_cap_factor ×
+    /// branch_rating_a_mva / base_mva` so the LP relaxation can't
+    /// hallucinate unbounded slack absorbing pathological dual bounds
+    /// (which observably drove -$1.7e14 dual bounds on 1576-bus D1 with
+    /// the `f64::INFINITY` cap). Physical violations remain accommodated
+    /// as long as they stay within the factor × rating envelope.
+    pub constrained_branches: &'a [usize],
     pub n_fg_rows: usize,
     /// Map from flowgate LP row index to index into `network.flowgates`.
     /// The bounds layer uses it to look up `limit_mw_active_period` +
@@ -324,51 +333,76 @@ fn zonal_slack_upper_bound_mw(
     req: &crate::common::reserves::ActiveZonalRequirement,
 ) -> f64 {
     let profiled_network = input.hourly_networks.get(t).unwrap_or(input.network);
+    // Fast bus-match using the precomputed HashSet on `req`. Previously
+    // this used `participants.contains(&bus)` on the raw Vec — O(P_zone)
+    // per check — inside per-DL and per-gen loops. With 16,000+ DLs and
+    // ~12 zonal requirements over 18 periods, the Vec path was the
+    // dominant build-side cost on 6049-bus SCUC.
+    //
+    // Note: the closure takes a `fallback_area_fn` rather than a
+    // pre-computed `Option<usize>` because the fallback path (used when
+    // no explicit participant set) calls `study_area_for_bus`, which
+    // internally rebuilds `network.bus_index_map()` — O(N_buses) per
+    // call. Lazy evaluation means the fallback computation is skipped
+    // on every iteration when the participant set is known, which is
+    // the common case for GO C3 zones.
+    let bus_matches = |bus_number: u32, fallback_area_fn: &dyn Fn() -> Option<usize>| -> bool {
+        match &req.participant_bus_set {
+            Some(set) => set.contains(&bus_number),
+            None => fallback_area_fn().unwrap_or(0) == req.zone_id,
+        }
+    };
+
     let base_requirement_mw = req
         .balance_req_indices
         .iter()
         .filter_map(|&idx| input.r_zonal_reqs.get(idx))
         .map(|item| item.requirement_mw_for_period(t))
         .sum::<f64>();
+    // Skip the inner DL iteration when the coefficient is zero /
+    // absent — multiplying the sum by 0 is wasteful when the sum
+    // requires walking 16,000+ DLs with per-DL HashMap work.
     let served_dispatchable_load_cap_mw = req
         .balance_served_dispatchable_load_coefficient
-        .unwrap_or(0.0)
-        * input
-            .dl_list
-            .iter()
-            .enumerate()
-            .filter(|&(_, dl)| {
-                crate::common::network::zonal_participant_bus_matches(
-                    req.zone_id,
-                    req.participant_bus_numbers.as_deref(),
-                    dl.bus,
-                    study_area_for_bus(profiled_network, input.spec, dl.bus),
-                )
-            })
-            .map(|(k, dl)| {
-                let dl_idx = input.dl_orig_idx.get(k).copied().unwrap_or(k);
-                let (_, p_max_pu, _, _, _, _) =
-                    resolve_dl_for_period_from_spec(dl_idx, t, dl, input.spec);
-                p_max_pu.max(0.0) * input.base
-            })
-            .sum::<f64>();
+        .filter(|&c| c.abs() > 0.0)
+        .map(|coeff| {
+            coeff
+                * input
+                    .dl_list
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, dl)| {
+                        bus_matches(dl.bus, &|| {
+                            study_area_for_bus(profiled_network, input.spec, dl.bus)
+                        })
+                    })
+                    .map(|(k, dl)| {
+                        let dl_idx = input.dl_orig_idx.get(k).copied().unwrap_or(k);
+                        let (_, p_max_pu, _, _, _, _) =
+                            resolve_dl_for_period_from_spec(dl_idx, t, dl, input.spec);
+                        p_max_pu.max(0.0) * input.base
+                    })
+                    .sum::<f64>()
+        })
+        .unwrap_or(0.0);
     let largest_generator_cap_mw = req
         .balance_largest_generator_dispatch_coefficient
-        .unwrap_or(0.0)
-        * input
-            .gen_indices
-            .iter()
-            .enumerate()
-            .filter_map(|(j, &gi)| {
-                crate::common::network::zonal_participant_bus_matches(
-                    req.zone_id,
-                    req.participant_bus_numbers.as_deref(),
-                    profiled_network.generators[gi].bus,
-                    input.spec.generator_area.get(j).copied(),
-                )
-                .then_some(profiled_network.generators[gi].pmax.max(0.0))
-            })
-            .fold(0.0, f64::max);
+        .filter(|&c| c.abs() > 0.0)
+        .map(|coeff| {
+            coeff
+                * input
+                    .gen_indices
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(j, &gi)| {
+                        bus_matches(profiled_network.generators[gi].bus, &|| {
+                            input.spec.generator_area.get(j).copied()
+                        })
+                        .then_some(profiled_network.generators[gi].pmax.max(0.0))
+                    })
+                    .fold(0.0, f64::max)
+        })
+        .unwrap_or(0.0);
 
     (base_requirement_mw + served_dispatchable_load_cap_mw + largest_generator_cap_mw).max(0.0)
 }
@@ -438,9 +472,23 @@ fn dl_rebound_idx(base: usize, rb_idx: usize, t: usize, n_hours: usize) -> usize
 }
 
 pub(super) fn build_variable_bounds(input: ScucBoundsInput<'_>) -> ScucBoundsState {
-    use std::sync::atomic::{AtomicPtr, Ordering};
+    use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
     use std::time::Instant;
     let _bounds_fn_t0 = Instant::now();
+    // Per-section nanosecond accumulators for bounds build sub-phase
+    // timings. Written atomically from rayon tasks (one task per
+    // period), reported as a single `info!` after the parallel loop
+    // exits.
+    let t_gen_bounds = AtomicU64::new(0);
+    let t_reserves = AtomicU64::new(0);
+    let t_reserves_gen = AtomicU64::new(0);
+    let t_reserves_dlgroup = AtomicU64::new(0);
+    let t_reserves_zonal = AtomicU64::new(0);
+    let t_dl_bounds = AtomicU64::new(0);
+    let t_branch_slacks = AtomicU64::new(0);
+    let t_flowgate_slacks = AtomicU64::new(0);
+    let t_gen_commit = AtomicU64::new(0);
+    let t_other = AtomicU64::new(0);
     let ignore_forced_offline_commitment =
         env_flag("SURGE_DEBUG_IGNORE_SCUC_FORCED_OFFLINE_COMMITMENT_BOUNDS");
     let relax_commitment_binaries = env_flag("SURGE_DEBUG_RELAX_SCUC_COMMITMENT_BINARIES");
@@ -534,6 +582,7 @@ pub(super) fn build_variable_bounds(input: ScucBoundsInput<'_>) -> ScucBoundsSta
             input.island_refs,
         );
 
+        let _t_gen_t0 = std::time::Instant::now();
         for (j, &gi) in input.gen_indices.iter().enumerate() {
             let g_hourly = &input.hourly_networks[t].generators[gi];
             let g_base = &input.network.generators[gi];
@@ -663,10 +712,18 @@ pub(super) fn build_variable_bounds(input: ScucBoundsInput<'_>) -> ScucBoundsSta
             }
         }
 
+        t_gen_bounds.fetch_add(_t_gen_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+        let _t_reserves_t0 = std::time::Instant::now();
         for ap in &input.reserve_layout.products {
+            let _t_rgen_t0 = std::time::Instant::now();
             for (j, &gi) in input.gen_indices.iter().enumerate() {
+                // Non-participants have no reserve column — skip bounds entirely.
+                let Some(intra_period_col) = ap.gen_reserve_col(j) else {
+                    continue;
+                };
                 let g = &input.network.generators[gi];
-                let col = input.layout.col(t, ap.gen_var_offset + j);
+                let col = input.layout.col(t, intra_period_col);
                 col_lower[col] = 0.0;
 
                 let empty_quals = Default::default();
@@ -734,6 +791,8 @@ pub(super) fn build_variable_bounds(input: ScucBoundsInput<'_>) -> ScucBoundsSta
                 col_upper[col] = offer_cap.min(ramp_cap).min(phys_cap) / input.base;
             }
 
+            t_reserves_gen.fetch_add(_t_rgen_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
             let slack_req_mw = ap
                 .system_req_indices
                 .iter()
@@ -748,35 +807,64 @@ pub(super) fn build_variable_bounds(input: ScucBoundsInput<'_>) -> ScucBoundsSta
                 0.0
             };
 
-            for (k, dl) in input.dl_list.iter().enumerate() {
-                let col = input.layout.col(t, ap.dl_var_offset + k);
+            // DL reserve bounds are group-level in Phase 3. Offer cap
+            // and physical cap sum across member blocks. Qualification
+            // is per-member; if any member qualifies we keep the col
+            // open with the summed bounds, otherwise pin to 0.
+            let _t_rdl_t0 = std::time::Instant::now();
+            for (gi, group) in input.reserve_layout.dl_consumer_groups.iter().enumerate() {
+                let Some(intra_period_col) = ap.dl_group_reserve_col(gi) else {
+                    continue;
+                };
+                let col = input.layout.col(t, intra_period_col);
                 col_lower[col] = 0.0;
 
-                let qualified =
-                    qualifies_for(&ap.product.qualification, true, false, &dl.qualifications);
-                if !qualified {
+                let mut any_qualified = false;
+                let mut total_offer_mw = 0.0;
+                let mut total_phys_mw = 0.0;
+                for &k in &group.member_dl_indices {
+                    let dl = input.dl_list[k];
+                    let qualified = qualifies_for(
+                        &ap.product.qualification,
+                        true,
+                        false,
+                        &dl.qualifications,
+                    );
+                    if !qualified {
+                        continue;
+                    }
+                    any_qualified = true;
+                    let offer_cap = dispatchable_load_reserve_offer_for_period(
+                        input.spec,
+                        input.dl_orig_idx.get(k).copied().unwrap_or(k),
+                        dl,
+                        &ap.product.id,
+                        t,
+                    )
+                    .map(|offer| offer.capacity_mw)
+                    .unwrap_or(0.0);
+                    let phys_cap_member = (dl.p_max_pu - dl.p_min_pu).max(0.0) * input.base;
+                    total_offer_mw += offer_cap;
+                    total_phys_mw += phys_cap_member;
+                }
+                if !any_qualified {
                     col_upper[col] = 0.0;
                     continue;
                 }
-                let offer_cap = dispatchable_load_reserve_offer_for_period(
-                    input.spec,
-                    input.dl_orig_idx.get(k).copied().unwrap_or(k),
-                    dl,
-                    &ap.product.id,
-                    t,
-                )
-                .map(|offer| offer.capacity_mw)
-                .unwrap_or(0.0);
-                let phys_cap = (dl.p_max_pu - dl.p_min_pu).max(0.0) * input.base;
-                col_upper[col] = offer_cap.min(phys_cap) / input.base;
+                col_upper[col] = total_offer_mw.min(total_phys_mw) / input.base;
             }
 
+            t_reserves_dlgroup.fetch_add(_t_rdl_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+            let _t_rzonal_t0 = std::time::Instant::now();
             for (zi, req) in ap.zonal_reqs.iter().enumerate() {
                 let col = input.layout.col(t, ap.zonal_slack_offset + zi);
                 col_lower[col] = 0.0;
                 col_upper[col] = zonal_slack_upper_bound_mw(input, t, req) / input.base;
             }
+            t_reserves_zonal.fetch_add(_t_rzonal_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
+        t_reserves.fetch_add(_t_reserves_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
         if input.use_plc {
             for j in 0..n_gen {
@@ -883,6 +971,7 @@ pub(super) fn build_variable_bounds(input: ScucBoundsInput<'_>) -> ScucBoundsSta
             }
         }
 
+        let _t_dl_t0 = std::time::Instant::now();
         if has_dl {
             for (k, dl) in input.dl_list.iter().enumerate() {
                 let (_, p_max, _, _, _, _) = crate::common::costs::resolve_dl_for_period_from_spec(
@@ -896,6 +985,7 @@ pub(super) fn build_variable_bounds(input: ScucBoundsInput<'_>) -> ScucBoundsSta
                 col_upper[idx] = p_max;
             }
         }
+        t_dl_bounds.fetch_add(_t_dl_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
         for (k, &bi) in input.active_vbids.iter().enumerate() {
             let vb = &input.spec.virtual_bids[bi];
@@ -908,42 +998,143 @@ pub(super) fn build_variable_bounds(input: ScucBoundsInput<'_>) -> ScucBoundsSta
             };
         }
 
-        for bus_idx in 0..input.n_bus {
-            let idx = input.layout.pb_curtailment_bus_col(t, bus_idx);
-            col_lower[idx] = 0.0;
-            col_upper[idx] = f64::INFINITY;
-        }
-        for bus_idx in 0..input.n_bus {
-            let idx = input.layout.pb_excess_bus_col(t, bus_idx);
-            col_lower[idx] = 0.0;
-            col_upper[idx] = f64::INFINITY;
-        }
-        for (s, &(mw_cap, penalty)) in pb_penalty.curtailment.iter().enumerate() {
-            let idx = input.layout.pb_curtailment_seg_col(t, s);
-            col_lower[idx] = 0.0;
-            col_upper[idx] = mw_cap / input.base;
-            col_cost[idx] = penalty * input.base * dt_h;
-        }
-        for (s, &(mw_cap, penalty)) in pb_penalty.excess.iter().enumerate() {
-            let idx = input.layout.pb_excess_seg_col(t, s);
-            col_lower[idx] = 0.0;
-            col_upper[idx] = mw_cap / input.base;
-            col_cost[idx] = penalty * input.base * dt_h;
+        // Pin per-bus & per-segment power-balance slacks to zero when the
+        // diagnostic knob is set (bus-balance rows become firm). The
+        // presolver strips the pinned cols before the MIP sees them. The
+        // pb_agg coupling rows stay harmless: both sides become ≡ 0.
+        //
+        // When NOT firm, cap `col_upper` at a physically meaningful
+        // value rather than `f64::INFINITY`. Previously the unbounded
+        // cap let the LP relaxation hallucinate billions-of-MW of
+        // slack on stressed networks like 6049-bus D1, producing
+        // dummy objectives in the 10^14 range that Gurobi's
+        // feasibility pump couldn't round to a viable integer. The
+        // physical bound is:
+        //   * pb_curtailment_bus[b,t] ≤ total demand at bus b
+        //     (fixed_bus_withdrawals + sum DL p_max_pu at bus × base)
+        //   * pb_excess_bus[b,t]      ≤ total gen pmax at bus b
+        // Multiplied by `PB_SLACK_CAP_FACTOR = 2.0` to leave headroom
+        // for rounding, out-of-envelope transients, etc.
+        const PB_SLACK_CAP_FACTOR: f64 = 2.0;
+        let firm_pb = input.spec.scuc_firm_bus_balance_slacks;
+        let firm_thermal = input.spec.scuc_firm_branch_thermal_slacks;
+        let skip_bus_pb = input.spec.scuc_disable_bus_power_balance;
+
+        // Per-bus pb slack bounds are only set when the per-bus balance
+        // row family is allocated. Under `scuc_disable_bus_power_balance`
+        // the `pb_*` column blocks collapse to zero width and these
+        // accessors are not valid.
+        if !skip_bus_pb {
+            // Precompute per-bus physical caps for this period.
+            let net_t = &input.hourly_networks[t];
+            let bus_withdrawals_mw =
+                crate::common::profiles::fixed_bus_withdrawals_mw(net_t, input.spec, t);
+            let mut dl_pmax_mw_by_bus: std::collections::HashMap<u32, f64> =
+                std::collections::HashMap::new();
+            for (k, dl) in input.dl_list.iter().enumerate() {
+                let (_, p_max_pu, _, _, _, _) =
+                    crate::common::costs::resolve_dl_for_period_from_spec(
+                        input.dl_orig_idx[k],
+                        t,
+                        dl,
+                        input.spec,
+                    );
+                *dl_pmax_mw_by_bus.entry(dl.bus).or_insert(0.0) +=
+                    p_max_pu.max(0.0) * input.base;
+            }
+            let mut gen_pmax_mw_by_bus: std::collections::HashMap<u32, f64> =
+                std::collections::HashMap::new();
+            for &gi in input.gen_indices.iter() {
+                let g = &net_t.generators[gi];
+                *gen_pmax_mw_by_bus.entry(g.bus).or_insert(0.0) += g.pmax.max(0.0);
+            }
+            let mut total_curt_cap_pu = 0.0_f64;
+            let mut total_excess_cap_pu = 0.0_f64;
+
+            for bus_idx in 0..input.n_bus {
+                let bus_number = input.network.buses[bus_idx].number;
+                let load_mw = bus_withdrawals_mw.get(&bus_number).copied().unwrap_or(0.0);
+                let dl_mw = dl_pmax_mw_by_bus.get(&bus_number).copied().unwrap_or(0.0);
+                let gen_mw = gen_pmax_mw_by_bus.get(&bus_number).copied().unwrap_or(0.0);
+
+                // Curtailment slack: bounded by total demand at this bus.
+                // Floor at 1 MW pu so a bus with zero declared demand can
+                // still absorb a small rounding residue — otherwise the LP
+                // relaxation pegs every zero-demand bus's slack at 0 even
+                // when network routing would need a tiny dispatch.
+                let curt_cap_mw =
+                    ((load_mw.abs() + dl_mw) * PB_SLACK_CAP_FACTOR).max(1.0);
+                let curt_cap_pu = curt_cap_mw / input.base;
+                total_curt_cap_pu += curt_cap_pu;
+
+                let excess_cap_mw = (gen_mw * PB_SLACK_CAP_FACTOR).max(1.0);
+                let excess_cap_pu = excess_cap_mw / input.base;
+                total_excess_cap_pu += excess_cap_pu;
+
+                let idx = input.layout.pb_curtailment_bus_col(t, bus_idx);
+                col_lower[idx] = 0.0;
+                col_upper[idx] = if firm_pb { 0.0 } else { curt_cap_pu };
+
+                let idx = input.layout.pb_excess_bus_col(t, bus_idx);
+                col_lower[idx] = 0.0;
+                col_upper[idx] = if firm_pb { 0.0 } else { excess_cap_pu };
+            }
+            // Per-segment caps: tighten to the sum of bus-level caps when
+            // that's smaller than the configured penalty-segment `mw_cap`.
+            // The pb_agg row enforces Σ seg == Σ bus, so the seg col_upper
+            // only bites when the penalty config explicitly caps lower
+            // than the physical sum. Keep the config cap as a ceiling for
+            // user-driven tightening.
+            for (s, &(mw_cap, penalty)) in pb_penalty.curtailment.iter().enumerate() {
+                let idx = input.layout.pb_curtailment_seg_col(t, s);
+                col_lower[idx] = 0.0;
+                let seg_cap_pu = (mw_cap / input.base).min(total_curt_cap_pu);
+                col_upper[idx] = if firm_pb { 0.0 } else { seg_cap_pu };
+                col_cost[idx] = penalty * input.base * dt_h;
+            }
+            for (s, &(mw_cap, penalty)) in pb_penalty.excess.iter().enumerate() {
+                let idx = input.layout.pb_excess_seg_col(t, s);
+                col_lower[idx] = 0.0;
+                let seg_cap_pu = (mw_cap / input.base).min(total_excess_cap_pu);
+                col_upper[idx] = if firm_pb { 0.0 } else { seg_cap_pu };
+                col_cost[idx] = penalty * input.base * dt_h;
+            }
         }
 
+        // Thermal-slack `col_upper` is capped at `SLACK_CAP_FACTOR ×
+        // branch_rating_pu` rather than `f64::INFINITY`. Motivation:
+        // with an unbounded cap, the LP relaxation can dump arbitrary
+        // flow into the slack columns — empirically this drove a
+        // dual bound of -$1.7×10¹⁴ on 1576-bus D1 (vs a physical
+        // incumbent around -$89M), preventing Gurobi from ever closing
+        // gap. Capping at `10 × rating` caps the hallucinated slack at
+        // (cap × penalty × rating) per branch while leaving plenty of
+        // headroom for any realistic overflow the MIP might legitimately
+        // want to absorb (10× rated flow is already far beyond any
+        // physical violation our N-1 security loop would tolerate).
+        const SLACK_CAP_FACTOR: f64 = 10.0;
+        let _t_branch_t0 = std::time::Instant::now();
         for row_idx in 0..input.n_branch_flow {
+            let branch_idx = input.constrained_branches[row_idx];
+            let branch = &input.hourly_networks[t].branches[branch_idx];
+            let fmax_pu = (branch.rating_a_mva.max(input.spec.min_rate_a)) / input.base;
+            let slack_cap_pu = SLACK_CAP_FACTOR * fmax_pu;
+
             let lower_idx = input.layout.branch_lower_slack_col(t, row_idx);
             col_lower[lower_idx] = 0.0;
-            col_upper[lower_idx] = f64::INFINITY;
+            col_upper[lower_idx] = if firm_thermal { 0.0 } else { slack_cap_pu };
             col_cost[lower_idx] =
                 input.spec.thermal_penalty_curve.marginal_cost_at(0.0) * input.base * dt_h;
 
             let upper_idx = input.layout.branch_upper_slack_col(t, row_idx);
             col_lower[upper_idx] = 0.0;
-            col_upper[upper_idx] = f64::INFINITY;
+            col_upper[upper_idx] = if firm_thermal { 0.0 } else { slack_cap_pu };
             col_cost[upper_idx] =
                 input.spec.thermal_penalty_curve.marginal_cost_at(0.0) * input.base * dt_h;
         }
+        t_branch_slacks.fetch_add(_t_branch_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
+        let _t_flowgate_t0 = std::time::Instant::now();
         for row_idx in 0..input.n_fg_rows {
             // Look up the source flowgate to decide whether this
             // (row, period, side) triple should actually allocate a
@@ -998,6 +1189,8 @@ pub(super) fn build_variable_bounds(input: ScucBoundsInput<'_>) -> ScucBoundsSta
                 col_cost[upper_idx] = 0.0;
             }
         }
+        t_flowgate_slacks.fetch_add(_t_flowgate_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+
         for row_idx in 0..input.n_iface_rows {
             let lower_idx = input.layout.interface_lower_slack_col(t, row_idx);
             col_lower[lower_idx] = 0.0;
@@ -1064,68 +1257,62 @@ pub(super) fn build_variable_bounds(input: ScucBoundsInput<'_>) -> ScucBoundsSta
 
         // Branch on/off binaries `u^on_jt`, `u^su_jt`, `u^sd_jt` per
         // AC branch per period. When `allow_branch_switching` is
-        // `false` (the default), every branch_commitment column is
-        // pinned to its static `in_service` flag and the start/stop
-        // columns are pinned to 0. When `true`, the columns are free
-        // in {0, 1} and the security loop adds connectivity cuts on
-        // top.
+        // `true` the columns are free in `{0, 1}` (per-branch, only
+        // for switchable branches that carry transition costs) and
+        // the security loop adds connectivity cuts on top. When
+        // `false` these columns are absent from the LP entirely —
+        // the branch state is read directly from the network's
+        // static `in_service` flag at row-build time — and the pin
+        // pass below is skipped.
         let allow_switching = input.spec.allow_branch_switching;
-        for branch_local_idx in 0..input.network.branches.len() {
-            let branch = &input.network.branches[branch_local_idx];
-            let initial_on = if branch.in_service { 1.0 } else { 0.0 };
-            let bc_idx = input.layout.branch_commitment_col(t, branch_local_idx);
-            let bs_idx = input.layout.branch_startup_col(t, branch_local_idx);
-            let bd_idx = input.layout.branch_shutdown_col(t, branch_local_idx);
-            // Per-branch switching: only free binaries for branches that
-            // carry non-zero transition costs (connection/disconnection).
-            // Branches without costs are pinned to their static in_service
-            // state even when the global allow_branch_switching flag is set.
-            if allow_switching && branch.is_switchable() && !relax_auxiliary_binaries {
-                col_lower[bc_idx] = 0.0;
-                col_upper[bc_idx] = 1.0;
-                col_lower[bs_idx] = 0.0;
-                col_upper[bs_idx] = 1.0;
-                col_lower[bd_idx] = 0.0;
-                col_upper[bd_idx] = 1.0;
-                integrality[bc_idx] = VariableDomain::Binary;
-                integrality[bs_idx] = VariableDomain::Binary;
-                integrality[bd_idx] = VariableDomain::Binary;
-            } else {
-                // Pin to initial state. The start/stop columns stay at 0
-                // since the branch never transitions.
-                col_lower[bc_idx] = initial_on;
-                col_upper[bc_idx] = initial_on;
-                col_lower[bs_idx] = 0.0;
-                col_upper[bs_idx] = 0.0;
-                col_lower[bd_idx] = 0.0;
-                col_upper[bd_idx] = 0.0;
-            }
-            // Branch transitions carry per-event startup/shutdown
-            // costs (populated from `connection_cost` /
-            // `disconnection_cost` on the surge branch). These appear
-            // in the objective as fixed-event costs — `$/event`, not
-            // `$/h`, so no `dt` scaling. When the branch is pinned
-            // (`allow_switching = false`) the cost coefficient is
-            // never paid because the start/stop columns are clamped
-            // at zero, but we still wire the cost so toggling
-            // `allow_switching` on at runtime picks it up without
-            // needing another pass.
-            //
-            // There is no fixed `c^on` analogue for the branch
-            // on-status column itself, so `bc_idx` stays at zero
-            // cost.
-            col_cost[bc_idx] = 0.0;
-            col_cost[bs_idx] = branch.cost_startup;
-            col_cost[bd_idx] = branch.cost_shutdown;
+        if allow_switching {
+            for branch_local_idx in 0..input.network.branches.len() {
+                let branch = &input.network.branches[branch_local_idx];
+                let initial_on = if branch.in_service { 1.0 } else { 0.0 };
+                let bc_idx = input.layout.branch_commitment_col(t, branch_local_idx);
+                let bs_idx = input.layout.branch_startup_col(t, branch_local_idx);
+                let bd_idx = input.layout.branch_shutdown_col(t, branch_local_idx);
+                // Per-branch switching: only free binaries for branches that
+                // carry non-zero transition costs (connection/disconnection).
+                // Branches without costs are pinned to their static in_service
+                // state even when the global allow_branch_switching flag is set.
+                if branch.is_switchable() && !relax_auxiliary_binaries {
+                    col_lower[bc_idx] = 0.0;
+                    col_upper[bc_idx] = 1.0;
+                    col_lower[bs_idx] = 0.0;
+                    col_upper[bs_idx] = 1.0;
+                    col_lower[bd_idx] = 0.0;
+                    col_upper[bd_idx] = 1.0;
+                    integrality[bc_idx] = VariableDomain::Binary;
+                    integrality[bs_idx] = VariableDomain::Binary;
+                    integrality[bd_idx] = VariableDomain::Binary;
+                } else {
+                    // Pin to initial state. The start/stop columns stay at 0
+                    // since the branch never transitions.
+                    col_lower[bc_idx] = initial_on;
+                    col_upper[bc_idx] = initial_on;
+                    col_lower[bs_idx] = 0.0;
+                    col_upper[bs_idx] = 0.0;
+                    col_lower[bd_idx] = 0.0;
+                    col_upper[bd_idx] = 0.0;
+                }
+                // Branch transitions carry per-event startup/shutdown
+                // costs from the network's `connection_cost` /
+                // `disconnection_cost`. These appear in the objective
+                // as fixed-event costs (`$/event`, no `dt` scaling).
+                // `bc_idx` stays at zero cost — no `c^on` analogue
+                // for the on-status column itself.
+                col_cost[bc_idx] = 0.0;
+                col_cost[bs_idx] = branch.cost_startup;
+                col_cost[bd_idx] = branch.cost_shutdown;
 
-            // Switchable-branch flow variable `pf_l`. Bound by
-            // `±fmax` in pu when switching is enabled so the LP
-            // respects the thermal envelope; the Big-M flow
-            // definition rows in `build_branch_flow_definition_rows`
-            // tie `pf_l` to `b·Δθ` when the branch is on and force it
-            // to zero via the `pf_l ≤ fmax·u^on` / `pf_l ≥ -fmax·u^on`
-            // coupling when it's off.
-            if allow_switching {
+                // Switchable-branch flow variable `pf_l`. Bound by
+                // `±fmax` in pu so the LP respects the thermal
+                // envelope; the Big-M flow definition rows in
+                // `build_branch_flow_definition_rows` tie `pf_l` to
+                // `b·Δθ` when the branch is on and force it to zero
+                // via `pf_l ≤ fmax·u^on` / `pf_l ≥ -fmax·u^on` when
+                // it's off.
                 let pf_idx = input.layout.branch_flow_col(t, branch_local_idx);
                 if branch.is_switchable() {
                     let fmax_pu = branch.rating_a_mva.max(0.0) / input.base;
@@ -1317,6 +1504,16 @@ pub(super) fn build_variable_bounds(input: ScucBoundsInput<'_>) -> ScucBoundsSta
     tracing::info!(
         stage = "build_bounds.main_per_period_loop",
         secs = _bounds_fn_t0.elapsed().as_secs_f64(),
+        gen_bounds_secs = t_gen_bounds.load(Ordering::Relaxed) as f64 / 1e9,
+        reserves_secs = t_reserves.load(Ordering::Relaxed) as f64 / 1e9,
+        reserves_gen_secs = t_reserves_gen.load(Ordering::Relaxed) as f64 / 1e9,
+        reserves_dlgroup_secs = t_reserves_dlgroup.load(Ordering::Relaxed) as f64 / 1e9,
+        reserves_zonal_secs = t_reserves_zonal.load(Ordering::Relaxed) as f64 / 1e9,
+        dl_bounds_secs = t_dl_bounds.load(Ordering::Relaxed) as f64 / 1e9,
+        branch_slacks_secs = t_branch_slacks.load(Ordering::Relaxed) as f64 / 1e9,
+        flowgate_slacks_secs = t_flowgate_slacks.load(Ordering::Relaxed) as f64 / 1e9,
+        gen_commit_secs = t_gen_commit.load(Ordering::Relaxed) as f64 / 1e9,
+        other_secs = t_other.load(Ordering::Relaxed) as f64 / 1e9,
         "SCUC bounds timing"
     );
     let _bounds_post_t0 = Instant::now();

@@ -171,6 +171,18 @@ class MarketPolicy:
     # isn't worth it. Set False explicitly on scenarios where cold-start
     # doesn't converge.
     disable_scuc_warm_start: bool = True
+    # Diagnostic: pin every per-bus power-balance slack column in SCUC
+    # to 0 so bus-balance rows are firm. Measures the LP weight of the
+    # soft-balance slack family. Off by default.
+    scuc_firm_bus_balance_slacks: bool = False
+    # Diagnostic: pin every branch thermal slack column in SCUC to 0.
+    # Different from ``disable_scuc_thermal_limits`` (which skips the
+    # rows entirely); this preserves the rows but removes the slack
+    # escape hatch. Off by default.
+    scuc_firm_branch_thermal_slacks: bool = False
+    # Diagnostic: drop SCUC branch thermal enforcement entirely (skips
+    # the row family). Off by default.
+    disable_scuc_thermal_limits: bool = False
     log_level: str = "info"
     capture_solver_log: bool = False
 

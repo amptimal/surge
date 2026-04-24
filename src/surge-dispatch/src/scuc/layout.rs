@@ -44,13 +44,14 @@ pub(super) struct ScucLayout {
     pub angle_diff_upper_slack: usize,
     pub n_angle_diff_rows: usize,
     /// Branch on/off binary `u^on_jt` for AC branches. Sized as
-    /// `n_ac_branches` per period. When the `allow_branch_switching`
-    /// policy is `false` the bounds layer pins every branch_commitment
-    /// column to the network's static `in_service` flag, leaving the
-    /// LP layout unchanged but the variables effectively absent. When
-    /// `true`, the variables are free in `{0, 1}` and the security
-    /// loop adds connectivity cuts over them whenever a solved
-    /// switching pattern disconnects the bus-branch graph.
+    /// `n_ac_branches` per period **only when**
+    /// `allow_branch_switching = true`; zero otherwise. In SW0 these
+    /// variables, together with `branch_startup` and `branch_shutdown`,
+    /// are omitted from the LP entirely (their static `in_service`
+    /// state feeds the bus-balance and thermal rows directly). When
+    /// switching is enabled the variables are free in `{0, 1}` and the
+    /// security loop adds connectivity cuts over them whenever a
+    /// solved switching pattern disconnects the bus-branch graph.
     pub branch_commitment: usize,
     /// Branch startup binary `u^su_jt` (close-circuit transition). Sized
     /// as `n_ac_branches` per period. State evolution row links it to
@@ -183,7 +184,7 @@ impl ScucLayout {
         n_iface_rows: usize,
         n_gen: usize,
         n_angle_diff_rows_arg: usize,
-        n_ac_branches: usize,
+        n_branch_switching_binaries_per_hour: usize,
         n_branch_switching_flow_per_hour: usize,
     ) {
         self.dispatch.block_reserve = self.dispatch.reserve + reserve_var_count;
@@ -208,10 +209,19 @@ impl ScucLayout {
         self.angle_diff_lower_slack = self.ramp_down_slack + n_gen;
         self.angle_diff_upper_slack = self.angle_diff_lower_slack + n_angle_diff_rows_arg;
         self.n_angle_diff_rows = n_angle_diff_rows_arg;
+        // Branch on/off, start-up, and shut-down binary blocks are only
+        // allocated when branch switching is enabled. In SW0 the columns
+        // would be pinned to the static `in_service` flag at bounds
+        // time and immediately dropped by presolve — we'd build ~3 ×
+        // n_ac_branches × n_hours dead columns (plus their state-
+        // evolution rows and triplets) every solve. Passing 0 for the
+        // per-hour binary count keeps those columns out of the LP
+        // entirely; callers that would reach for `branch_commitment_col`
+        // et al. must gate on `allow_branch_switching` first.
         self.branch_commitment = self.angle_diff_upper_slack + n_angle_diff_rows_arg;
-        self.branch_startup = self.branch_commitment + n_ac_branches;
-        self.branch_shutdown = self.branch_startup + n_ac_branches;
-        self.branch_flow = self.branch_shutdown + n_ac_branches;
+        self.branch_startup = self.branch_commitment + n_branch_switching_binaries_per_hour;
+        self.branch_shutdown = self.branch_startup + n_branch_switching_binaries_per_hour;
+        self.branch_flow = self.branch_shutdown + n_branch_switching_binaries_per_hour;
         self.n_branch_flow_per_hour = n_branch_switching_flow_per_hour;
         self.dispatch.n_vars = self.branch_flow + n_branch_switching_flow_per_hour;
     }
@@ -445,22 +455,46 @@ impl ScucLayout {
         self.col(hour, self.angle_diff_upper_slack + row_idx)
     }
 
+    /// True iff the branch switching binary block (commitment, start,
+    /// stop) is present in the LP — i.e., `allow_branch_switching` was
+    /// on when the layout was finalized. Callers of
+    /// `branch_commitment_col` / `branch_startup_col` /
+    /// `branch_shutdown_col` MUST gate on this.
+    pub fn has_branch_switching_binaries(&self) -> bool {
+        self.branch_startup > self.branch_commitment
+    }
+
     /// Branch on/off binary `u^on_jt` for AC branch `branch_local_idx` at
     /// hour `hour`. Eqs (48), (53)-(54), (59)-(60). The local index is the
     /// position of the branch within the network's `ac_branch_indices`
     /// (built by `branch_layout_metadata` below) — NOT the global
-    /// `network.branches[]` index.
+    /// `network.branches[]` index. Only valid when
+    /// `has_branch_switching_binaries()` is true (SW1).
     pub fn branch_commitment_col(&self, hour: usize, branch_local_idx: usize) -> usize {
+        debug_assert!(
+            self.has_branch_switching_binaries(),
+            "branch_commitment_col called without allow_branch_switching"
+        );
         self.col(hour, self.branch_commitment + branch_local_idx)
     }
 
     /// Branch close-circuit (startup) binary `u^su_jt`. Eqs (49), (53).
+    /// Only valid when `has_branch_switching_binaries()` is true.
     pub fn branch_startup_col(&self, hour: usize, branch_local_idx: usize) -> usize {
+        debug_assert!(
+            self.has_branch_switching_binaries(),
+            "branch_startup_col called without allow_branch_switching"
+        );
         self.col(hour, self.branch_startup + branch_local_idx)
     }
 
     /// Branch open-circuit (shutdown) binary `u^sd_jt`. Eqs (50), (54).
+    /// Only valid when `has_branch_switching_binaries()` is true.
     pub fn branch_shutdown_col(&self, hour: usize, branch_local_idx: usize) -> usize {
+        debug_assert!(
+            self.has_branch_switching_binaries(),
+            "branch_shutdown_col called without allow_branch_switching"
+        );
         self.col(hour, self.branch_shutdown + branch_local_idx)
     }
 
@@ -657,6 +691,28 @@ pub(super) fn build_layout_plan<'a>(input: ScucLayoutPlanInput<'a>) -> ScucLayou
         n_reg_vars,
     );
 
+    // Compute per-product gen participation once. A generator
+    // participates in a product iff it has a nonzero offer capacity
+    // in any period. DL-side participation is computed per CONSUMER
+    // GROUP (Phase 3): multiple price-decomposed blocks of the same
+    // physical consumer share a single reserve variable, so
+    // participation is asked at group granularity.
+    let gen_participation_by_product = crate::common::reserves::compute_gen_participation(
+        reserve_products,
+        spec,
+        network,
+        gen_indices,
+        spec.n_periods,
+    );
+    let dl_consumer_groups = crate::common::reserves::compute_dl_consumer_groups(&dl_list);
+    let dl_group_participation_by_product = crate::common::reserves::compute_dl_group_participation(
+        reserve_products,
+        spec,
+        &dl_list,
+        &dl_orig_idx,
+        &dl_consumer_groups,
+        spec.n_periods,
+    );
     let reserve_layout = crate::common::reserves::build_layout(
         reserve_products,
         system_reserve_requirements,
@@ -669,6 +725,9 @@ pub(super) fn build_layout_plan<'a>(input: ScucLayoutPlanInput<'a>) -> ScucLayou
         n_dl,
         layout.reserve_base(),
         has_prev_dispatch,
+        &gen_participation_by_product,
+        &dl_consumer_groups,
+        &dl_group_participation_by_product,
     );
     let has_reg_products = declared_reg_products
         && reserve_layout
@@ -805,17 +864,40 @@ pub(super) fn build_layout_plan<'a>(input: ScucLayoutPlanInput<'a>) -> ScucLayou
         })
         .sum();
 
-    let n_pb_curt_segs = spec.power_balance_penalty.curtailment.len();
-    let n_pb_excess_segs = spec.power_balance_penalty.excess.len();
-    let n_ac_branches = network.branches.len();
-    // Allocate one `pf_l` flow column per AC branch per period only
-    // when switching is enabled. Keeping the block size at 0 in the
-    // default mode means the non-switching layout is untouched.
-    let n_branch_switching_flow_per_hour = if spec.allow_branch_switching {
-        n_ac_branches
-    } else {
+    // `scuc_disable_bus_power_balance` drops the per-bus balance row
+    // family entirely. The layout consequence is that the `pb_*` column
+    // blocks (curtailment_bus, excess_bus, curtailment_seg, excess_seg)
+    // and the per-bus balance rows are never allocated — the skip must
+    // be done here in `finish_post_reserve` to keep the downstream
+    // accessors and offsets consistent. A single system-balance row per
+    // period replaces the per-bus rows; it's emitted in
+    // `scuc::problem` row building.
+    let skip_bus_pb = spec.scuc_disable_bus_power_balance;
+    let n_bus_for_pb = if skip_bus_pb { 0 } else { n_bus };
+    let n_pb_curt_segs = if skip_bus_pb {
         0
+    } else {
+        spec.power_balance_penalty.curtailment.len()
     };
+    let n_pb_excess_segs = if skip_bus_pb {
+        0
+    } else {
+        spec.power_balance_penalty.excess.len()
+    };
+    let n_ac_branches = network.branches.len();
+    // Branch switching binary and flow columns are only allocated
+    // when `allow_branch_switching = true`. In SW0 the on/off,
+    // startup, and shutdown binaries would be pinned to the static
+    // `in_service` flag and immediately presolved away — so we skip
+    // emitting them up front to save ~3 × n_ac_branches × n_hours
+    // columns (plus their state-evolution rows and triplets) on
+    // every SCUC build.
+    let (n_branch_switching_binaries_per_hour, n_branch_switching_flow_per_hour) =
+        if spec.allow_branch_switching {
+            (n_ac_branches, n_ac_branches)
+        } else {
+            (0, 0)
+        };
     layout.finish_post_reserve(
         reserve_layout.n_reserve_vars,
         n_blk_res_vars_per_hour,
@@ -823,7 +905,7 @@ pub(super) fn build_layout_plan<'a>(input: ScucLayoutPlanInput<'a>) -> ScucLayou
         n_foz_phi,
         n_foz_rho,
         n_ph_mode_vars_per_hour,
-        n_bus,
+        n_bus_for_pb,
         n_pb_curt_segs,
         n_pb_excess_segs,
         n_branch_flow,
@@ -831,7 +913,7 @@ pub(super) fn build_layout_plan<'a>(input: ScucLayoutPlanInput<'a>) -> ScucLayou
         n_iface_rows,
         n_gen,
         input.n_angle_diff_rows,
-        n_ac_branches,
+        n_branch_switching_binaries_per_hour,
         n_branch_switching_flow_per_hour,
     );
 

@@ -116,11 +116,6 @@ pub fn go_c3_build_network<'py>(
         })?;
     io_go_c3::apply_voltage_regulation(&mut network, &mut ctx, &handle.problem, &policy)
         .map_err(|err| SurgeError::new_err(format!("apply_voltage_regulation failed: {err}")))?;
-    eprintln!(
-        "go_c3_build_network explicit={} slack={:?}",
-        ctx.explicit_voltage_regulating_resource_ids.len(),
-        ctx.slack_bus_numbers
-    );
 
     // Persist the finished context on the handle so `go_c3_build_request`
     // and `go_c3_export_solution` can reuse it without rerunning the pipeline.
@@ -475,6 +470,36 @@ fn parse_policy(policy: Option<&Bound<'_, PyDict>>) -> PyResult<GoC3Policy> {
     if let Some(value) = policy.get_item("disable_scuc_warm_start")? {
         if !value.is_none() {
             out.disable_scuc_warm_start = value.extract::<bool>()?;
+        }
+    }
+    if let Some(value) = policy.get_item("scuc_firm_bus_balance_slacks")? {
+        if !value.is_none() {
+            out.scuc_firm_bus_balance_slacks = value.extract::<bool>()?;
+        }
+    }
+    if let Some(value) = policy.get_item("scuc_firm_branch_thermal_slacks")? {
+        if !value.is_none() {
+            out.scuc_firm_branch_thermal_slacks = value.extract::<bool>()?;
+        }
+    }
+    if let Some(value) = policy.get_item("disable_scuc_thermal_limits")? {
+        if !value.is_none() {
+            out.disable_scuc_thermal_limits = value.extract::<bool>()?;
+        }
+    }
+    if let Some(value) = policy.get_item("scuc_copperplate")? {
+        if !value.is_none() {
+            out.scuc_copperplate = value.extract::<bool>()?;
+        }
+    }
+    if let Some(value) = policy.get_item("scuc_power_balance_penalty_multiplier")? {
+        if !value.is_none() {
+            out.scuc_power_balance_penalty_multiplier = value.extract::<f64>()?;
+        }
+    }
+    if let Some(value) = policy.get_item("scuc_disable_bus_power_balance")? {
+        if !value.is_none() {
+            out.scuc_disable_bus_power_balance = value.extract::<bool>()?;
         }
     }
     Ok(out)

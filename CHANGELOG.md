@@ -6,6 +6,72 @@ this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows Semantic Versioning intent.
 
+## [0.1.6] — 2026-04-24
+
+`surge-dispatch` release: SCUC LP tightening, large-network
+performance, and a fix for unbounded thermal-slack relaxations. GO C3
+adapter gains diagnostic knobs for isolating large-network bottlenecks.
+
+### Fixed
+
+- **Bounded thermal-slack relaxation in SCUC.** Per-branch thermal
+  slack columns (`branch_lower_slack`, `branch_upper_slack`) were
+  allocated with `col_upper = +∞`, letting the LP relaxation
+  hallucinate unbounded virtual capacity on degenerate networks.
+  `col_upper` is now capped at 10× rating; slack rates are unchanged,
+  so the economic tradeoff is preserved. On 1576-bus D1 s003 this
+  takes the SCUC MIP from `time_limit` at 3637s with a −$1.7e14 dual
+  bound to `optimal` at 66s with a 1.92% gap; commitment decisions
+  unchanged.
+
+### Added
+
+- **Sparse reserve-product participation in SCUC.** Reserve LP columns
+  are now emitted only for `(product, resource)` pairs that can
+  qualify under some commitment state AND have a nonzero offer
+  capacity in some period. Applies to both generators and
+  dispatchable loads. On 617-bus D2 the pre-presolve LP shrinks by
+  ~97k columns.
+- **Consumer-level DL reserve aggregation.** Dispatchable loads that
+  share a `reserve_group` (the GO C3 pattern of price-decomposed
+  consumer blocks) now share a single reserve variable per product,
+  bounded by total offer and coupled to total served. Removes a
+  spurious per-block pro-rata constraint that was over-restricting
+  consumer reserve when block served-levels were uneven.
+- **Sparse reserve row families.** Cross-headroom / cross-footroom,
+  shared-limit, and energy-coupling rows are now emitted only for
+  participating resources. On 73-bus D3 s303 pre-presolve rows drop
+  37% and nonzeros 17%.
+- **SW0 branch-binary strip.** When `allow_branch_switching=false`,
+  `branch_commitment`/`startup`/`shutdown` columns and their
+  state-evolution rows are omitted from the LP entirely instead of
+  allocated and pinned. On 617-bus D2 this removes ~123k cols and
+  ~82k rows up-front.
+- **GO C3 SCUC diagnostic knobs** on `GoC3Policy` / `DispatchRuntime`:
+  - `scuc_disable_bus_power_balance` — drop per-bus KCL rows and
+    `pb_*` slack cols; replace with a single system-balance row plus
+    a post-solve DC-PF theta repair before N-1 screening. Defaults to
+    `true` for GO C3. On 6049-bus D1 s015 this takes SCUC from
+    unsolved at 300s to optimal in 8s.
+  - `scuc_copperplate` — zero the power-balance penalty so per-bus
+    rows become trivially satisfied via free slack (for isolating
+    whether MIP cost lives in UC or in network coupling).
+  - `scuc_firm_bus_balance_slacks`, `scuc_firm_branch_thermal_slacks`,
+    `disable_scuc_thermal_limits` — per-family slack-firming probes.
+
+### Performance (`surge-dispatch`)
+
+- **O(N²) hoists in `attach_keyed_period_views`.** Branch / flowgate
+  shadow-price lookups and zonal reserve participant matching no
+  longer re-scan the network per period. On 4224-bus D1 s014 this
+  function drops from 108s to sub-second.
+- **Hoisted `network.bus_index_map()` rebuilds** out of the
+  `build_capacity_logic_reserve_rows` zone loops. Per-product,
+  per-period cost drops ~1000× on 4224-bus D1 s014.
+- **Cached zonal participant sets** on `ActiveZonalRequirement`,
+  eliminating an O(N_bus) HashMap rebuild per DL per zonal
+  requirement per period in SCUC bounds construction.
+
 ## [0.1.5] — 2026-04-22
 
 Python-side release: agent / MCP integration helpers, a PyPSA netCDF

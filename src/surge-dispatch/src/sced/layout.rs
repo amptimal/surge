@@ -370,6 +370,26 @@ pub(super) fn select_active_inputs<'a>(
         .filter(|(_, vb)| vb.in_service && vb.period == context.period)
         .map(|(i, _)| i)
         .collect();
+    // Sparse participation per product — same semantics as the SCUC
+    // layout. DL-side uses the CONSUMER GROUP (Phase 3) granularity.
+    // Participation is computed across the full horizon so the
+    // column layout stays consistent across SCED periods.
+    let gen_participation_by_product = crate::common::reserves::compute_gen_participation(
+        reserve_products,
+        spec,
+        network,
+        gen_indices,
+        spec.n_periods,
+    );
+    let dl_consumer_groups = crate::common::reserves::compute_dl_consumer_groups(&dl_list);
+    let dl_group_participation_by_product = crate::common::reserves::compute_dl_group_participation(
+        reserve_products,
+        spec,
+        &dl_list,
+        &dl_orig_idx,
+        &dl_consumer_groups,
+        spec.n_periods,
+    );
     let reserve_layout = crate::common::reserves::build_layout_for_period(
         reserve_products,
         system_reserve_requirements,
@@ -383,6 +403,9 @@ pub(super) fn select_active_inputs<'a>(
         reserve_var_base,
         context.has_prev_dispatch(),
         context.period,
+        &gen_participation_by_product,
+        &dl_consumer_groups,
+        &dl_group_participation_by_product,
     );
     let reserve_ctx = ReserveLpCtx::from_problem(
         network,

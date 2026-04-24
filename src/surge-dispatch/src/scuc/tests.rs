@@ -898,7 +898,8 @@ fn test_indexed_connectivity_cut_emits_sum_row_triplets() {
         /* n_ph_mode_vars_per_hour */ 0, /* n_bus */ 3, /* n_pb_curt_segs */ 0,
         /* n_pb_excess_segs */ 0, /* n_branch_flow */ 0, /* n_fg_rows */ 0,
         /* n_iface_rows */ 0, /* n_gen */ 0, /* n_angle_diff_rows */ 0,
-        /* n_ac_branches */ 3, /* n_branch_switching_flow_per_hour */ 3,
+        /* n_branch_switching_binaries_per_hour */ 3,
+        /* n_branch_switching_flow_per_hour */ 3,
     );
 
     // Cut set {0, 2} at period 1: at least one of branches 0 or 2

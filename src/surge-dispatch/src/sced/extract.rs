@@ -322,7 +322,11 @@ fn build_objective_terms(input: &ScedExtractionInput<'_>) -> Vec<ObjectiveTerm> 
 
     for ap in &active_inputs.reserve_layout.products {
         for (j, &gi) in setup.gen_indices.iter().enumerate() {
-            let award_mw = sol.x[ap.gen_var_offset + j] * base;
+            // Non-participants have no column — no award to report.
+            let Some(col) = ap.gen_reserve_col(j) else {
+                continue;
+            };
+            let award_mw = sol.x[col] * base;
             if award_mw.abs() <= 1e-9 {
                 continue;
             }
@@ -351,38 +355,61 @@ fn build_objective_terms(input: &ScedExtractionInput<'_>) -> Vec<ObjectiveTerm> 
                 ),
             );
         }
-        for (k, dl) in active_inputs.dl_list.iter().enumerate() {
-            let award_mw = sol.x[ap.dl_var_offset + k] * base;
-            if award_mw.abs() <= 1e-9 {
+        // DL reserve awards are published per-BLOCK via uniform
+        // pro-rata split of the consumer group's award. All members of
+        // a group share the same $/MWh rate, so Σ (share × rate) ×
+        // dt_h = group_award × rate × dt_h exactly — the total
+        // reserve procurement cost matches the LP objective to the
+        // bit.
+        for (gi, group) in active_inputs
+            .reserve_layout
+            .dl_consumer_groups
+            .iter()
+            .enumerate()
+        {
+            let Some(col) = ap.dl_group_reserve_col(gi) else {
+                continue;
+            };
+            let group_award_mw = sol.x[col] * base;
+            if group_award_mw.abs() <= 1e-9 {
                 continue;
             }
-            let resource_id = dispatchable_load_resource_id(
-                dl,
-                active_inputs.dl_orig_idx.get(k).copied().unwrap_or(k),
-            );
-            let rate = dispatchable_load_reserve_offer_for_period(
-                spec,
-                active_inputs.dl_orig_idx.get(k).copied().unwrap_or(k),
-                dl,
-                &ap.product.id,
-                input.context.period,
-            )
-            .map(|offer| offer.cost_per_mwh)
-            .unwrap_or(0.0);
-            push_term(
-                &mut terms,
-                make_term(
-                    format!("reserve:{}", ap.product.id),
-                    ObjectiveBucket::Reserve,
-                    ObjectiveTermKind::ReserveProcurement,
-                    ObjectiveSubjectKind::Resource,
-                    resource_id,
-                    award_mw * rate * dt_h,
-                    Some(award_mw),
-                    Some(ObjectiveQuantityUnit::Mw),
-                    Some(rate * dt_h),
-                ),
-            );
+            let shares =
+                crate::common::reserves::prorata_group_award_uniform(group, group_award_mw);
+            for (offset, &k) in group.member_dl_indices.iter().enumerate() {
+                let award_mw = shares[offset];
+                if award_mw.abs() <= 1e-9 {
+                    continue;
+                }
+                let dl = active_inputs.dl_list[k];
+                let resource_id = dispatchable_load_resource_id(
+                    dl,
+                    active_inputs.dl_orig_idx.get(k).copied().unwrap_or(k),
+                );
+                let rate = dispatchable_load_reserve_offer_for_period(
+                    spec,
+                    active_inputs.dl_orig_idx.get(k).copied().unwrap_or(k),
+                    dl,
+                    &ap.product.id,
+                    input.context.period,
+                )
+                .map(|offer| offer.cost_per_mwh)
+                .unwrap_or(0.0);
+                push_term(
+                    &mut terms,
+                    make_term(
+                        format!("reserve:{}", ap.product.id),
+                        ObjectiveBucket::Reserve,
+                        ObjectiveTermKind::ReserveProcurement,
+                        ObjectiveSubjectKind::Resource,
+                        resource_id,
+                        award_mw * rate * dt_h,
+                        Some(award_mw),
+                        Some(ObjectiveQuantityUnit::Mw),
+                        Some(rate * dt_h),
+                    ),
+                );
+            }
         }
         let reserve_subject_id = reserve_requirement_subject_id(&ap.product.id, None);
         for slack_idx in 0..ap.n_penalty_slacks {

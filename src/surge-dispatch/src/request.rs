@@ -623,6 +623,12 @@ pub(crate) struct DispatchInput {
     pub ac_relax_committed_pmin_to_zero: bool,
     pub lp_solver: Option<Arc<dyn LpSolver>>,
     pub capture_model_diagnostics: bool,
+    /// See [`crate::request::DispatchRuntime::scuc_firm_bus_balance_slacks`].
+    pub scuc_firm_bus_balance_slacks: bool,
+    /// See [`crate::request::DispatchRuntime::scuc_firm_branch_thermal_slacks`].
+    pub scuc_firm_branch_thermal_slacks: bool,
+    /// See [`crate::request::DispatchRuntime::scuc_disable_bus_power_balance`].
+    pub scuc_disable_bus_power_balance: bool,
     /// Per-period AC SCED concurrency. See
     /// [`crate::request::DispatchRuntime::ac_sced_period_concurrency`] for
     /// semantics.
@@ -714,6 +720,9 @@ impl Default for DispatchInput {
             ac_relax_committed_pmin_to_zero: false,
             lp_solver: None,
             capture_model_diagnostics: false,
+            scuc_firm_bus_balance_slacks: false,
+            scuc_firm_branch_thermal_slacks: false,
+            scuc_disable_bus_power_balance: false,
             ac_sced_period_concurrency: None,
         }
     }

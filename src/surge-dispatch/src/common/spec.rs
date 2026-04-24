@@ -341,6 +341,16 @@ pub(crate) struct DispatchProblemSpec<'a> {
     /// When true, capture a [`crate::model_diagnostic::ModelDiagnostic`]
     /// snapshot after each LP/MIP solve.
     pub capture_model_diagnostics: bool,
+    /// See [`crate::request::DispatchRuntime::scuc_firm_bus_balance_slacks`].
+    pub scuc_firm_bus_balance_slacks: bool,
+    /// See [`crate::request::DispatchRuntime::scuc_firm_branch_thermal_slacks`].
+    pub scuc_firm_branch_thermal_slacks: bool,
+    /// See [`crate::request::DispatchRuntime::scuc_disable_bus_power_balance`].
+    /// When `true`, the SCUC layout drops the `pb_curtailment_bus` /
+    /// `pb_excess_bus` / `pb_curtailment_seg` / `pb_excess_seg` column
+    /// blocks, the per-bus balance rows, and the two `pb_agg` coupling
+    /// rows — replaced by a single system-balance row per period.
+    pub scuc_disable_bus_power_balance: bool,
     /// Per-period AC SCED concurrency. See
     /// [`crate::request::DispatchRuntime::ac_sced_period_concurrency`] for
     /// semantics.
@@ -448,6 +458,9 @@ impl<'a> DispatchProblemSpec<'a> {
             options.generator_cost_modeling.as_ref(),
             &options.initial_state,
             false,
+            false,
+            false,
+            false,
             None,
         )
     }
@@ -543,6 +556,9 @@ impl<'a> DispatchProblemSpec<'a> {
             input.generator_cost_modeling.as_ref(),
             &input.initial_state,
             input.capture_model_diagnostics,
+            input.scuc_firm_bus_balance_slacks,
+            input.scuc_firm_branch_thermal_slacks,
+            input.scuc_disable_bus_power_balance,
             input.ac_sced_period_concurrency,
         )
     }
@@ -638,6 +654,9 @@ impl<'a> DispatchProblemSpec<'a> {
         generator_cost_modeling: Option<&'a GeneratorCostModeling>,
         initial_state: &'a IndexedDispatchInitialState,
         capture_model_diagnostics: bool,
+        scuc_firm_bus_balance_slacks: bool,
+        scuc_firm_branch_thermal_slacks: bool,
+        scuc_disable_bus_power_balance: bool,
         ac_sced_period_concurrency: Option<usize>,
     ) -> Self {
         let clock = DispatchClock::new(dt_hours, period_hours, period_hour_prefix);
@@ -732,6 +751,9 @@ impl<'a> DispatchProblemSpec<'a> {
             generator_cost_modeling,
             initial_state,
             capture_model_diagnostics,
+            scuc_firm_bus_balance_slacks,
+            scuc_firm_branch_thermal_slacks,
+            scuc_disable_bus_power_balance,
             ac_sced_period_concurrency,
         }
     }
@@ -848,6 +870,9 @@ impl<'a> DispatchProblemSpec<'a> {
             generator_cost_modeling: self.generator_cost_modeling,
             initial_state: self.initial_state,
             capture_model_diagnostics: self.capture_model_diagnostics,
+            scuc_firm_bus_balance_slacks: self.scuc_firm_bus_balance_slacks,
+            scuc_firm_branch_thermal_slacks: self.scuc_firm_branch_thermal_slacks,
+            scuc_disable_bus_power_balance: self.scuc_disable_bus_power_balance,
             ac_sced_period_concurrency: self.ac_sced_period_concurrency,
         }
     }
@@ -991,6 +1016,9 @@ impl<'a> DispatchProblemSpec<'a> {
             generator_cost_modeling: self.generator_cost_modeling,
             initial_state: self.initial_state,
             capture_model_diagnostics: self.capture_model_diagnostics,
+            scuc_firm_bus_balance_slacks: self.scuc_firm_bus_balance_slacks,
+            scuc_firm_branch_thermal_slacks: self.scuc_firm_branch_thermal_slacks,
+            scuc_disable_bus_power_balance: self.scuc_disable_bus_power_balance,
             ac_sced_period_concurrency: self.ac_sced_period_concurrency,
         }
     }

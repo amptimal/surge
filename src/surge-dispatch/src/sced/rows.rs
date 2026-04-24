@@ -311,11 +311,13 @@ pub(super) fn build_rows(
             for ap in &input.reserve_layout.products {
                 let impact = period_spec.storage_reserve_soc_impact(gi, ap.product.id.as_str());
                 if impact > 0.0 {
-                    triplets.push(Triplet {
-                        row,
-                        col: ap.gen_var_offset + j,
-                        val: -impact * period_hours * input.base,
-                    });
+                    if let Some(col) = ap.gen_reserve_col(j) {
+                        triplets.push(Triplet {
+                            row,
+                            col,
+                            val: -impact * period_hours * input.base,
+                        });
+                    }
                 }
             }
             row_lower.push(storage.soc_min_mwh);
@@ -337,11 +339,13 @@ pub(super) fn build_rows(
             for ap in &input.reserve_layout.products {
                 let impact = period_spec.storage_reserve_soc_impact(gi, ap.product.id.as_str());
                 if impact < 0.0 {
-                    triplets.push(Triplet {
-                        row,
-                        col: ap.gen_var_offset + j,
-                        val: -impact * period_hours * input.base,
-                    });
+                    if let Some(col) = ap.gen_reserve_col(j) {
+                        triplets.push(Triplet {
+                            row,
+                            col,
+                            val: -impact * period_hours * input.base,
+                        });
+                    }
                 }
             }
             row_lower.push(f64::NEG_INFINITY);

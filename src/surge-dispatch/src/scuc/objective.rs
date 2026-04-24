@@ -269,28 +269,45 @@ pub(super) fn build_objective(input: ScucObjectiveInput<'_>) -> Vec<f64> {
 
         for ap in &input.reserve_layout.products {
             for (j, &gi) in input.gen_indices.iter().enumerate() {
+                // Non-participants have no reserve col; nothing to cost.
+                let Some(intra_period_col) = ap.gen_reserve_col(j) else {
+                    continue;
+                };
                 let g = &input.network.generators[gi];
                 let cost = generator_reserve_offer_for_period(input.spec, gi, g, &ap.product.id, t)
                     .map(|offer| offer.cost_per_mwh)
                     .unwrap_or(0.0);
                 if cost > 0.0 {
                     // Eqs (90)-(97): z^[kind]_jt = dt × c × p^[kind]_jt.
-                    col_cost[input.layout.col(t, ap.gen_var_offset + j)] =
+                    col_cost[input.layout.col(t, intra_period_col)] =
                         pu_h_cost(cost, input.base, dt_h);
                 }
             }
-            for (k, dl) in input.dl_list.iter().enumerate() {
-                let cost = dispatchable_load_reserve_offer_for_period(
-                    input.spec,
-                    input.dl_orig_idx.get(k).copied().unwrap_or(k),
-                    dl,
-                    &ap.product.id,
-                    t,
-                )
-                .map(|offer| offer.cost_per_mwh)
-                .unwrap_or(0.0);
+            // DL reserve cost is now group-level. All members of a
+            // group share the same `cost_per_mwh` for a product, so
+            // use the first member's offer as the group's rate.
+            for (gi, group) in input.reserve_layout.dl_consumer_groups.iter().enumerate() {
+                let Some(intra_period_col) = ap.dl_group_reserve_col(gi) else {
+                    continue;
+                };
+                let cost = group
+                    .member_dl_indices
+                    .iter()
+                    .find_map(|&k| {
+                        let dl = input.dl_list[k];
+                        dispatchable_load_reserve_offer_for_period(
+                            input.spec,
+                            input.dl_orig_idx.get(k).copied().unwrap_or(k),
+                            dl,
+                            &ap.product.id,
+                            t,
+                        )
+                        .map(|offer| offer.cost_per_mwh)
+                        .filter(|c| *c > 0.0)
+                    })
+                    .unwrap_or(0.0);
                 if cost > 0.0 {
-                    col_cost[input.layout.col(t, ap.dl_var_offset + k)] =
+                    col_cost[input.layout.col(t, intra_period_col)] =
                         pu_h_cost(cost, input.base, dt_h);
                 }
             }
@@ -410,20 +427,22 @@ pub(super) fn build_objective(input: ScucObjectiveInput<'_>) -> Vec<f64> {
             }
         }
 
-        if let Some(penalty) = input.spec.power_balance_penalty.curtailment.first() {
-            let _ = penalty;
-            for seg_idx in 0..input.spec.power_balance_penalty.curtailment.len() {
-                let seg_rate = input.spec.power_balance_penalty.curtailment[seg_idx].1;
-                col_cost[input.layout.pb_curtailment_seg_col(t, seg_idx)] =
-                    pu_h_cost(seg_rate, input.base, dt_h);
+        if !input.spec.scuc_disable_bus_power_balance {
+            if let Some(penalty) = input.spec.power_balance_penalty.curtailment.first() {
+                let _ = penalty;
+                for seg_idx in 0..input.spec.power_balance_penalty.curtailment.len() {
+                    let seg_rate = input.spec.power_balance_penalty.curtailment[seg_idx].1;
+                    col_cost[input.layout.pb_curtailment_seg_col(t, seg_idx)] =
+                        pu_h_cost(seg_rate, input.base, dt_h);
+                }
             }
-        }
-        if let Some(penalty) = input.spec.power_balance_penalty.excess.first() {
-            let _ = penalty;
-            for seg_idx in 0..input.spec.power_balance_penalty.excess.len() {
-                let seg_rate = input.spec.power_balance_penalty.excess[seg_idx].1;
-                col_cost[input.layout.pb_excess_seg_col(t, seg_idx)] =
-                    pu_h_cost(seg_rate, input.base, dt_h);
+            if let Some(penalty) = input.spec.power_balance_penalty.excess.first() {
+                let _ = penalty;
+                for seg_idx in 0..input.spec.power_balance_penalty.excess.len() {
+                    let seg_rate = input.spec.power_balance_penalty.excess[seg_idx].1;
+                    col_cost[input.layout.pb_excess_seg_col(t, seg_idx)] =
+                        pu_h_cost(seg_rate, input.base, dt_h);
+                }
             }
         }
 

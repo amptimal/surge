@@ -352,7 +352,7 @@ pub fn build_dispatch_request(
     }
 
     // ── Market ───────────────────────────────────────────────────────────
-    let market = DispatchMarket {
+    let mut market = DispatchMarket {
         reserve_products,
         zonal_reserve_requirements,
         generator_offer_schedules,
@@ -367,6 +367,33 @@ pub fn build_dispatch_request(
         penalty_config: goc3_penalty_config(problem, policy.scuc_thermal_penalty_multiplier),
         ..DispatchMarket::default()
     };
+    // Copperplate diagnostic: when enabled, zero out the power-balance
+    // slack penalty so per-bus balance rows become trivially satisfied
+    // via free slack. The LP still emits the full per-bus balance row
+    // family + θ + flow variables, but since the slack is free, the
+    // effective problem is copperplate — the solver sees no network
+    // coupling. Use only to probe whether the UC + reserves part of
+    // the MIP is solvable independently of DC-PF.
+    if policy.scuc_copperplate {
+        market.power_balance_penalty = surge_dispatch::request::network::PowerBalancePenalty {
+            curtailment: vec![(f64::MAX, 0.0)],
+            excess: vec![(f64::MAX, 0.0)],
+        };
+    } else if (policy.scuc_power_balance_penalty_multiplier - 1.0).abs() > 1e-12 {
+        // Scale the default (or GO C3-derived) power-balance penalty so
+        // bus slack is cheaper relative to other costs. Useful when the
+        // default $1e7/MW curtailment penalty is so dominant that
+        // integer-commitment solutions price above any achievable LP
+        // relaxation (6049-bus D1 observed this on every default-slack
+        // probe). See `GoC3Policy::scuc_power_balance_penalty_multiplier`.
+        let mult = policy.scuc_power_balance_penalty_multiplier.max(0.0);
+        for (_, penalty) in market.power_balance_penalty.curtailment.iter_mut() {
+            *penalty *= mult;
+        }
+        for (_, penalty) in market.power_balance_penalty.excess.iter_mut() {
+            *penalty *= mult;
+        }
+    }
 
     // ── Network ──────────────────────────────────────────────────────────
     let mut network = DispatchNetwork::default();
@@ -378,7 +405,7 @@ pub fn build_dispatch_request(
             network.security = Some(security);
         }
     }
-    network.thermal_limits.enforce = true;
+    network.thermal_limits.enforce = !policy.disable_scuc_thermal_limits;
     network.ramping.enforcement = ConstraintEnforcement::Hard;
     if let Some(vio) = &problem.network.violation_cost {
         network.energy_windows.penalty_per_puh = vio.e_vio_cost / base_mva.max(1.0);
@@ -468,6 +495,9 @@ pub fn build_dispatch_request(
     // re-solve adds ~15-25s/617-bus SCUC.
     let mut runtime = DispatchRuntime {
         run_pricing: policy.run_pricing,
+        scuc_firm_bus_balance_slacks: policy.scuc_firm_bus_balance_slacks,
+        scuc_firm_branch_thermal_slacks: policy.scuc_firm_branch_thermal_slacks,
+        scuc_disable_bus_power_balance: policy.scuc_disable_bus_power_balance,
         ..DispatchRuntime::default()
     };
     if matches!(formulation, Formulation::Ac) {
