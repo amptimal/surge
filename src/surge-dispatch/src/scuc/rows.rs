@@ -2057,6 +2057,113 @@ pub(super) fn build_foz_cross_rows(input: ScucFozCrossRowsInput<'_>) -> LpBlock 
     block
 }
 
+/// Bucket the horizon's periods into 24-hour windows by cumulative
+/// duration. Each bucket closes on the first period whose cumulative
+/// duration reaches 24 h (so a single period that straddles a day
+/// boundary lands wholly in one bucket). The trailing partial bucket
+/// is kept as-is and pro-rated by `bucket_h / 24` when applied.
+///
+/// Returns `(start_period_inclusive, end_period_exclusive, bucket_hours)`.
+pub(super) fn day_buckets(
+    spec: &DispatchProblemSpec<'_>,
+    n_hours: usize,
+) -> Vec<(usize, usize, f64)> {
+    let mut buckets = Vec::new();
+    if n_hours == 0 {
+        return buckets;
+    }
+    let mut start = 0usize;
+    let mut acc = 0.0f64;
+    for t in 0..n_hours {
+        acc += spec.period_hours(t);
+        if acc >= 24.0 - 1e-9 {
+            buckets.push((start, t + 1, acc));
+            start = t + 1;
+            acc = 0.0;
+        }
+    }
+    if start < n_hours && acc > 1e-9 {
+        buckets.push((start, n_hours, acc));
+    }
+    buckets
+}
+
+pub(super) fn storage_daily_cycle_rows(setup: &DispatchSetup, n_buckets: usize) -> usize {
+    if n_buckets == 0 {
+        return 0;
+    }
+    setup
+        .storage_daily_cycle_limit
+        .iter()
+        .filter(|o| o.is_some())
+        .count()
+        * n_buckets
+}
+
+pub(super) struct ScucStorageDailyCycleRowsInput<'a> {
+    pub network: &'a Network,
+    pub spec: &'a DispatchProblemSpec<'a>,
+    pub setup: &'a DispatchSetup,
+    pub layout: &'a ScucLayout,
+    pub n_hours: usize,
+    pub row_base: usize,
+}
+
+pub(super) fn build_storage_daily_cycle_rows(input: ScucStorageDailyCycleRowsInput<'_>) -> LpBlock {
+    let buckets = day_buckets(input.spec, input.n_hours);
+    let n_rows = storage_daily_cycle_rows(input.setup, buckets.len());
+    if n_rows == 0 {
+        return LpBlock::empty();
+    }
+    let mut block = LpBlock {
+        triplets: Vec::new(),
+        row_lower: Vec::with_capacity(n_rows),
+        row_upper: Vec::with_capacity(n_rows),
+    };
+    let mut local_row = 0usize;
+    for (s, &(_, _, gi)) in input.setup.storage_gen_local.iter().enumerate() {
+        let limit = match input.setup.storage_daily_cycle_limit[s] {
+            Some(v) => v,
+            None => continue,
+        };
+        let energy_mwh = input.network.generators[gi]
+            .storage
+            .as_ref()
+            .expect("storage_gen_local only contains generators with storage")
+            .energy_capacity_mwh;
+        for &(start_t, end_t, bucket_h) in &buckets {
+            let row = input.row_base + local_row;
+            for t in start_t..end_t {
+                let dt = input.spec.period_hours(t);
+                push_triplet(
+                    &mut block.triplets,
+                    row,
+                    input.layout.storage_charge_col(t, s),
+                    dt,
+                );
+                push_triplet(
+                    &mut block.triplets,
+                    row,
+                    input.layout.storage_discharge_col(t, s),
+                    dt,
+                );
+            }
+            // SCUC's storage charge/discharge variables are in MW (see
+            // `scuc/bounds.rs`, which sets `col_upper = charge_mw_max()`
+            // directly). With `dt` in hours, the LHS sums to throughput
+            // in MWh; the cap is `limit · 2 · E_mwh` pro-rated by the
+            // bucket's hour fraction.
+            let day_fraction = (bucket_h / 24.0).clamp(0.0, 1.0);
+            let cap_mwh = limit * 2.0 * energy_mwh * day_fraction;
+            block.row_lower.push(-BIG_M);
+            block.row_upper.push(cap_mwh);
+            local_row += 1;
+        }
+    }
+    debug_assert_eq!(local_row, n_rows);
+    block
+}
+
 pub(super) struct ScucPhModeUnit {
     pub storage_idx: usize,
     pub dis_max_mw: f64,

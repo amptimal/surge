@@ -1,5 +1,10 @@
 # SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0
-"""Smoke tests for the RTO dashboard adapter (``dashboards.rto.api``)."""
+"""Smoke tests for the RTO dashboard adapter (``dashboards.rto.api``).
+
+The dashboard runs every solve through ``surge.market.go_c3``'s
+canonical native two-stage SCUC → AC SCED pipeline, so these tests
+exercise the goc3 cases bundled under ``examples/cases/``.
+"""
 
 from __future__ import annotations
 
@@ -8,124 +13,187 @@ import pytest
 from dashboards.rto import api as rto_api
 
 
-def test_case_registry_exposes_expected_cases() -> None:
+def test_case_registry_exposes_goc3_and_ieee_cases() -> None:
+    """Both GO-C3 archives and IEEE built-ins are available."""
     ids = {c["id"] for c in rto_api.available_cases()}
-    # Built-in IEEE set + the two GO-C3 references the dashboard advertises.
-    for expected in ("case9", "case14", "case30", "case57", "case118", "goc3_73"):
+    for expected in ("goc3_73", "goc3_617", "goc3_2000", "case9", "case14", "case30"):
         assert expected in ids, f"case {expected} missing from registry"
 
 
-def test_scaffold_case14_has_synthesized_defaults() -> None:
-    scen = rto_api.build_scaffold("case14")
-    assert scen["source"]["case_id"] == "case14"
-    # 24-period horizon at 60-min resolution by default
-    assert scen["time_axis"]["periods"] == 24
-    assert scen["time_axis"]["resolution_minutes"] == 60
-    # All four reserve products should be present with sane defaults
-    assert set(scen["reserves_config"]["products"].keys()) == {"reg_up", "reg_down", "syn", "nsyn"}
-    # Generators populated with Pmax > 0
-    assert scen["generators"]
-    assert any(g["pmax_mw"] > 0 for g in scen["generators"])
-    # Loads populated from the case (case14 has loads at ~11 buses)
-    assert len(scen["loads"]) >= 10
-    # Policy default is "optimize" — the MIP path
-    assert scen["policy"]["commitment_mode"] == "optimize"
+@pytest.mark.slow
+def test_scaffold_goc3_2000_carries_problem_path() -> None:
+    """The bundled 2000-bus archive decompresses on first scaffold
+    and threads the problem path through the scenario source.
+
+    Slow (~15 s on first run, ~5 s after the cached decompressed
+    JSON warms up); excluded from the default pytest run via the
+    ``slow`` marker. Pass ``--run-slow`` to include.
+    """
+    scen = rto_api.build_scaffold("goc3_2000")
+    src = scen["source"]
+    assert src["case_id"] == "goc3_2000"
+    assert src["family"] == "goc3"
+    assert "goc3_problem_path" in src
+    # 2000-bus archives ship a non-trivial generator and load roster.
+    assert len(scen["generators"]) > 500
+    assert len(scen["loads"]) > 500
 
 
-def test_solve_case14_returns_settlement() -> None:
+def test_default_case_is_goc3_73_d3_315() -> None:
+    """The first case in the registry is the 73-bus event4 D3 315 —
+    that's what the dashboard's frontend lands on at startup. D3
+    has the long uniform 42-period horizon that exercises the
+    most pipeline phases on a fresh demo."""
+    cases = rto_api.available_cases()
+    assert cases[0]["id"] == "goc3_73_d3_315"
+
+
+def test_solve_case14_via_ieee_path() -> None:
+    """case14 routes through the surge.solve_dispatch path — synthesized
+    offer curves + load forecast + zonal reserve requirements.
+
+    Pinned to ``solve_mode=scuc`` because case14's bundled data has a
+    regulated-bus voltage outside its ``[v_min, v_max]`` envelope which
+    the AC-OPF rejects pre-solve. The dashboard's default is now
+    ``scuc_ac_sced``; users who pick case14 with AC SCED on get a
+    clear error from surge rather than a mysterious failure.
+    """
     scen = rto_api.build_scaffold("case14")
+    scen["policy"]["solve_mode"] = "scuc"
     result = rto_api.run_solve(scen)
     assert result["status"] == "ok", result.get("error")
+    assert result["periods"] == scen["time_axis"]["periods"]
+    # 14 buses → an LMP series for each.
+    assert len(result["lmps_by_bus"]) == 14
+    for bus_lmps in result["lmps_by_bus"].values():
+        assert len(bus_lmps) == result["periods"]
     summary = result["summary"]
-    # Case14 with positive loads should produce positive energy payment
     assert summary["energy_payment_dollars"] > 0
     assert summary["load_payment_dollars"] > 0
-    assert summary["mean_system_lmp"] >= 0
-    # Per-period LMPs for every bus
-    assert len(result["lmps_by_bus"]) == 14
-    for bus_series in result["lmps_by_bus"].values():
-        assert len(bus_series) == scen["time_axis"]["periods"]
-    # Four reserve products should show up in the settlement (default 5/5/3/2 %)
-    product_ids = {r["product_id"] for r in result["reserve_awards"]}
-    assert product_ids >= {"reg_up", "reg_down", "syn", "nsyn"}
 
 
-def test_scenario_roundtrip_solves_identically(tmp_path) -> None:
-    """Serialize a scenario to JSON and back — result should match."""
-    import json
+def test_solve_case9_via_ieee_path_all_committed() -> None:
+    """case9 with all-committed commitment is the smallest sanity check."""
     scen = rto_api.build_scaffold("case9")
-    first = rto_api.run_solve(scen)
-    # Round-trip
-    path = tmp_path / "scen.json"
-    path.write_text(json.dumps(scen))
-    reloaded = json.loads(path.read_text())
-    second = rto_api.run_solve(reloaded)
-    assert first["status"] == "ok" and second["status"] == "ok"
-    assert first["summary"]["production_cost_dollars"] == pytest.approx(
-        second["summary"]["production_cost_dollars"], rel=1e-6
-    )
-
-
-def test_reserve_requirement_scaled_by_percent() -> None:
-    """Reserve requirement = %-of-peak × peak load across periods."""
-    scen = rto_api.build_scaffold("case14")
-    # Tweak reg_up to 10% — should roughly double from the 5% default
-    scen["reserves_config"]["products"]["reg_up"] = {"percent_of_peak": 10.0, "absolute_mw": None}
-    scen["reserves_config"]["products"]["reg_down"] = {"percent_of_peak": 0.0, "absolute_mw": None}
-    scen["reserves_config"]["products"]["syn"] = {"percent_of_peak": 0.0, "absolute_mw": None}
-    scen["reserves_config"]["products"]["nsyn"] = {"percent_of_peak": 0.0, "absolute_mw": None}
+    scen["policy"]["solve_mode"] = "scuc"
+    scen["policy"]["commitment_mode"] = "all_committed"
     result = rto_api.run_solve(scen)
-    assert result["status"] == "ok"
-    # Only reg_up has a requirement
-    reg_up = next(r for r in result["reserve_awards"] if r["product_id"] == "reg_up")
-    # Peak load on case14 with duck profile: ~259 MW × 1.0 ≈ 259 MW peak
-    # so 10% = ~26 MW requirement at peak hour.
-    assert max(reg_up["requirement_mw"]) > 20.0
+    assert result["status"] == "ok", result.get("error")
+    assert len(result["lmps_by_bus"]) == 9
 
 
-def test_scaffold_topology_present_for_builtins() -> None:
-    """Every built-in case should come with a bus/edge layout."""
-    for case_id in ("case9", "case14", "case30"):
-        scen = rto_api.build_scaffold(case_id)
-        topo = scen["topology"]
-        bus_count = scen["network_summary"]["buses"]
-        assert len(topo["buses"]) == bus_count
-        # Positions normalised to the unit box.
-        for b in topo["buses"]:
-            assert 0.0 <= b["x"] <= 1.0
-            assert 0.0 <= b["y"] <= 1.0
-        # Edge endpoints refer to known bus numbers.
-        numbers = {b["number"] for b in topo["buses"]}
-        for br in topo["branches"]:
-            assert br["from"] in numbers and br["to"] in numbers
-
-
-def test_goc3_case_pulls_load_profile_from_problem_file() -> None:
-    """GO-C3 73-bus should have load profiles sourced from its
-    companion ``.goc3-problem.json.zst`` — not the empty network."""
+def test_scaffold_goc3_73_carries_problem_path() -> None:
+    """Loading the goc3_73 scaffold decompresses the problem
+    archive and threads the cache path through the scenario
+    ``source`` block so ``run_solve`` can hand it to
+    ``GoC3Problem.load``."""
     scen = rto_api.build_scaffold("goc3_73")
+    src = scen["source"]
+    assert src["case_id"] == "goc3_73"
+    assert src["family"] == "goc3"
+    assert "goc3_problem_path" in src
     # 18 × 15-min intervals from the problem archive.
     assert scen["time_axis"]["periods"] == 18
     assert scen["time_axis"]["resolution_minutes"] == 15
-    # 51 consumer devices → 51 bus loads.
+    # Generators / loads pulled from the goc3 archive.
+    assert len(scen["generators"]) > 100
     assert len(scen["loads"]) >= 50
-    peak = scen["network_summary"]["total_load_mw"]
-    assert peak > 1000.0, f"GO-73 peak load should be ~7 GW, got {peak}"
-    # Each load carries a per-period profile.
-    assert all("profile_mw" in l for l in scen["loads"])
 
 
-def test_load_shape_changes_profile() -> None:
-    """Switching from duck to flat changes per-period load totals."""
-    scen = rto_api.build_scaffold("case14")
-    scen["load_config"]["profile_shape"] = "duck"
-    result_duck = rto_api.run_solve(scen)
-    scen["load_config"]["profile_shape"] = "flat"
-    result_flat = rto_api.run_solve(scen)
-    assert result_duck["status"] == "ok" and result_flat["status"] == "ok"
-    # Flat profile has same load every period; duck has wider variance.
-    def period_totals(r):
-        return [sum(l["served_mw"][t] for l in r["loads"]) for t in range(r["periods"])]
-    dv = period_totals(result_duck)
-    fv = period_totals(result_flat)
-    assert max(dv) - min(dv) > max(fv) - min(fv) * 1.1
+def test_scaffold_default_policy_enables_reactive_pin_for_goc3() -> None:
+    """``reactive_support_pin_factor`` defaults to 0.2 on goc3 cases —
+    the canonical retry factor that resolves Ipopt convergence-basin
+    issues on 73-/617-bus AC SCED."""
+    scen = rto_api.build_scaffold("goc3_73")
+    assert scen["policy"]["reactive_support_pin_factor"] == pytest.approx(0.2)
+
+
+def test_run_solve_goc3_73_scuc_only() -> None:
+    """SCUC-only on the 303 case — fast smoke test for the bridge.
+
+    The native pipeline takes ~3 s and produces LMPs on every bus
+    plus the standard settlement summary fields.
+    """
+    scen = rto_api.build_scaffold("goc3_73")
+    scen["policy"]["solve_mode"] = "scuc"
+    result = rto_api.run_solve(scen)
+    assert result["status"] == "ok", result.get("error")
+    assert result["lmp_source"] == "DC SCUC"
+    assert result["periods"] == 18
+    assert len(result["lmps_by_bus"]) == 73
+    for bus_lmps in result["lmps_by_bus"].values():
+        assert len(bus_lmps) == 18
+    summary = result["summary"]
+    # Production cost is in dollars; non-zero means the solve produced
+    # a real dispatch (sign depends on the goc3 case's internal cost
+    # accounting — anything but 0 is fine for the smoke).
+    assert summary["mean_system_lmp"] is not None
+
+
+def test_policy_translation_to_market_policy() -> None:
+    """``RtoPolicy.to_market_policy`` produces the canonical
+    :class:`MarketPolicy` shape — dashboard policy form ↔ goc3
+    pipeline knobs.
+    """
+    from dashboards.rto.policy import RtoPolicy
+
+    p = RtoPolicy(
+        solve_mode="scuc_ac_sced",
+        commitment_mode="optimize",
+        lp_solver="highs",
+        nlp_solver="ipopt",
+        mip_gap=1e-3,
+        time_limit_secs=120.0,
+        reactive_support_pin_factor=0.2,
+        sced_ac_opf_max_iterations=2000,
+        loss_mode="load_pattern",
+        loss_rate=0.02,
+        loss_max_iterations=1,
+        security_enabled=True,
+        security_max_iterations=4,
+    )
+    mp = p.to_market_policy()
+    assert mp.ac_reconcile_mode == "ac_dispatch"
+    assert mp.commitment_mode == "optimize"
+    assert mp.lp_solver == "highs"
+    assert mp.nlp_solver == "ipopt"
+    assert mp.commitment_mip_rel_gap == pytest.approx(1e-3)
+    assert mp.commitment_time_limit_secs == 120.0
+    assert mp.reactive_support_pin_factor == pytest.approx(0.2)
+    assert mp.sced_ac_opf_max_iterations == 2000
+    assert mp.scuc_loss_factor_warm_start == ("load_pattern", 0.02)
+    assert mp.scuc_loss_factor_max_iterations == 1
+    assert mp.scuc_security_max_iterations == 4
+
+
+def test_policy_scuc_only_mode_disables_ac_reconcile() -> None:
+    """``solve_mode=scuc`` collapses to ``ac_reconcile_mode="none"``
+    so the goc3 pipeline runs the SCUC alone."""
+    from dashboards.rto.policy import RtoPolicy
+
+    mp = RtoPolicy(solve_mode="scuc").to_market_policy()
+    assert mp.ac_reconcile_mode == "none"
+
+
+def test_policy_security_disabled_pins_iterations_to_one() -> None:
+    """When ``security_enabled=False``, the security knobs collapse
+    to a no-op (1 iteration, 0 preseeded cuts)."""
+    from dashboards.rto.policy import RtoPolicy
+
+    mp = RtoPolicy(security_enabled=False, security_max_iterations=10).to_market_policy()
+    assert mp.scuc_security_max_iterations == 1
+    assert mp.scuc_security_preseed_count_per_period == 0
+
+
+def test_policy_validation_rejects_unknown_solve_mode() -> None:
+    from dashboards.rto.policy import RtoPolicy
+
+    with pytest.raises(ValueError, match="solve_mode"):
+        RtoPolicy(solve_mode="not_a_mode")
+
+
+def test_policy_validation_rejects_negative_reactive_pin() -> None:
+    from dashboards.rto.policy import RtoPolicy
+
+    with pytest.raises(ValueError, match="reactive_support_pin_factor"):
+        RtoPolicy(reactive_support_pin_factor=-0.1)

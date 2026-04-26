@@ -3786,6 +3786,7 @@ mod tests {
             limit_reverse_mw_schedule: vec![],
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
+            ptdf_per_bus: vec![],
             limit_mw_active_period: None,
             breach_sides: crate::network::FlowgateBreachSides::Both,
         });
@@ -3814,6 +3815,7 @@ mod tests {
             limit_reverse_mw_schedule: vec![],
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
+            ptdf_per_bus: vec![],
             limit_mw_active_period: None,
             breach_sides: crate::network::FlowgateBreachSides::Both,
         });

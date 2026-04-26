@@ -1589,6 +1589,10 @@ pub(super) fn build_period_results(input: PeriodAssemblyInput<'_>) -> PeriodAsse
         let mut raw_period = RawDispatchPeriodResult {
             pg_mw: pg_t.clone(),
             lmp: lmp_t.clone(),
+            // SCUC repricing LP doesn't compute a Q-balance dual —
+            // Q-LMP is AC-only and lands on the AC SCED stage's
+            // ``RawDispatchPeriodResult`` instead.
+            q_lmp: Vec::new(),
             lmp_energy,
             lmp_congestion,
             total_cost: period_costs[t],
@@ -2225,6 +2229,7 @@ pub(super) fn assemble_solution(input: SolutionAssemblyInput<'_>) -> RawDispatch
         cc_transition_cost,
         cc_transition_costs,
         model_diagnostics: Vec::new(),
+        aux_flowgate_names: Vec::new(),
         scuc_final_loss_warm_start: None,
     }
 }

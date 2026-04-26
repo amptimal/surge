@@ -354,6 +354,51 @@ pub struct GoC3Policy {
     /// iterations). AC SCED still enforces full nodal physics when
     /// it runs downstream. Off by default.
     pub scuc_disable_bus_power_balance: bool,
+
+    /// How losses are represented inside SCUC across security
+    /// iterations when running in `scuc_disable_bus_power_balance`
+    /// (system-row) mode. Three modes:
+    ///
+    /// * [`GoC3ScucLossTreatment::Static`] (default) — single scalar
+    ///   `rate × total_load` per period, baked into the system-row
+    ///   RHS. Same value every security iteration. Cheapest, but
+    ///   ignores realized dispatch.
+    /// * [`GoC3ScucLossTreatment::ScalarFeedback`] — after each
+    ///   security iteration's repaired DC PF, compute realized total
+    ///   losses per period and feed back as next iteration's RHS.
+    ///   Damped with asymmetric upward bias (under-commitment costs
+    ///   more than over because AC SCED can't commit new units).
+    /// * [`GoC3ScucLossTreatment::PenaltyFactors`] — full marginal
+    ///   loss factors `(1 − LF_g)` on every injection coefficient,
+    ///   with linearization-point RHS correction. Distributed-load
+    ///   slack reference. Recovers locational signal — a renewable
+    ///   at a high-loss bus contributes effective MW < raw MW, so
+    ///   SCUC commits more thermal up front.
+    ///
+    /// In per-bus-balance mode (`scuc_disable_bus_power_balance =
+    /// false`) this knob is ignored — the existing per-bus
+    /// `iterate_loss_factors` machinery handles loss representation
+    /// directly.
+    pub scuc_loss_treatment: GoC3ScucLossTreatment,
+}
+
+/// SCUC system-row loss treatment selector — public mirror of
+/// [`surge_dispatch::request::network::ScucLossTreatment`] for the GO C3
+/// policy. Serialized as snake_case strings (`"static"`,
+/// `"scalar_feedback"`, `"penalty_factors"`).
+///
+/// Default: `ScalarFeedback`. Validated 2026-04-25 on a 617-bus event4
+/// cut (6 scenarios across D1/D2/D3, SW0): scalar feedback beat
+/// `Static` on every scenario, +$1.81 M aggregate validator surplus
+/// (+0.094 %) at near-static wall cost. `PenaltyFactors` came in
+/// second on every scenario; available as an opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoC3ScucLossTreatment {
+    Static,
+    #[default]
+    ScalarFeedback,
+    PenaltyFactors,
 }
 
 impl Default for GoC3Policy {
@@ -379,7 +424,7 @@ impl Default for GoC3Policy {
             sced_enforce_regulated_bus_vm_targets: false,
             reactive_support_pin_factor: 0.0,
             run_pricing: false,
-            scuc_security_preseed_count_per_period: 250,
+            scuc_security_preseed_count_per_period: 0,
             scuc_security_max_iterations: 5,
             scuc_security_max_cuts_per_iteration: 2_500,
             scuc_loss_factor_warm_start: Some(("load_pattern".to_string(), 0.02)),
@@ -396,6 +441,7 @@ impl Default for GoC3Policy {
             scuc_copperplate: false,
             scuc_power_balance_penalty_multiplier: 1.0,
             scuc_disable_bus_power_balance: true,
+            scuc_loss_treatment: GoC3ScucLossTreatment::default(),
         }
     }
 }

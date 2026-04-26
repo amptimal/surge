@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -106,6 +106,28 @@ def create_app() -> FastAPI:
             logger.exception("RTO solve failed")
             raise HTTPException(status_code=500, detail=f"solve failed: {exc}")
         return JSONResponse(result)
+
+    @app.post("/api/solve/stream")
+    def solve_stream(body: SolveRequest) -> StreamingResponse:
+        """Stream the solve as Server-Sent Events.
+
+        The dashboard's modal overlay subscribes to this endpoint
+        so the user can watch log lines arrive in real time
+        instead of staring at a spinner. The wire format is plain
+        SSE: ``event: log`` per Python log line, one ``event:
+        result`` carrying the final flattened-result JSON, or
+        ``event: error`` on failure. Heartbeat ``: ping`` comments
+        keep idle connections alive across reverse proxies.
+        """
+        scenario = body.model_dump()
+        return StreamingResponse(
+            rto_api.run_solve_stream(scenario),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",  # disable nginx buffering when behind one
+            },
+        )
 
     @app.get("/")
     def index() -> FileResponse:

@@ -24,8 +24,9 @@ running standalone.
 from __future__ import annotations
 
 import logging
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
@@ -48,13 +49,13 @@ def create_hub_app(
     ``include``: optional whitelist of dashboard ``name`` values to
     mount. ``None`` mounts every discovered dashboard.
     """
-    app = FastAPI(title="Surge Dashboards", version="0.1")
     manifests = discover_dashboards(dashboards_root)
     if include is not None:
         wanted = set(include)
         manifests = [m for m in manifests if m.name in wanted]
 
-    mounted: list[DashboardManifest] = []
+    mounted: list[tuple[DashboardManifest, FastAPI]] = []
+    skipped: list[DashboardManifest] = []
     for manifest in manifests:
         try:
             factory = manifest.load_app_factory()
@@ -65,6 +66,7 @@ def create_hub_app(
                 manifest.source_dir,
                 exc,
             )
+            skipped.append(manifest)
             continue
         try:
             sub_app = factory()
@@ -74,14 +76,46 @@ def create_hub_app(
                 manifest.name,
                 exc,
             )
+            skipped.append(manifest)
             continue
+        mounted.append((manifest, sub_app))
+
+    # Chain each mounted sub-app's lifespan into the hub's lifespan.
+    # Starlette / FastAPI does not propagate lifespans to apps attached
+    # via ``.mount()``, so without this every sub-app's ``@asynccontextmanager``
+    # lifespan handler is a no-op — leaving startup state (e.g. the
+    # GO C3 dashboard's ``app.state.registry``) unset and every API
+    # request 500s on first state access.
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        async with AsyncExitStack() as stack:
+            for manifest, sub_app in mounted:
+                router = sub_app.router
+                if router.lifespan_context is None:
+                    continue
+                try:
+                    await stack.enter_async_context(router.lifespan_context(sub_app))
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "dashboard %r: lifespan startup failed",
+                        manifest.name,
+                    )
+                    raise
+            logger.info(
+                "hub ready · mounted=%s",
+                ", ".join(m.name for m, _ in mounted) or "(none)",
+            )
+            yield
+
+    app = FastAPI(title="Surge Dashboards", version="0.1", lifespan=lifespan)
+
+    for manifest, sub_app in mounted:
         mount_path = "/" + manifest.route.strip("/")
         app.mount(mount_path, sub_app, name=manifest.name)
-        mounted.append(manifest)
         logger.info("mounted dashboard %r at %s", manifest.name, mount_path)
 
     # Stash for the API + landing.
-    app.state.mounted_dashboards = mounted
+    app.state.mounted_dashboards = [m for m, _ in mounted]
 
     @app.get("/api/dashboards")
     def list_dashboards() -> JSONResponse:

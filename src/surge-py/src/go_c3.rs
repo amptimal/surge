@@ -29,7 +29,7 @@ use pyo3::types::{PyAny, PyDict};
 use surge_io::go_c3 as io_go_c3;
 use surge_io::go_c3::{
     GoC3AcReconcileMode, GoC3CommitmentMode, GoC3ConsumerMode, GoC3Context, GoC3Formulation,
-    GoC3Policy, GoC3Problem, GoC3SlackInferenceMode,
+    GoC3Policy, GoC3Problem, GoC3ScucLossTreatment, GoC3SlackInferenceMode,
 };
 use surge_market::go_c3 as market_go_c3;
 
@@ -160,25 +160,37 @@ pub fn go_c3_build_request<'py>(
 /// from that solution while reactive (`q_res_up`, `q_res_down`)
 /// reserve awards stay on `dispatch_result`. Mirrors Python's
 /// `export_go3_solution(..., dc_dispatch_result=...)` merge.
+///
+/// `allow_consumer_reserve_shedding` (default `true`) caps each
+/// consumer's exported active-reserve awards so the validator's
+/// `viol_cs_t_p_on_min` / `viol_cs_t_p_on_max` constraints stay
+/// feasible after AC SCED curtails the consumer's `p_on`. The shed
+/// amount is implicitly accepted as zonal reserve shortfall. Set
+/// `false` for diagnostics that need to expose the raw SCUC awards.
 #[pyfunction]
-#[pyo3(signature = (handle, dispatch_result, dc_reserve_source = None))]
+#[pyo3(signature = (handle, dispatch_result, dc_reserve_source = None, allow_consumer_reserve_shedding = true))]
 pub fn go_c3_export_solution<'py>(
     py: Python<'py>,
     handle: &GoC3Handle,
     dispatch_result: &Bound<'_, PyAny>,
     dc_reserve_source: Option<&Bound<'_, PyAny>>,
+    allow_consumer_reserve_shedding: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     let solution_inner = extract_dispatch_solution(py, dispatch_result)?;
     let dc_inner = match dc_reserve_source {
         Some(obj) => Some(extract_dispatch_solution(py, obj)?),
         None => None,
     };
+    let options = market_go_c3::ExportOptions {
+        allow_consumer_reserve_shedding,
+    };
     let solution = handle.with_context(|ctx| {
-        market_go_c3::export_go_c3_solution_with_reserve_source(
+        market_go_c3::export_go_c3_solution_with_options(
             &handle.problem,
             ctx,
             &solution_inner,
             dc_inner.as_ref(),
+            &options,
         )
     })?;
     let solution = solution
@@ -500,6 +512,20 @@ fn parse_policy(policy: Option<&Bound<'_, PyDict>>) -> PyResult<GoC3Policy> {
     if let Some(value) = policy.get_item("scuc_disable_bus_power_balance")? {
         if !value.is_none() {
             out.scuc_disable_bus_power_balance = value.extract::<bool>()?;
+        }
+    }
+    if let Some(value) = policy.get_item("scuc_loss_treatment")? {
+        if !value.is_none() {
+            out.scuc_loss_treatment = match value.extract::<String>()?.as_str() {
+                "static" => GoC3ScucLossTreatment::Static,
+                "scalar_feedback" => GoC3ScucLossTreatment::ScalarFeedback,
+                "penalty_factors" => GoC3ScucLossTreatment::PenaltyFactors,
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "unknown GoC3Policy.scuc_loss_treatment: {other}"
+                    )));
+                }
+            };
         }
     }
     Ok(out)

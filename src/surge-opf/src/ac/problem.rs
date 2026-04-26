@@ -1106,6 +1106,7 @@ mod tests {
                 chemistry: None,
                 discharge_foldback_soc_mwh: None,
                 charge_foldback_soc_mwh: None,
+                daily_cycle_limit: None,
             }),
             ..Generator::default()
         };

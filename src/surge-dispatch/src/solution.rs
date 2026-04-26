@@ -92,6 +92,9 @@ pub struct RawBusPeriodResult {
     pub mcc: f64,
     /// Marginal loss component ($/MWh).
     pub mlc: f64,
+    /// Reactive LMP ($/MVAr-h). ``None`` for DC-only solves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q_lmp: Option<f64>,
     /// Bus angle in radians when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub angle_rad: Option<f64>,
@@ -232,6 +235,11 @@ pub struct RawDispatchPeriodResult {
     pub pg_mw: Vec<f64>,
     /// Locational marginal price at each bus ($/MWh).
     pub lmp: Vec<f64>,
+    /// Reactive LMP at each bus ($/MVAr-h) — dual on the per-bus
+    /// Q-balance constraint from the AC OPF. Empty for DC-only
+    /// solves and for backends that don't surface NLP duals.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub q_lmp: Vec<f64>,
     /// LMP energy component at each bus ($/MWh). Equal to the reference bus LMP.
     pub lmp_energy: Vec<f64>,
     /// LMP congestion component at each bus ($/MWh). `lmp - lmp_energy`.

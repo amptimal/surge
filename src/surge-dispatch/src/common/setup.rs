@@ -184,6 +184,10 @@ pub(crate) struct DispatchSetup {
     /// Per storage unit: charge-side foldback threshold (MWh). ``None``
     /// disables the foldback cut for that unit.
     pub storage_foldback_charge_mwh: Vec<Option<f64>>,
+    /// Per storage unit: maximum full equivalent cycles per 24-hour
+    /// window. ``None`` disables the cap; only honoured by the SCUC
+    /// time-coupled build.
+    pub storage_daily_cycle_limit: Vec<Option<f64>>,
     /// Per storage unit: initial state-of-charge in MWh after request overrides.
     pub storage_initial_soc_mwh: Vec<f64>,
     pub n_storage: usize,
@@ -374,6 +378,16 @@ impl DispatchSetup {
                     .charge_foldback_soc_mwh
             })
             .collect();
+        let storage_daily_cycle_limit: Vec<Option<f64>> = storage_gen_local
+            .iter()
+            .map(|&(_, _, gi)| {
+                network.generators[gi]
+                    .storage
+                    .as_ref()
+                    .expect("storage_gen_local only contains generators with storage")
+                    .daily_cycle_limit
+            })
+            .collect();
         let storage_initial_soc_mwh: Vec<f64> = storage_gen_local
             .iter()
             .map(|&(_, _, gi)| {
@@ -472,6 +486,7 @@ impl DispatchSetup {
             storage_eta_discharge,
             storage_foldback_discharge_mwh,
             storage_foldback_charge_mwh,
+            storage_daily_cycle_limit,
             storage_initial_soc_mwh,
             n_storage,
             pwl_gen_info,

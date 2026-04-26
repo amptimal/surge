@@ -423,7 +423,19 @@ pub fn goc3_ac_opf_options(
         fallback_q_mvar: GOC3_STATIC_Q_BUS_PENALTY_PER_MVAR,
         p_per_pu_fallback: GOC3_P_PER_PU_FALLBACK,
     });
-    AcOpfSceduledBaseline::tap_locked_shunts_on(bus_balance_penalties).into_options()
+    let mut opts =
+        AcOpfSceduledBaseline::tap_locked_shunts_on(bus_balance_penalties).into_options();
+    // GO C3 scores bus P/Q balance using its own pi-model reconstruction
+    // with no constraint scaling. Ipopt's `gradient-based` scaling
+    // makes `tol` apply to scaled rows; on stiff-coupling buses (zero-r
+    // ties, identical parallel lines) the scaled→unscaled blow-up at
+    // termination shows up as ~1e-6 pu validator-visible Q residual.
+    // Tightening `tolerance` to 1e-9 (combined with the constr_viol_tol
+    // binding in backends/ipopt.rs) drops the unscaled residual to
+    // ~1e-12 pu — well below any reporting threshold and effectively
+    // machine precision against the validator's pi-model.
+    opts.tolerance = 1e-9;
+    opts
 }
 
 /// Two-rung OPF retry attempts for a GO C3 scenario:

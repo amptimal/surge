@@ -12,7 +12,7 @@ The :class:`MarketConfig` captures:
 * **Benders config** — AC-OPF Benders slack penalties.
 
 Start from :meth:`MarketConfig.default` and override what's specific
-to your market. See :mod:`markets.rto.config` for a worked example.
+to your market. See :mod:`markets.go_c3.config` for a worked example.
 """
 
 from __future__ import annotations

@@ -272,6 +272,10 @@ pub(crate) struct DispatchProblemSpec<'a> {
     /// The security loop consults this on iter 0 to decide whether to
     /// pre-seed the MIP with a loss estimate.
     pub loss_factor_warm_start_mode: crate::request::network::LossFactorWarmStartMode,
+    /// SCUC system-row loss treatment. Copied from
+    /// [`crate::request::DispatchInput::scuc_loss_treatment`]. Only
+    /// active when `scuc_disable_bus_power_balance = true`.
+    pub scuc_loss_treatment: crate::request::network::ScucLossTreatment,
     pub enforce_forbidden_zones: bool,
     pub foz_max_transit_periods: Option<usize>,
     pub load_profiles: &'a LoadProfiles,
@@ -397,6 +401,7 @@ impl<'a> DispatchProblemSpec<'a> {
             options.max_loss_factor_iters,
             options.loss_factor_tol,
             crate::request::network::LossFactorWarmStartMode::Disabled,
+            crate::request::network::ScucLossTreatment::Static,
             options.enforce_forbidden_zones,
             options.foz_max_transit_periods,
             &options.load_profiles,
@@ -495,6 +500,7 @@ impl<'a> DispatchProblemSpec<'a> {
             input.max_loss_factor_iters,
             input.loss_factor_tol,
             input.loss_factor_warm_start_mode,
+            input.scuc_loss_treatment,
             input.enforce_forbidden_zones,
             input.foz_max_transit_periods,
             &input.load_profiles,
@@ -593,6 +599,7 @@ impl<'a> DispatchProblemSpec<'a> {
         max_loss_factor_iters: usize,
         loss_factor_tol: f64,
         loss_factor_warm_start_mode: crate::request::network::LossFactorWarmStartMode,
+        scuc_loss_treatment: crate::request::network::ScucLossTreatment,
         enforce_forbidden_zones: bool,
         foz_max_transit_periods: Option<usize>,
         load_profiles: &'a LoadProfiles,
@@ -690,6 +697,7 @@ impl<'a> DispatchProblemSpec<'a> {
             max_loss_factor_iters,
             loss_factor_tol,
             loss_factor_warm_start_mode,
+            scuc_loss_treatment,
             enforce_forbidden_zones,
             foz_max_transit_periods,
             load_profiles,
@@ -809,6 +817,7 @@ impl<'a> DispatchProblemSpec<'a> {
             max_loss_factor_iters: self.max_loss_factor_iters,
             loss_factor_tol: self.loss_factor_tol,
             loss_factor_warm_start_mode: self.loss_factor_warm_start_mode,
+            scuc_loss_treatment: self.scuc_loss_treatment,
             enforce_forbidden_zones: self.enforce_forbidden_zones,
             foz_max_transit_periods: self.foz_max_transit_periods,
             load_profiles: self.load_profiles,
@@ -955,6 +964,7 @@ impl<'a> DispatchProblemSpec<'a> {
             max_loss_factor_iters: self.max_loss_factor_iters,
             loss_factor_tol: self.loss_factor_tol,
             loss_factor_warm_start_mode: self.loss_factor_warm_start_mode,
+            scuc_loss_treatment: self.scuc_loss_treatment,
             enforce_forbidden_zones: self.enforce_forbidden_zones,
             foz_max_transit_periods: self.foz_max_transit_periods,
             load_profiles: self.load_profiles,

@@ -95,6 +95,72 @@ def _extract_scuc_mip_stats(workflow_result: dict | None) -> dict | None:
     return None
 
 
+def _extract_scuc_security_report(workflow_result: dict | None) -> dict | None:
+    """Per-iteration security-loop breakdown emitted by surge-dispatch.
+
+    Returns ``None`` when the SCUC stage didn't attach security metadata
+    (e.g. `security` was not configured, or an early-failure path). The
+    returned dict has stable keys suitable for a run-report: ``setup_timings_secs``,
+    ``per_iteration`` (list, each with ``inner_solve_secs`` / ``screen_secs`` /
+    ``cut_build_secs`` / ``inner_mip_trace`` restricted to `_SCUC_MIP_STAT_KEYS`),
+    and the aggregate counters (``iterations``, ``n_cuts``, ``converged`` …).
+    """
+    if not workflow_result:
+        return None
+    for stage in workflow_result.get("stages") or []:
+        if stage.get("stage_id") != "scuc":
+            continue
+        solution = stage.get("solution") or {}
+        diagnostics = solution.get("diagnostics") or {}
+        security = diagnostics.get("security")
+        if not security:
+            return None
+        per_iter_raw = security.get("per_iteration") or []
+        per_iteration: list[dict[str, Any]] = []
+        for entry in per_iter_raw:
+            trace = entry.get("inner_mip_trace")
+            trimmed_trace = (
+                {key: trace.get(key) for key in _SCUC_MIP_STAT_KEYS if key in trace}
+                if trace
+                else None
+            )
+            per_iteration.append(
+                {
+                    "iter": entry.get("iter"),
+                    "net_clone_secs": entry.get("net_clone_secs"),
+                    "inner_solve_secs": entry.get("inner_solve_secs"),
+                    "repair_theta_secs": entry.get("repair_theta_secs", 0.0),
+                    "screen_secs": entry.get("screen_secs"),
+                    "cut_build_secs": entry.get("cut_build_secs", 0.0),
+                    "new_cuts": entry.get("new_cuts"),
+                    "n_branch_violations": entry.get("n_branch_violations"),
+                    "n_hvdc_violations": entry.get("n_hvdc_violations"),
+                    "max_branch_violation_pu": entry.get("max_branch_violation_pu"),
+                    "max_hvdc_violation_pu": entry.get("max_hvdc_violation_pu"),
+                    "inner_mip_trace": trimmed_trace,
+                    # System-row loss telemetry (None on `Static` mode or
+                    # per-bus path). Surfaces realized vs blended total
+                    # losses per period and per-bus LF distribution stats
+                    # so we can A/B `scuc_loss_treatment` settings against
+                    # AC-SCED slack penalty headroom.
+                    "sys_row_loss_telemetry": entry.get("sys_row_loss_telemetry"),
+                }
+            )
+        return {
+            "iterations": security.get("iterations"),
+            "n_cuts": security.get("n_cuts"),
+            "converged": security.get("converged"),
+            "last_branch_violations": security.get("last_branch_violations"),
+            "last_hvdc_violations": security.get("last_hvdc_violations"),
+            "max_branch_violation_pu": security.get("max_branch_violation_pu"),
+            "max_hvdc_violation_pu": security.get("max_hvdc_violation_pu"),
+            "n_preseed_cuts": security.get("n_preseed_cuts", 0),
+            "setup_timings_secs": security.get("setup_timings_secs"),
+            "per_iteration": per_iteration,
+        }
+    return None
+
+
 def _extract_ac_opf_stats(workflow_result: dict | None) -> list[dict] | None:
     """Return per-period AC-OPF solver stats from the AC SCED stage.
 
@@ -180,7 +246,12 @@ def _run_pass(
 
         logger.info("Native solve: exporting solution")
         t0 = time.perf_counter()
-        exp = go_c3_native.export(problem, final_solution, dc_reserve_source=dc_res)
+        exp = go_c3_native.export(
+            problem,
+            final_solution,
+            dc_reserve_source=dc_res,
+            allow_consumer_reserve_shedding=policy.allow_ac_consumer_reserve_shedding,
+        )
         timings["export"] = time.perf_counter() - t0
         logger.info(
             "Native solve: step times (s) build_workflow=%.2f "
@@ -263,6 +334,7 @@ def solve(
                 else None
             ),
             "scuc_mip_stats": _extract_scuc_mip_stats(wr),
+            "scuc_security_report": _extract_scuc_security_report(wr),
             "ac_opf_stats": _extract_ac_opf_stats(wr),
         }
         if wr is not None:

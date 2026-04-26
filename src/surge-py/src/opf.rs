@@ -263,6 +263,7 @@ fn build_ac_opf_request(
         enforce_regulated_bus_vm_targets: true,
         discrete_mode: dm,
         discrete_polish: true,
+        nlp_scaling_method: "gradient-based".to_string(),
     };
     let mut runtime = surge_opf::AcOpfRuntime::default();
     if let Some(solver) = solver {

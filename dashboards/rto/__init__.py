@@ -1,20 +1,19 @@
 # SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0
-"""Interactive dashboard for the ``markets/rto/`` day-ahead market.
+"""Interactive RTO dashboard wrapping the canonical go_c3 native pipeline.
 
-Two entry paths:
+Every solve runs through :func:`surge.market.go_c3.solve_workflow`,
+the validator-aligned two-stage SCUC → AC SCED that the GO-C3
+benchmark uses. The dashboard adds:
 
-* **Built-in / network-only.** Pick an IEEE case (9, 14, 30, 57, 118,
-  300) or a GO-C3 case (73, 617). The dashboard synthesizes every RTO
-  market input — timeline, loads, offer curves, reserve requirements,
-  renewable caps — from sensible defaults the user then tweaks.
+* a configurable policy form (workflow shape, solver / commitment
+  knobs, loss + N-1 security tuning, AC SCED tuning including
+  reactive-pin retry),
+* per-bus / per-resource visualizations (LMP heatmap, generator
+  trace, AS pricing) of the native pipeline's solved output.
 
-* **Full case.** Load a pre-packaged RTO scenario (native JSON export
-  from this dashboard). Everything is already populated; the user
-  overrides policy and re-solves.
-
-The dashboard calls :func:`markets.rto.solve` with the
-assembled :class:`RtoProblem` and returns settlement, dispatch, and
-violation data flattened for the browser.
+Cases are restricted to the bundled GO-C3 problem archives —
+arbitrary ``surge.Network`` cases can't be solved by the goc3
+native pipeline, so they don't appear in the registry.
 """
 
 from .server.app import create_app

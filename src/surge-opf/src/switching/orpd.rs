@@ -1681,6 +1681,7 @@ fn build_orpd_model<'a>(
             HessianMode::LimitedMemory
         },
         warm_start: false,
+        nlp_scaling_method: "gradient-based".to_string(),
     };
 
     Ok(OrpdModelBuild {

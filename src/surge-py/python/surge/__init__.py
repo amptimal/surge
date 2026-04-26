@@ -43,7 +43,8 @@ _NATIVE_PUBLIC_EXPORTS = (
     # Study / domain classes
     "Contingency", "ContingencyOptions",
     # Entry points re-exported at package level
-    "version", "init_logging", "set_max_threads", "get_max_threads",
+    "version", "init_logging", "attach_log_listener", "detach_log_listener",
+    "LogReceiver", "set_max_threads", "get_max_threads",
     "analyze_n1_branch", "analyze_n2_branch", "analyze_n1_generator",
     "analyze_contingencies", "solve_hvdc",
     "case9", "case14", "case30", "market30", "case57", "case118", "case300",

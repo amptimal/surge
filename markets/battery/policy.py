@@ -73,6 +73,16 @@ class BatteryPolicy:
     #: and ``"gurobi"`` also work.
     lp_solver: str = "highs"
 
+    #: When ``True``, every cleared MW of an AS award must be backed by
+    #: enough SOC headroom to deploy continuously for 100 % of the
+    #: period. The LP gates each up-direction product (reg-up,
+    #: synchronized, non-spin) against ``SOC[t] − soc_min`` after
+    #: discharge-efficiency loss, and each down-direction product
+    #: (reg-down) against ``soc_max − SOC[t]`` after charge-efficiency
+    #: loss. Off by default — turning it on usually shifts AS revenue
+    #: down and changes how the LP positions SOC across the horizon.
+    enforce_reserve_soc_capacity: bool = False
+
     #: Bus-balance penalty multiplier (not currently wired through
     #: to the request — Surge's default 1e7 / 1e5 is already extreme
     #: enough for a 1-bus site; retained for future tuning).

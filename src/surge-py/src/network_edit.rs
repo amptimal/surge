@@ -1937,6 +1937,7 @@ impl Network {
             limit_reverse_mw_schedule: Vec::new(),
             hvdc_coefficients: Vec::new(),
             hvdc_band_coefficients: Vec::new(),
+            ptdf_per_bus: Vec::new(),
             limit_mw_active_period: None,
             breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });

@@ -84,6 +84,9 @@ fn _surge(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Utils
     m.add_function(wrap_pyfunction!(utils::init_logging, m)?)?;
+    m.add_function(wrap_pyfunction!(utils::attach_log_listener, m)?)?;
+    m.add_function(wrap_pyfunction!(utils::detach_log_listener, m)?)?;
+    m.add_class::<utils::LogReceiver>()?;
     m.add_function(wrap_pyfunction!(utils::set_max_threads, m)?)?;
     m.add_function(wrap_pyfunction!(utils::get_max_threads, m)?)?;
 

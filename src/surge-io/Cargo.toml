@@ -33,5 +33,7 @@ zstd = "0.13"
 tempfile = "3"
 
 [dev-dependencies]
-surge-ac.workspace = true
+# Path-only override so cargo strips this dev-dep from the published
+# manifest, avoiding the surge-io ↔ surge-ac publish cycle.
+surge-ac = { path = "../surge-ac" }
 anyhow.workspace = true

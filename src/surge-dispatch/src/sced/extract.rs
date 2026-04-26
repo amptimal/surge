@@ -1433,6 +1433,8 @@ pub(super) fn extract_solution(input: ScedExtractionInput<'_>) -> RawDispatchSol
     let dispatch = RawDispatchPeriodResult {
         pg_mw,
         lmp,
+        // DC SCED has no per-bus Q-balance dual — Q-LMP is AC-only.
+        q_lmp: Vec::new(),
         lmp_energy,
         lmp_congestion,
         total_cost,
@@ -1550,6 +1552,7 @@ pub(super) fn extract_solution(input: ScedExtractionInput<'_>) -> RawDispatchSol
         cc_transition_cost: 0.0,
         cc_transition_costs: Vec::new(),
         model_diagnostics: Vec::new(),
+        aux_flowgate_names: Vec::new(),
         bus_loss_allocation_mw: Vec::new(),
         scuc_final_loss_warm_start: None,
     }

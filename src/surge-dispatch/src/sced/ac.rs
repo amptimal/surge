@@ -83,6 +83,11 @@ pub struct AcScedPeriodSolution {
     pub qg_mvar: Vec<f64>,
     /// LMP per bus ($/MWh).
     pub lmp: Vec<f64>,
+    /// Reactive LMP per bus ($/MVAr-h) — the dual on the per-bus
+    /// Q-balance constraint. Empty when the AC-OPF backend didn't
+    /// surface NLP duals (replay paths, DC fallback).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub q_lmp: Vec<f64>,
     /// Bus voltage magnitude per-unit by bus.
     pub bus_voltage_pu: Vec<f64>,
     /// Bus voltage angle in radians by bus.
@@ -141,6 +146,13 @@ pub struct AcScedPeriodSolution {
     /// Exact period objective decomposition.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub objective_terms: Vec<ObjectiveTerm>,
+    /// Branch thermal shadow prices ($/MWh), indexed by network branch order.
+    /// Pulled from the AC NLP duals on the apparent-power thermal-limit
+    /// constraints (sum of from- and to-side multipliers). Empty when
+    /// the AC backend didn't surface NLP duals (replay paths, AC-LP
+    /// fallback, or `enforce_thermal_limits` off).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub branch_shadow_prices: Vec<f64>,
     /// Flowgate shadow prices ($/MWh), indexed by `Network::flowgates`.
     /// Empty when `enforce_flowgates` is `false` or the network has no flowgates.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2676,6 +2688,18 @@ pub(crate) fn solve_ac_sced_with_problem_spec_artifacts(
         // No storage: single AC-OPF pass.
         let mut ac_opts_no_storage = ac_opf.clone();
         ac_opts_no_storage.enforce_flowgates = problem_spec.enforce_flowgates;
+        // Thread the actual period interval through so the AC OPF
+        // objective integrates `pg × cost × dt` (and the dual/LMP
+        // scale uses dt as its `base × dt_hours` divisor). Mirrors
+        // the storage-branch ``ac_opts_with_native_storage`` setter
+        // — without it, callers fall back to ``AcOpfOptions::default
+        // ().dt_hours == 1.0`` and every period (regardless of its
+        // true duration) gets billed at 1 hour. That collapsed the
+        // dispatch-result ``period.total_cost`` and ``objective_terms
+        // .dollars`` to a constant per-MW figure across cases with
+        // different period lengths, which the dashboard then summed
+        // into a horizon-independent "production cost".
+        ac_opts_no_storage.dt_hours = dt;
         if request_hvdc_uses_terminal_injections(problem_spec) && !any_hvdc_p2p_variable(&net) {
             ac_opts_no_storage.include_hvdc = Some(false);
         }
@@ -2806,6 +2830,7 @@ pub(crate) fn solve_ac_sced_with_problem_spec_artifacts(
         zone_q_reserve_up_shortfall_mvar: sol.devices.zone_q_reserve_up_shortfall_mvar.clone(),
         zone_q_reserve_down_shortfall_mvar: sol.devices.zone_q_reserve_down_shortfall_mvar.clone(),
         lmp: sol.pricing.lmp.clone(),
+        q_lmp: sol.pricing.lmp_reactive.clone(),
         bus_voltage_pu: sol.power_flow.voltage_magnitude_pu.clone(),
         bus_angle_rad: sol.power_flow.voltage_angle_rad.clone(),
         storage_soc_mwh: new_soc,
@@ -2823,6 +2848,7 @@ pub(crate) fn solve_ac_sced_with_problem_spec_artifacts(
         switched_shunt_dispatch,
         total_cost: sol.total_cost,
         objective_terms: sol.objective_terms.clone(),
+        branch_shadow_prices: sol.branches.branch_shadow_prices.clone(),
         flowgate_shadow_prices: sol.branches.flowgate_shadow_prices.clone(),
         interface_shadow_prices: sol.branches.interface_shadow_prices.clone(),
         bus_q_slack_pos_mvar: sol.bus_q_slack_pos_mvar.clone(),
@@ -3067,6 +3093,7 @@ mod tests {
                 chemistry: None,
                 discharge_foldback_soc_mwh: None,
                 charge_foldback_soc_mwh: None,
+                daily_cycle_limit: None,
             }),
             ..Generator::default()
         };
@@ -5331,6 +5358,7 @@ mod tests {
             limit_reverse_mw_schedule: vec![],
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
+            ptdf_per_bus: Vec::new(),
             limit_mw_active_period: None,
             breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });

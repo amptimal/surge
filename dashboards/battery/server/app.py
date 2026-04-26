@@ -33,6 +33,9 @@ class SolveRequest(BaseModel):
     as_products: list[dict[str, Any]] = Field(default_factory=list)
     policy: dict[str, Any] = Field(default_factory=dict)
     pwl_strategy: dict[str, Any] | None = None
+    # BA ACE / CR distributions used by the post-clearing AS-deployment
+    # overlay; opaque to the LP but consumed by api._compute_as_implied.
+    distributions: dict[str, Any] = Field(default_factory=dict)
 
 
 def create_app() -> FastAPI:

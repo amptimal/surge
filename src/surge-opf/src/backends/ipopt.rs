@@ -644,14 +644,36 @@ pub fn solve_ipopt(problem: &dyn NlpProblem, options: &NlpOptions) -> Result<Nlp
         // More L-BFGS memory helps dual convergence
         set_int("limited_memory_max_history", 20);
     } else {
-        // Exact Hessian mode: gradient-based scaling helps large HVDC problems.
+        // Exact Hessian mode: scaling defaults to gradient-based (helps large
+        // HVDC problems). Caller can override to "none" to keep `tol` applied
+        // to unscaled residuals — required when the external pi-model
+        // reconstruction (e.g. the GO C3 validator) must see exact bus balance
+        // and stiff branches would otherwise inflate scaled→unscaled residuals.
         // Adaptive barrier reduces iteration count by 10-20% on medium/large networks.
-        set_str("nlp_scaling_method", "gradient-based");
+        set_str("nlp_scaling_method", &options.nlp_scaling_method);
         set_str("mu_strategy", "adaptive");
         // Acceptable termination for near-converged iterates (avoids tail iterations).
         set_num("acceptable_tol", 1e-4);
         set_int("acceptable_iter", 10);
+        // Bind the acceptable-path unscaled feasibility check to `tol`
+        // (default would be 1e-2). When Ipopt terminates via "acceptable"
+        // rather than "optimal", the same unscaled bus-balance ceiling
+        // applies — otherwise validator-visible Q residuals at stiff
+        // buses can be 4 orders of magnitude looser than `tol`.
+        set_num("acceptable_constr_viol_tol", options.tolerance);
     }
+
+    // Bind the unscaled primal-feasibility check to `tol` so the bus-balance
+    // residual visible to external pi-model reconstructions (e.g. the GO C3
+    // validator) is bounded by `tol` regardless of `nlp_scaling_method`.
+    // Ipopt's default `constr_viol_tol = 1e-4` is far looser than `tol = 1e-8`
+    // and lets stiff-branch row scaling inflate the unscaled residual at
+    // incident buses by `max_row_gradient / tol_scale` — observed as ~1e-6 pu
+    // P/Q balance error at zero-r ties and identical parallel lines on the
+    // GO C3 73-bus case. Tying `constr_viol_tol` to `tol` forces those
+    // buses to converge to the same unscaled tolerance the rest of the
+    // network meets in scaled units.
+    set_num("constr_viol_tol", options.tolerance);
 
     // Use sequential MUMPS linear solver — fast, thread-safe, no special env vars.
     // Override: set IPOPT_LINEAR_SOLVER=spral for parallel SSIDS on large problems

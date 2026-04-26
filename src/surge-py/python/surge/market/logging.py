@@ -16,7 +16,7 @@ Example::
     from surge.market import SolveLogger
 
     with SolveLogger(workdir, policy=policy, label=label,
-                     surge_module=surge, logger_name="markets.rto"):
+                     surge_module=surge, logger_name="markets.go_c3"):
         result = solve_dispatch(network, request)
 """
 
@@ -89,7 +89,7 @@ class SolveLogger:
     logger_name
         Python logger hierarchy to attach to. Defaults to
         ``"surge.market"``; markets typically pass their own name
-        (e.g. ``"go_c3"``, ``"markets.rto"``).
+        (e.g. ``"go_c3"``, ``"markets.battery"``).
     policy
         Optional policy dataclass (or any mapping-like object). Written
         to the log header as JSON for reproducibility.
@@ -289,4 +289,64 @@ class SolveLogger:
         return self._log_path
 
 
-__all__ = ["SolveLogger"]
+class LogStream:
+    """Subscribe to Rust ``tracing`` records as they're emitted.
+
+    Backed by ``surge.attach_log_listener`` / ``LogReceiver``: the
+    global tracing subscriber's broadcast layer fans each formatted
+    record into a Rust channel, exposed to Python through
+    :meth:`recv` (blocking with timeout) and :meth:`drain` (non-
+    blocking). Designed to replace fd-tee-based stdout/stderr capture
+    in long-running web servers where pipe-buffer deadlock is
+    unacceptable.
+
+    Example::
+
+        with surge.market.LogStream() as stream:
+            # ... kick off a solve in another thread ...
+            while solve_running:
+                line = stream.recv(0.25)
+                if line is not None:
+                    print(line)
+    """
+
+    def __init__(self, *, level: str = "info", surge_module=None):
+        self._surge = surge_module
+        if self._surge is None:
+            import surge as _surge_mod  # type: ignore
+            self._surge = _surge_mod
+        # Make sure the global tracing subscriber is up before we try
+        # to attach. ``init_logging`` is idempotent (Once-guarded).
+        self._surge.init_logging(level)
+        self._handle: int | None = None
+        self._receiver = None
+
+    def __enter__(self) -> "LogStream":
+        self._handle, self._receiver = self._surge.attach_log_listener()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self._handle is not None:
+            try:
+                self._surge.detach_log_listener(self._handle)
+            except Exception:  # noqa: BLE001
+                pass
+            self._handle = None
+            self._receiver = None
+
+    def recv(self, timeout_secs: float = 0.25) -> str | None:
+        """Block for up to ``timeout_secs`` waiting for the next
+        log line. Returns ``None`` if no record arrived in that
+        window."""
+        if self._receiver is None:
+            return None
+        return self._receiver.recv(timeout_secs)
+
+    def drain(self) -> list[str]:
+        """Pull every queued record without blocking."""
+        if self._receiver is None:
+            return []
+        return self._receiver.drain()
+
+
+__all__ = ["LogStream", "SolveLogger"]

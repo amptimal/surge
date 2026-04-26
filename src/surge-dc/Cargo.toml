@@ -23,7 +23,9 @@ thiserror.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
-surge-io.workspace = true
+# Path-only override so cargo strips this dev-dep from the published
+# manifest, avoiding the surge-dc ↔ surge-io publish cycle.
+surge-io = { path = "../surge-io" }
 serde_json.workspace = true
 serde-value = "0.7"
 zstd = "0.13"

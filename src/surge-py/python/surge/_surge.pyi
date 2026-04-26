@@ -556,6 +556,7 @@ class StorageParams:
         chemistry: Optional[str] = None,
         discharge_foldback_soc_mwh: Optional[float] = None,
         charge_foldback_soc_mwh: Optional[float] = None,
+        daily_cycle_limit: Optional[float] = None,
     ) -> None: ...
 
     @property
@@ -628,6 +629,10 @@ class StorageParams:
     def charge_foldback_soc_mwh(self) -> Optional[float]: ...
     @charge_foldback_soc_mwh.setter
     def charge_foldback_soc_mwh(self, value: Optional[float]) -> None: ...
+    @property
+    def daily_cycle_limit(self) -> Optional[float]: ...
+    @daily_cycle_limit.setter
+    def daily_cycle_limit(self, value: Optional[float]) -> None: ...
 
     def __repr__(self) -> str: ...
 
@@ -6340,6 +6345,71 @@ def init_logging(level: str = "warn", json: bool = False) -> None:
         level: "error", "warn", "info", "debug", or "trace".
                RUST_LOG env var overrides this.
         json: If True, emit machine-readable JSON logs.
+
+    The subscriber's writer tees stderr AND broadcasts each formatted
+    record to every currently-attached :class:`LogReceiver` (created
+    via :func:`attach_log_listener`).
+    """
+    ...
+
+
+class LogReceiver:
+    """Receiver for the in-process tracing broadcast.
+
+    Constructed by :func:`attach_log_listener`; never instantiated
+    directly. Hands each formatted Rust ``tracing`` record to the
+    Python caller via :meth:`recv` (blocking with timeout) or
+    :meth:`drain` (non-blocking). Designed to replace fd-tee-based
+    log capture in long-running web servers where pipe-buffer
+    deadlock is unacceptable.
+    """
+
+    @property
+    def handle(self) -> int:
+        """The opaque registry handle this receiver was attached as.
+
+        Pass to :func:`detach_log_listener` to remove it explicitly;
+        otherwise the receiver is auto-pruned when the channel
+        closes (i.e. when the Python object is garbage-collected).
+        """
+        ...
+
+    def recv(self, timeout_secs: float) -> str | None:
+        """Block for up to ``timeout_secs`` waiting for the next
+        log line.
+
+        Returns the formatted line (no trailing newline) or
+        ``None`` if no record arrived in the window. Releases the
+        GIL while waiting so other Python threads keep running.
+        """
+        ...
+
+    def drain(self) -> list[str]:
+        """Pull every queued record without blocking.
+
+        Returns a list (possibly empty) of formatted log lines in
+        emission order.
+        """
+        ...
+
+
+def attach_log_listener() -> tuple[int, LogReceiver]:
+    """Subscribe to the tracing broadcast.
+
+    Returns ``(handle, receiver)``. Pass the handle to
+    :func:`detach_log_listener` when done; the receiver is the
+    object you call :meth:`LogReceiver.recv` on. Multiple
+    listeners can coexist. The companion
+    ``surge.market.LogStream`` context manager wraps this
+    pair for convenient ``with``-block usage.
+    """
+    ...
+
+
+def detach_log_listener(handle: int) -> None:
+    """Detach a listener previously returned by :func:`attach_log_listener`.
+
+    Idempotent — detaching an unknown handle is a no-op.
     """
     ...
 

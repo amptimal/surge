@@ -40,6 +40,37 @@ pub fn export_go_c3_solution(
     export_go_c3_solution_with_reserve_source(problem, context, solution, None)
 }
 
+/// Optional knobs for [`export_go_c3_solution_with_options`].
+#[derive(Debug, Clone)]
+pub struct ExportOptions {
+    /// When true, scale each consumer's exported active-reserve awards
+    /// down so the validator's `viol_cs_t_p_on_min` /
+    /// `viol_cs_t_p_on_max` constraints stay feasible after AC SCED
+    /// curtails the consumer's `p_on`. Up-direction awards
+    /// (regulation up, synchronous, ramp-up online) are capped at
+    /// `max(0, p_on − p_lb)`; down-direction awards (regulation down,
+    /// ramp-down online) at `max(0, p_ub − p_on)`. The shed amount is
+    /// implicitly accepted as zonal reserve shortfall and scored by
+    /// the validator's existing zonal-balance penalty — preferable
+    /// to letting the validator stamp the whole solution `feas=0`
+    /// over a bookkeeping mismatch between the SCUC reserve award
+    /// and the AC-curtailed served power.
+    ///
+    /// Default `true`: the GO C3 path consistently produces this
+    /// mismatch (AC SCED has no consumer-side reserve coupling rows),
+    /// and shedding is the canonical resolution. Set `false` only for
+    /// diagnostics that need to expose the raw SCUC awards.
+    pub allow_consumer_reserve_shedding: bool,
+}
+
+impl Default for ExportOptions {
+    fn default() -> Self {
+        Self {
+            allow_consumer_reserve_shedding: true,
+        }
+    }
+}
+
 /// Convert a [`DispatchSolution`] into a GO C3 solution document,
 /// optionally taking active reserve awards from a separate "reserve
 /// source" solution (typically the DC SCUC) while dispatch values
@@ -55,6 +86,24 @@ pub fn export_go_c3_solution_with_reserve_source(
     context: &GoC3Context,
     solution: &DispatchSolution,
     dc_reserve_source: Option<&DispatchSolution>,
+) -> Result<GoC3Solution, GoC3DispatchError> {
+    export_go_c3_solution_with_options(
+        problem,
+        context,
+        solution,
+        dc_reserve_source,
+        &ExportOptions::default(),
+    )
+}
+
+/// Like [`export_go_c3_solution_with_reserve_source`] but takes an
+/// [`ExportOptions`] bag for opt-in behavior.
+pub fn export_go_c3_solution_with_options(
+    problem: &GoC3Problem,
+    context: &GoC3Context,
+    solution: &DispatchSolution,
+    dc_reserve_source: Option<&DispatchSolution>,
+    options: &ExportOptions,
 ) -> Result<GoC3Solution, GoC3DispatchError> {
     // The objective-ledger consistency check is advisory: LP
     // degeneracy / floating-point rounding can leave per-period
@@ -81,7 +130,7 @@ pub fn export_go_c3_solution_with_reserve_source(
     // Bus solutions with voltage clamping to per-bus (vm_lb, vm_ub).
     let bus_solutions = export_bus_solutions(problem, context, solution);
     let (device_solutions, synthetic_ids) =
-        export_device_solutions(problem, context, solution, dc_reserve_source);
+        export_device_solutions(problem, context, solution, dc_reserve_source, options);
     let ac_line_solutions = export_ac_line_solutions(problem, context, periods);
     let transformer_solutions = export_transformer_solutions(problem, context, solution, periods);
     let dc_line_solutions = export_dc_line_solutions(
@@ -148,6 +197,7 @@ fn export_device_solutions(
     context: &GoC3Context,
     solution: &DispatchSolution,
     dc_reserve_source: Option<&DispatchSolution>,
+    options: &ExportOptions,
 ) -> (Vec<GoC3DeviceSolution>, HashSet<String>) {
     let periods = problem.time_series_input.general.time_periods;
     let period_results = solution.periods();
@@ -241,6 +291,7 @@ fn export_device_solutions(
                 &dc_reserve_by_uid,
                 dc_reserve_source.is_some(),
                 context,
+                options,
             ));
             continue;
         }
@@ -432,6 +483,14 @@ type ActiveReserveAwardSeries = (
     Vec<f64>,
 );
 
+/// Product IDs whose awards count against `p_on − p_lb` for a
+/// consumer (validator's `viol_cs_t_p_on_min` formula).
+const UP_DIRECTION_PRODUCTS: &[&str] = &["reg_up", "syn", "ramp_up_on"];
+
+/// Product IDs whose awards count against `p_ub − p_on` for a
+/// consumer (validator's `viol_cs_t_p_on_max` formula).
+const DOWN_DIRECTION_PRODUCTS: &[&str] = &["reg_down", "ramp_down_on"];
+
 fn extract_reserve_awards(reserve_awards: &[HashMap<String, f64>]) -> ActiveReserveAwardSeries {
     let take = |id: &str| -> Vec<f64> {
         reserve_awards
@@ -460,6 +519,7 @@ fn consumer_device_solution(
     dc_reserve_by_uid: &HashMap<String, Vec<HashMap<String, f64>>>,
     have_dc_reserve_source: bool,
     context: &GoC3Context,
+    options: &ExportOptions,
 ) -> GoC3DeviceSolution {
     // Block IDs — populated by `build_dispatch_request`. When the
     // request builder hasn't been called on this handle, probe the
@@ -594,6 +654,71 @@ fn consumer_device_solution(
         })
         .collect();
     let on_status = stabilize_zero_floor_online_status(device, device_ts, raw_on_status);
+
+    // Optional reserve-shedding pass: AC SCED can curtail consumer
+    // `p_on` below the level needed to support the SCUC-awarded
+    // reserves. The validator's
+    //   `viol_cs_t_p_on_min`: p_on ≥ p_lb + p_rgu + p_scr + p_rru_on
+    //   `viol_cs_t_p_off_max`: p_on ≤ p_ub − p_rgd − p_rrd_on
+    // then stamps `feas=0` even when the AC dispatch is otherwise
+    // valid. When `allow_consumer_reserve_shedding=true` we cap each
+    // direction's awarded reserves so those constraints stay
+    // feasible. The shed amount is implicitly accepted as zonal
+    // reserve shortfall and scored by the validator's existing zonal-
+    // balance penalty — preferable to letting the validator stamp
+    // the whole solution `feas=0` over a bookkeeping mismatch
+    // between SCUC awards and AC-curtailed dispatch.
+    if options.allow_consumer_reserve_shedding {
+        let p_lb_series: Vec<f64> = device_ts
+            .map(|ts| ts.p_lb.clone())
+            .unwrap_or_else(|| vec![0.0; periods]);
+        for (i, awards) in reserve_awards.iter_mut().enumerate() {
+            if i >= p_on.len() {
+                break;
+            }
+            let p_lb_i = p_lb_series.get(i).copied().unwrap_or(0.0);
+            let p_ub_i = p_ub.get(i).copied().unwrap_or(f64::INFINITY);
+
+            // Up-direction: served power must cover `p_lb + Σ up_res`.
+            let up_room = (p_on[i] - p_lb_i).max(0.0);
+            let up_total: f64 = UP_DIRECTION_PRODUCTS
+                .iter()
+                .filter_map(|p| awards.get(*p).copied())
+                .sum();
+            if up_total > up_room + 1e-12 {
+                let scale = if up_total > 0.0 {
+                    (up_room / up_total).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                for product in UP_DIRECTION_PRODUCTS {
+                    if let Some(v) = awards.get_mut(*product) {
+                        *v *= scale;
+                    }
+                }
+            }
+
+            // Down-direction: served power plus down-reserves must
+            // not exceed `p_ub`.
+            let down_room = (p_ub_i - p_on[i]).max(0.0);
+            let down_total: f64 = DOWN_DIRECTION_PRODUCTS
+                .iter()
+                .filter_map(|p| awards.get(*p).copied())
+                .sum();
+            if down_total > down_room + 1e-12 {
+                let scale = if down_total > 0.0 {
+                    (down_room / down_total).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                for product in DOWN_DIRECTION_PRODUCTS {
+                    if let Some(v) = awards.get_mut(*product) {
+                        *v *= scale;
+                    }
+                }
+            }
+        }
+    }
 
     let (
         p_reg_res_up,

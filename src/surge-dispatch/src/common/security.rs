@@ -342,6 +342,7 @@ pub fn build_branch_lodf_flowgate(
         limit_reverse_mw_schedule: Vec::new(),
         hvdc_coefficients: Vec::new(),
         hvdc_band_coefficients: Vec::new(),
+        ptdf_per_bus: Vec::new(),
         limit_mw_active_period: active_period,
         breach_sides: if violation.breach_upper {
             FlowgateBreachSides::Upper

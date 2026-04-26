@@ -11,8 +11,9 @@ One-paragraph market description:
 
 Concrete reference implementations:
 
-* [`markets/rto/`](../rto/README.md) — multi-participant DAM with
-  LMPs, 4-product AS, SCUC + repricing.
+* [`markets/go_c3/`](../go_c3/README.md) — multi-participant DAM
+  with LMPs, AS, SCUC + AC SCED reconcile (the GO Competition
+  Challenge 3 spec).
 * [`markets/battery/`](../battery/README.md) — single-site
   price-taker with AS co-optimisation.
 

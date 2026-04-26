@@ -183,6 +183,177 @@ pub struct SecurityDispatchMetadata {
     /// is carrying dead constraint rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub n_preseed_pairs_binding: Option<usize>,
+    /// One-time setup wall times incurred before the first security
+    /// iteration (hourly network snapshots, contingency contexts, pre-
+    /// seeded cuts, cold-start loss warm start). `None` for paths that
+    /// don't have a setup phase (e.g. `max_iterations == 0` shortcut,
+    /// explicit-security dispatch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_timings_secs: Option<SecuritySetupTimings>,
+    /// Per-iteration breakdown of the outer security loop. Empty for
+    /// paths that don't run an iterative loop (e.g. `max_iterations ==
+    /// 0` shortcut, explicit-security dispatch). Ordered by iteration
+    /// index starting at 0.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub per_iteration: Vec<SecurityIterationReport>,
+    /// Final-pass post-contingency flow report for `(period, ctg, mon)`
+    /// pairs whose post-contingency flow on the converged dispatch
+    /// reaches a near-binding threshold (default 0.7 of the monitored
+    /// branch's emergency rating). Lets the dashboard show
+    /// contingencies that are *close* to the limit but didn't trigger
+    /// a hard violation, without exploding the report with every
+    /// (k × l × period) tuple. Empty for non-iterative paths or when
+    /// near-binding screening is disabled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub near_binding_contingencies: Vec<NearBindingContingency>,
+}
+
+/// Post-contingency flow on a single (period, contingency, monitored)
+/// pair, reported when the flow magnitude reaches the near-binding
+/// threshold. See [`SecurityDispatchMetadata::near_binding_contingencies`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NearBindingContingency {
+    /// Period index this report applies to.
+    pub period: u32,
+    /// Outage (contingency) branch endpoints + circuit.
+    pub outage_from_bus: u32,
+    pub outage_to_bus: u32,
+    pub outage_circuit: String,
+    /// Monitored branch endpoints + circuit.
+    pub monitored_from_bus: u32,
+    pub monitored_to_bus: u32,
+    pub monitored_circuit: String,
+    /// Post-contingency flow on the monitored branch (MW). Sign
+    /// matches the network's stored from→to direction.
+    pub post_contingency_flow_mw: f64,
+    /// Monitored branch emergency rating used as the cut limit (MW).
+    pub limit_mw: f64,
+    /// `|post_contingency_flow_mw| / limit_mw`. Always ≥ the
+    /// near-binding threshold, possibly > 1.0 when breached.
+    pub utilization: f64,
+}
+
+/// One-time setup wall times for the iterative security SCUC loop.
+///
+/// Emitted once before the first outer iteration; captures the hourly
+/// network snapshots, per-hour contingency contexts, pre-seeded cut
+/// construction, and cold-start loss-factor warm start (when enabled).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SecuritySetupTimings {
+    /// Building per-period [`surge_network::Network`] snapshots with the
+    /// dispatch profiles applied — O(n_periods × n_branches).
+    pub hourly_networks_secs: f64,
+    /// Building per-period PTDF + contingency metadata used by the N-1
+    /// screener (`HourlySecurityContext::build`).
+    pub hourly_contexts_secs: f64,
+    /// Ranking and materialising structural N-1 pairs into the flowgate
+    /// pre-seed. `0.0` when `preseed_count_per_period == 0` or the
+    /// policy's preseed method is `None`.
+    #[serde(default)]
+    pub preseed_secs: f64,
+    /// Cold-start loss-factor warm start compute (only runs on iter 0
+    /// when loss factors are enabled and the mode opts in). `0.0`
+    /// otherwise.
+    #[serde(default)]
+    pub cold_start_loss_warm_start_secs: f64,
+}
+
+/// Per-outer-iteration breakdown of the iterative security SCUC loop.
+///
+/// Mirrors what `tracing::info!` emits inside the outer loop so the
+/// per-iteration wall-time profile is recoverable from `run-report.json`
+/// without having to replay `capture_solver_log=true`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityIterationReport {
+    /// Zero-based outer-loop iteration index.
+    pub iter: usize,
+    /// Cloning `network` and extending it with accumulated security
+    /// flowgates before the inner SCUC solve.
+    pub net_clone_secs: f64,
+    /// Everything inside the inner `solve_scuc_*` call for this
+    /// iteration — includes LP/MIP warm-start application, MIP solve,
+    /// and any post-MIP loss-factor / theta-repair work. The
+    /// connectivity-cut refit rounds on SW1 all bill to this bucket.
+    pub inner_solve_secs: f64,
+    /// Re-solving DC PF per period to rebuild physical angles when
+    /// `scuc_disable_bus_power_balance` is on (otherwise `0.0`). Billed
+    /// separately from `inner_solve_secs` and `screen_secs`.
+    #[serde(default)]
+    pub repair_theta_secs: f64,
+    /// Post-solve N-1 screening across every period (branch + HVDC
+    /// violation screens).
+    pub screen_secs: f64,
+    /// Building [`surge_network::Flowgate`]s from the picked-up
+    /// violations and extending `security_flowgates` for the next
+    /// iteration. `0.0` on the last (converged) iteration.
+    #[serde(default)]
+    pub cut_build_secs: f64,
+    /// Branch N-1 violations observed in this iteration's screen.
+    pub n_branch_violations: usize,
+    /// HVDC N-1 violations observed in this iteration's screen.
+    pub n_hvdc_violations: usize,
+    /// Worst branch-outage thermal violation in p.u. (None when no
+    /// violations were found).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_branch_violation_pu: Option<f64>,
+    /// Worst HVDC-outage thermal violation in p.u. (None when no
+    /// violations were found).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_hvdc_violation_pu: Option<f64>,
+    /// Cuts added by this iteration (branch + HVDC, capped by
+    /// `max_cuts_per_iteration`). `0` on the converged iteration.
+    pub new_cuts: usize,
+    /// MIP trace for the inner SCUC solve — same shape as
+    /// `DispatchDiagnostics::commitment_mip_trace`, but scoped to this
+    /// iteration rather than the final one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inner_mip_trace: Option<surge_opf::backends::MipTrace>,
+    /// System-row loss telemetry. `Some` only when
+    /// `scuc_disable_bus_power_balance = true` and `scuc_loss_treatment`
+    /// is `ScalarFeedback` or `PenaltyFactors`. Captures the system-row
+    /// loss state computed *after this iteration's* repaired theta and
+    /// fed forward into the next iteration's SCUC build.
+    ///
+    /// Use this to: (a) compare the assumed loss budget on the first
+    /// iter vs realized losses on subsequent iters, (b) detect
+    /// magnitude-cap saturation (large `lf_cap_hits` means the LFs are
+    /// noisy or the network is structurally stressed), (c) check whether
+    /// the loss feedback loop is converging (`per_period_total_loss_mw`
+    /// should stabilize across iters).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sys_row_loss_telemetry: Option<SecurityIterationLossTelemetry>,
+}
+
+/// Per-period system-row loss telemetry attached to each
+/// `SecurityIterationReport` when `scuc_loss_treatment != Static`.
+///
+/// All fields are computed from the iteration's repaired theta — the
+/// physical DC PF angles consistent with the just-solved SCUC dispatch.
+/// `dloss_dp` stats reflect the post-blend, post-cap state that will
+/// feed the next iteration's SCUC build (so e.g. `lf_p95_abs_per_period`
+/// at the magnitude cap means the cap is biting).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SecurityIterationLossTelemetry {
+    /// Loss treatment mode active when this telemetry was captured.
+    /// `"static"`, `"scalar_feedback"`, or `"penalty_factors"`.
+    pub mode: String,
+    /// Realized total system loss per period in MW (before damping/
+    /// blending) — what `repair_theta_from_dc_pf` actually saw.
+    pub realized_total_loss_mw_per_period: Vec<f64>,
+    /// Total loss per period in MW after blending against the prior
+    /// iter's cache. This is what gets baked into the *next* iter's
+    /// system-row RHS. Equals `realized_*` on iter 0.
+    pub blended_total_loss_mw_per_period: Vec<f64>,
+    /// Per-period stats on the post-blend, post-cap `dloss_dp` slice.
+    /// All zeros on `ScalarFeedback` mode (LFs not used). Populated
+    /// only on `PenaltyFactors`.
+    pub lf_min_per_period: Vec<f64>,
+    pub lf_max_per_period: Vec<f64>,
+    pub lf_p95_abs_per_period: Vec<f64>,
+    /// Number of `dloss_dp` entries (across all periods + buses) that
+    /// hit either rail of the magnitude cap during this iteration's
+    /// blend. Large values mean the cap is biting and LFs are noisy.
+    pub lf_cap_hits: usize,
 }
 
 /// Per-phase wall-clock timings for the dispatch pipeline (seconds).
@@ -522,6 +693,11 @@ pub struct BusPeriodResult {
     pub mec: f64,
     pub mcc: f64,
     pub mlc: f64,
+    /// Reactive LMP ($/MVAr-h) — dual on the per-bus Q-balance
+    /// constraint from the AC OPF. ``None`` for DC-only solves and
+    /// for backends that don't surface NLP duals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q_lmp: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub angle_rad: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1790,6 +1966,7 @@ mod tests {
                 mec: 0.0,
                 mcc: 0.0,
                 mlc: 0.0,
+                q_lmp: None,
                 angle_rad: None,
                 voltage_pu: None,
                 net_injection_mw: 0.0,

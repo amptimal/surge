@@ -14,6 +14,7 @@ pub(super) mod layout;
 pub(super) mod losses;
 pub(super) mod metadata;
 pub(super) mod objective;
+pub(super) mod penalty_factors;
 pub(super) mod plan;
 pub(super) mod pricing;
 pub(super) mod problem;
