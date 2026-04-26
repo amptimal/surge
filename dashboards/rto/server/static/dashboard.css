@@ -882,7 +882,7 @@ svg.sc-chart { width: 100%; height: 100%; display: block; overflow: visible; }
 }
 .gen-row {
   display: grid;
-  grid-template-columns: minmax(120px, 1.6fr) 40px 60px minmax(100px, 1fr) 60px 70px 80px;
+  grid-template-columns: minmax(120px, 1.6fr) 40px 60px minmax(100px, 1fr) 60px 70px 78px 70px 78px;
   gap: 10px;
   padding: 6px 8px;
   background: var(--bg-elevated);
@@ -893,6 +893,23 @@ svg.sc-chart { width: 100%; height: 100%; display: block; overflow: visible; }
   align-items: center;
   color: var(--text-muted);
 }
+.gen-row .revenue.as-pos { color: var(--purple-bright, #a78bfa); }
+.gen-row .revenue.as-zero { color: var(--text-dim); }
+/* Thin AS-carrying band above each sparkline. Each cell is one period;
+   filled when the unit cleared any AS award that period, colored by
+   the first product that cleared. */
+.spark-as-band {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  display: flex;
+  pointer-events: none;
+  border-radius: 1px;
+  overflow: hidden;
+}
+.spark-as-cell { flex: 1 1 0; }
 .gen-row.head {
   font-family: var(--font);
   font-weight: 700;
@@ -921,7 +938,10 @@ svg.sc-chart { width: 100%; height: 100%; display: block; overflow: visible; }
   border-radius: 50%;
   flex-shrink: 0;
 }
-.gen-row .mw, .gen-row .revenue, .gen-row .cost { text-align: right; }
+.gen-row .mw, .gen-row .revenue, .gen-row .cost, .gen-row .net { text-align: right; }
+.gen-row .net.pos { color: var(--emerald, #34d399); font-weight: 600; }
+.gen-row .net.neg { color: var(--red, #f87171); font-weight: 600; }
+.gen-row .net.zero { color: var(--text-dim); }
 .gen-row .mini-spark {
   height: 22px;
   position: relative;
@@ -953,7 +973,7 @@ svg.sc-chart { width: 100%; height: 100%; display: block; overflow: visible; }
 }
 .load-row {
   display: grid;
-  grid-template-columns: 60px 80px 80px 80px 1fr;
+  grid-template-columns: 60px 80px 80px 80px 90px 1fr;
   gap: 10px;
   padding: 6px 8px;
   background: var(--bg-elevated);
@@ -963,6 +983,7 @@ svg.sc-chart { width: 100%; height: 100%; display: block; overflow: visible; }
   font-family: var(--mono);
   align-items: center;
 }
+.load-row .cost { text-align: right; }
 .load-row.head {
   font-family: var(--font);
   font-weight: 700;
@@ -973,7 +994,117 @@ svg.sc-chart { width: 100%; height: 100%; display: block; overflow: visible; }
   background: transparent;
   border: 0;
 }
+.load-row.total {
+  background: transparent;
+  border-top: 1px solid var(--border);
+  border-bottom: 0;
+  border-left: 0;
+  border-right: 0;
+  border-radius: 0;
+  margin-top: 4px;
+  font-weight: 700;
+  color: var(--text);
+}
+.load-row.total .cost { color: var(--purple-bright, #a78bfa); }
 .load-row .mini-spark { height: 22px; }
+
+/* ─── HVDC PANE ─── */
+/* Aggregate chart sized to match the Generators tab so the HVDC tab
+   reads the same: chart fixed at 260 px, table fills the rest. */
+#hvdc-chart {
+  min-height: 220px;
+  flex: 0 0 auto;
+  height: 260px;
+}
+.hvdc-table {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+}
+.hvdc-row {
+  display: grid;
+  grid-template-columns: 1.2fr 1fr 1fr 1fr 1.4fr 1.2fr 1.2fr;
+  gap: 10px;
+  padding: 6px 8px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-sub);
+  border-radius: 5px;
+  font-size: 0.66rem;
+  font-family: var(--mono);
+  align-items: center;
+}
+.hvdc-row .mw { text-align: right; }
+.hvdc-row.head {
+  font-family: var(--font);
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-size: 0.54rem;
+  color: var(--text-dim);
+  background: transparent;
+  border: 0;
+}
+.hvdc-row .dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 6px;
+}
+.hvdc-row .mini-spark { height: 22px; position: relative; }
+
+/* ─── AS PRICING PANE ─── */
+.as-pricing-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 12px;
+  padding: 6px 4px;
+}
+.as-pricing-card {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-sub);
+  border-radius: 6px;
+  padding: 8px 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 200px;
+}
+.as-pricing-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.as-pricing-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.74rem;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: 0.04em;
+}
+.as-pricing-title .panel-sub { font-weight: 400; }
+.as-pricing-title .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.as-pricing-stats {
+  display: inline-flex;
+  gap: 10px;
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  color: var(--text-muted);
+}
+.as-pricing-chart {
+  flex: 1 1 auto;
+  min-height: 140px;
+  height: 160px;
+}
 
 /* ─── RESERVES PANE ─── */
 .reserves-grid {
@@ -1148,11 +1279,328 @@ svg.sc-chart { width: 100%; height: 100%; display: block; overflow: visible; }
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
+/* Compact tooltip for the table-row sparklines (Generators, Loads,
+   Branches, Contingencies). Same visual language as ``.sc-tooltip``
+   but lighter padding so it fits over a 22 px row. */
+.spark-tooltip {
+  position: absolute;
+  z-index: 30;
+  background: rgba(10,10,15,0.96);
+  border: 1px solid var(--border-purple);
+  border-radius: 5px;
+  padding: 4px 7px;
+  min-width: 110px;
+  pointer-events: none;
+  font-family: var(--font);
+  font-size: 0.60rem;
+  color: var(--text);
+  backdrop-filter: blur(3px);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+  opacity: 0;
+  transition: opacity 0.08s;
+  white-space: nowrap;
+}
+.spark-tooltip.visible { opacity: 1; }
+.spark-tooltip-title {
+  color: var(--text-muted);
+  font-size: 0.54rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding-bottom: 2px;
+  margin-bottom: 2px;
+  border-bottom: 1px solid var(--border-sub);
+}
+.spark-tooltip-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 1px 0;
+}
+.spark-tooltip-row .sw {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 2px;
+  margin-right: 5px;
+}
+.spark-tooltip-row .val {
+  color: var(--text);
+  font-family: var(--mono);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
 .sc-crosshair {
   stroke: rgba(167,139,250,0.45);
   stroke-width: 1;
   stroke-dasharray: 2 3;
   pointer-events: none;
+}
+
+/* ─── Objective tab ─── */
+.objective-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 0.6rem;
+  padding: 0.75rem 1rem;
+}
+.obj-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 0.6rem 0.75rem;
+  background: rgba(30, 41, 59, 0.4);
+  border-radius: 6px;
+  border-left: 3px solid var(--accent-cyan, #60a5fa);
+}
+.obj-card.grand {
+  border-left-color: var(--purple-bright, #a78bfa);
+  background: rgba(167, 139, 250, 0.08);
+}
+.obj-card-label {
+  font-size: 0.8rem;
+  color: var(--text-muted, #94a3b8);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.obj-card-value {
+  font-size: 1.05rem;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.obj-card-share {
+  font-size: 0.75rem;
+  color: var(--text-muted, #94a3b8);
+  font-family: var(--mono);
+}
+.objective-stack {
+  /* Take all remaining vertical space below the bucket cards.
+     ``min-height: 0`` is required for ``flex: 1 1 auto`` to actually
+     shrink the chart inside the flex column when the cards row grows. */
+  flex: 1 1 auto;
+  min-height: 240px;
+  margin: 0.5rem 1rem 1rem;
+}
+
+/* ─── Branches / Contingencies tabs ─── */
+.threshold-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+  color: var(--text-muted, #94a3b8);
+}
+.threshold-control input {
+  width: 70px;
+}
+.branches-body, .contingencies-body {
+  padding: 0.5rem 1rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  font-family: var(--mono);
+  font-size: 0.85rem;
+}
+.br-row, .ctg-row {
+  display: grid;
+  grid-template-columns: 1.4fr 1fr 0.7fr 1.2fr 1.2fr 1.2fr;
+  gap: 0.5rem;
+  padding: 0.3rem 0.5rem;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+  align-items: center;
+}
+.br-row.head, .ctg-row.head {
+  font-weight: 600;
+  color: var(--text-muted, #94a3b8);
+  border-bottom: 1px solid rgba(148, 163, 184, 0.3);
+}
+.br-row .worst, .ctg-row .worst {
+  font-weight: 600;
+}
+.br-row.near .worst, .ctg-row.near .worst { color: #fbbf24; }
+.br-row.binding .worst, .ctg-row.binding .worst { color: #fb923c; }
+.br-row.breach .worst, .ctg-row.breach .worst { color: #f87171; }
+
+.br-row.head .legend-key, .ctg-row.head .legend-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.65rem;
+  font-weight: 400;
+  color: var(--text-muted, #94a3b8);
+  margin-top: 0.15rem;
+}
+.br-row.head .legend-key .dot, .ctg-row.head .legend-key .dot {
+  display: inline-block;
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 50%;
+  margin-right: 0.15rem;
+  margin-left: 0.45rem;
+}
+.br-row.head .legend-key .dot:first-child,
+.ctg-row.head .legend-key .dot:first-child { margin-left: 0; }
+.br-row.head .legend-key .dot.sced,
+.ctg-row.head .legend-key .dot.sced { background: #f87171; }
+.br-row.head .legend-key .dot.scuc,
+.ctg-row.head .legend-key .dot.scuc { background: rgba(96, 165, 250, 0.85); }
+
+/* ─── LMP tab side-by-side P / Q layout ─── */
+.lmp-grid {
+  display: grid;
+  /* Default = one column (P only). When the result carries reactive
+     duals, JS adds ``has-q`` and the second column reveals. */
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.75rem;
+  padding: 0 0.5rem 0.5rem;
+  /* Each column scrolls independently inside its own heatmap so the
+     overall pane stays in the viewport without page-level scrolling. */
+  align-items: start;
+}
+.lmp-grid.has-q {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+.lmp-col {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  min-width: 0;
+}
+.lmp-col-head {
+  font-size: 0.85rem;
+  color: var(--text-muted, #94a3b8);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 0.25rem 0.25rem 0;
+}
+.lmp-col .lmp-heatmap,
+.lmp-col .lmp-lines {
+  /* Constrain heatmap height + scroll inside the column rather than
+     pushing the chart below off-screen. */
+  max-height: 360px;
+  overflow: auto;
+}
+.lmp-col .lmp-lines {
+  height: 180px;
+  max-height: 220px;
+  overflow: hidden;
+}
+@media (max-width: 1240px) {
+  /* Tight viewports stack the two columns rather than crushing them. */
+  .lmp-grid.has-q { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* ─── Reactive (P/Q) mode toggle ─── */
+.reactive-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.15rem 0.5rem;
+  background: rgba(167, 139, 250, 0.08);
+  border: 1px solid rgba(167, 139, 250, 0.2);
+  border-radius: 4px;
+  font-size: 0.85rem;
+  color: var(--text-muted, #94a3b8);
+}
+.reactive-toggle[hidden] { display: none; }
+.reactive-toggle select {
+  font-family: inherit;
+  font-size: inherit;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  outline: none;
+}
+
+/* ─── Solve modal overlay ─── */
+.solve-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.72);
+  backdrop-filter: blur(2px);
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: all;
+}
+.solve-overlay[hidden] { display: none; }
+.solve-overlay-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 1.5rem 2rem;
+  background: var(--bg-2, #0f172a);
+  border: 1px solid var(--border, #334155);
+  border-radius: 8px;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
+  min-width: 240px;
+  max-width: 90vw;
+  max-height: 80vh;
+}
+.solve-overlay-log {
+  width: 600px;
+  max-width: 80vw;
+  height: 240px;
+  margin: 0;
+  padding: 0.5rem 0.75rem;
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid var(--border, #334155);
+  border-radius: 4px;
+  font-family: var(--mono, monospace);
+  font-size: 0.75rem;
+  line-height: 1.4;
+  color: var(--text-muted, #94a3b8);
+  white-space: pre-wrap;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+.solve-overlay-log:empty {
+  display: none;
+}
+.solve-overlay-dismiss {
+  margin-top: 0.5rem;
+  padding: 0.4rem 1.2rem;
+  background: rgba(248, 113, 113, 0.15);
+  border: 1px solid rgba(248, 113, 113, 0.4);
+  color: #f87171;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+.solve-overlay-dismiss:hover {
+  background: rgba(248, 113, 113, 0.25);
+}
+.solve-overlay-spinner {
+  width: 38px;
+  height: 38px;
+  border: 3px solid rgba(167, 139, 250, 0.25);
+  border-top-color: var(--purple-bright, #a78bfa);
+  border-radius: 50%;
+  animation: solve-spin 0.85s linear infinite;
+}
+@keyframes solve-spin {
+  to { transform: rotate(360deg); }
+}
+.solve-overlay-title {
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--text);
+}
+.solve-overlay-sub {
+  font-size: 0.85rem;
+  color: var(--text-muted, #94a3b8);
+}
+.solve-overlay-elapsed {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.95rem;
+  color: var(--purple-bright, #a78bfa);
 }
 
 /* ─── responsive safety ─── */

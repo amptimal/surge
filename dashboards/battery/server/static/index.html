@@ -41,6 +41,10 @@
       <option value="sequential">Sequential</option>
     </select>
   </div>
+  <label class="mode-toggle" title="Firm AS — every cleared MW of AS award must be backed by enough SOC headroom to deploy at 100 % for the entire period. Up-direction products (reg-up, syn, nsyn) are gated against (SOC[t] − soc_min) × η_dis / dt; down-direction (reg-down) against (soc_max − SOC[t]) / (η_ch · dt). Off by default — turning it on usually shifts AS revenue down because the LP refuses to clear awards it can't physically deliver.">
+    <input type="checkbox" id="inp-enforce-reserve-soc">
+    <span>Firm AS</span>
+  </label>
   <div class="mode-hint" id="mode-hint"></div>
   <div class="solve-bar-right">
     <div id="solve-status" class="solve-status">ready</div>
@@ -87,14 +91,15 @@
             <label class="field-row"><span class="field-label">Charge <em>MW</em></span><input type="number" id="inp-charge-mw" min="0" step="0.1"></label>
             <label class="field-row"><span class="field-label">Discharge <em>MW</em></span><input type="number" id="inp-discharge-mw" min="0" step="0.1"></label>
             <label class="field-row"><span class="field-label">Energy <em>MWh</em></span><input type="number" id="inp-energy" min="0" step="0.1"></label>
-            <label class="field-row"><span class="field-label">Charge efficiency</span><input type="number" id="inp-eff-charge" min="0.1" max="1.0" step="0.01"></label>
-            <label class="field-row"><span class="field-label">Discharge efficiency</span><input type="number" id="inp-eff-discharge" min="0.1" max="1.0" step="0.01"></label>
+            <label class="field-row"><span class="field-label">Charge efficiency <em>%</em></span><input type="number" id="inp-eff-charge" min="10" max="100" step="0.1"></label>
+            <label class="field-row"><span class="field-label">Discharge efficiency <em>%</em></span><input type="number" id="inp-eff-discharge" min="10" max="100" step="0.1"></label>
             <label class="field-row"><span class="field-label">Degradation <em>$/MWh</em></span><input type="number" id="inp-deg" min="0" step="0.1"></label>
-            <label class="field-row"><span class="field-label">SOC min</span><input type="number" id="inp-soc-min" min="0" max="1" step="0.01"></label>
-            <label class="field-row"><span class="field-label">SOC max</span><input type="number" id="inp-soc-max" min="0" max="1" step="0.01"></label>
-            <label class="field-row"><span class="field-label">Discharge foldback <em>SOC</em></span><input type="number" id="inp-foldback-dis" min="0" max="1" step="0.01" placeholder="off"></label>
-            <label class="field-row"><span class="field-label">Charge foldback <em>SOC</em></span><input type="number" id="inp-foldback-ch" min="0" max="1" step="0.01" placeholder="off"></label>
+            <label class="field-row"><span class="field-label">SOC min <em>%</em></span><input type="number" id="inp-soc-min" min="0" max="100" step="0.5"></label>
+            <label class="field-row"><span class="field-label">SOC max <em>%</em></span><input type="number" id="inp-soc-max" min="0" max="100" step="0.5"></label>
+            <label class="field-row"><span class="field-label">Discharge foldback <em>SOC %</em></span><input type="number" id="inp-foldback-dis" min="0" max="100" step="0.5" placeholder="off"></label>
+            <label class="field-row"><span class="field-label">Charge foldback <em>SOC %</em></span><input type="number" id="inp-foldback-ch" min="0" max="100" step="0.5" placeholder="off"></label>
             <label class="field-row"><span class="field-label">SOC initial <em>MWh</em></span><input type="number" id="inp-soc-init" min="0" step="0.1"></label>
+            <label class="field-row"><span class="field-label">Cycles / day <em>FEC</em></span><input type="number" id="inp-cycles-per-day" min="0" step="0.1" placeholder="off"></label>
           </div>
         </div>
 
@@ -173,7 +178,8 @@
             <button class="ghost-btn-sm" data-preset="peak">Peak</button>
           </div>
           <div class="as-actions" id="as-actions">
-            <button class="ghost-btn-sm" id="btn-as-zero" title="Set every period to $0">Zero</button>
+            <button class="ghost-btn-sm" id="btn-as-zero" title="Zero every period for the active tab (collapses the distribution band too)">Zero</button>
+            <button class="ghost-btn-sm" id="btn-as-reset" title="Restore this tab to its default values">Reset</button>
           </div>
           <div class="dist-controls" id="price-dist-controls"></div>
         </div>
@@ -200,6 +206,7 @@
       <div class="panel-body">
         <div class="rev-row"><span>Energy</span><span id="rev-energy">—</span></div>
         <div class="rev-row"><span>AS</span><span id="rev-as">—</span></div>
+        <div class="rev-as-breakdown" id="rev-as-breakdown"></div>
         <div class="rev-row"><span>Degradation</span><span id="rev-deg">—</span></div>
         <div class="rev-row total"><span>Net</span><span id="rev-net">—</span></div>
         <div class="rev-row sub"><span>Charge</span><span id="rev-charge-mwh">—</span></div>
@@ -217,7 +224,10 @@
     </div>
 
     <div class="panel">
-      <div class="panel-head"><h2>SOC <span class="panel-sub">MWh</span></h2></div>
+      <div class="panel-head">
+        <h2>SOC <span class="panel-sub">MWh</span></h2>
+        <div class="chart-legend" id="soc-legend"></div>
+      </div>
       <div class="panel-body"><div id="chart-soc" class="chart-readonly"></div></div>
     </div>
 

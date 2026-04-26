@@ -63,7 +63,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
-from typing import Any, Literal, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 from .._generated.dispatch_request import DispatchRequest
 from .loads import DispatchableLoadOfferSchedule, DispatchableLoadSpec
@@ -314,6 +314,32 @@ class DispatchRequestBuilder:
         self._market["generator_reserve_offer_schedules"] = [
             s.to_request_dict(self._periods) for s in schedules
         ]
+        return self
+
+    def storage_reserve_soc_impacts(
+        self, impacts: Sequence[Mapping[str, Any]]
+    ) -> "DispatchRequestBuilder":
+        """Per-storage per-product SOC impact factors used by the LP's
+        reserve-SOC-headroom rows.
+
+        Each entry is a mapping with the keys
+        ``resource_id``, ``product_id``, and
+        ``values_mwh_per_mw`` (length = horizon periods). A positive
+        value means "deployment uses SOC" (up-direction reserves); a
+        negative value means "deployment fills SOC" (down-direction).
+        Magnitude of ``1 / η_dis`` (up) or ``η_ch`` (down) gives the
+        full-period 100 %-deployment cap.
+        """
+        rendered: list[dict[str, Any]] = []
+        for entry in impacts:
+            rendered.append(
+                {
+                    "resource_id": str(entry["resource_id"]),
+                    "product_id": str(entry["product_id"]),
+                    "values_mwh_per_mw": [float(v) for v in entry["values_mwh_per_mw"]],
+                }
+            )
+        self._market["storage_reserve_soc_impacts"] = rendered
         return self
 
     def dispatchable_loads(

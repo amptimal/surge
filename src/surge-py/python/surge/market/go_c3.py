@@ -78,8 +78,8 @@ class MarketPolicy:
     allow_branch_switching: bool = False
     lp_solver: str = "gurobi"
     nlp_solver: str = "ipopt"
-    commitment_mip_rel_gap: float | None = 0.0001
-    commitment_time_limit_secs: float | None = 600.0
+    commitment_mip_rel_gap: float | None = 1e-3
+    commitment_time_limit_secs: float | None = 300.0
     # Time-varying MIP gap schedule evaluated as a step function: at
     # wall time ``t`` the acceptable gap is the ``gap`` of the latest
     # pair with ``time_secs <= t``. The solver terminates once the
@@ -117,22 +117,16 @@ class MarketPolicy:
     # PF warm-start, and use the bounds-midpoint anchor for ramps.
     # Networks with in-service storage fall back to sequential.
     ac_sced_period_concurrency: int | None = 2
-    # Pre-seed iter 0 of the SCUC iterative-screening security loop with
-    # this many top-ranked (contingency, monitored) cuts per period.
-    # 0 = disabled. Ranking is topology-only (|LODF| scaled by
-    # emergency-rating ratio), so the cost is a fraction of one SCUC
-    # re-solve. The default (10_000) is larger than any current network's
-    # pairs-per-period budget, which effectively seeds every candidate
-    # pair — on 73-bus D1 this converges in 1 SCUC iteration and cuts
-    # wall time ~50% vs. the baseline iterative-screening loop.
-    # Default tuned on 617-D1 case 2: 1000 preseeded cuts/period
-    # seeds iter-0 with ~18k structural cuts — enough to cover the
-    # top-LODF binding pairs in one shot so the iterative refinement
-    # loop converges in 1-2 extra iterations. Higher values bloat the
-    # MIP (90k rows at 5000/period couldn't find an incumbent in 60 s
-    # on 617-bus); lower values leave many binding pairs for the
-    # iterative loop to clean up.
-    scuc_security_preseed_count_per_period: int = 250
+    # Pre-seed iter 0 of the SCUC iterative-screening security loop
+    # with this many top-ranked (contingency, monitored) cuts per
+    # period. Ranking is topology-only (|LODF| scaled by
+    # emergency-rating ratio). 0 (default) lets the iterative loop
+    # discover all cuts on its own — on 73-bus D1 this trades ~2× wall
+    # time for materially better z and feasibility (12/24 vs 9/24
+    # feas, mean Δ% vs SW1 winner -0.258 vs -0.432). Set to a positive
+    # value to seed the MIP up-front when iteration count, not
+    # solution quality, is the bottleneck.
+    scuc_security_preseed_count_per_period: int = 0
     # Outer-loop cap for the iterative SCUC N-1 security screening
     # (preseed → solve → check violations → add cuts → repeat). `1`
     # runs a single SCUC solve with only the preseeded cuts.
@@ -183,6 +177,22 @@ class MarketPolicy:
     # Diagnostic: drop SCUC branch thermal enforcement entirely (skips
     # the row family). Off by default.
     disable_scuc_thermal_limits: bool = False
+    # SCUC system-row loss treatment across security iterations when
+    # ``scuc_disable_bus_power_balance=True`` (the canonical GO C3 mode).
+    # Three options:
+    #   * "static" — single ``rate × total_load`` per period baked into
+    #     the system-row RHS, never updated. Pre-feedback baseline.
+    #   * "scalar_feedback" (default) — realized total losses per
+    #     period fed forward as next iter's RHS. Damped, asymmetric
+    #     upward bias. Validated 2026-04-25 on the 617-bus cut: beat
+    #     ``static`` on 6/6 scenarios, +$1.81 M aggregate surplus.
+    #   * "penalty_factors" — full marginal loss factors `(1 − LF_g)` on
+    #     every injection coefficient, distributed-load slack reference,
+    #     with linearization-point RHS correction. Available as opt-in
+    #     when locational asymmetries are suspected.
+    # Ignored when ``scuc_disable_bus_power_balance=False`` — the per-bus
+    # ``iterate_loss_factors`` machinery handles losses directly there.
+    scuc_loss_treatment: str = "scalar_feedback"
     log_level: str = "info"
     capture_solver_log: bool = False
 
@@ -458,6 +468,7 @@ def export(
     dispatch_result,
     *,
     dc_reserve_source=None,
+    allow_consumer_reserve_shedding: bool = True,
 ) -> dict[str, Any]:
     """Convert a solved dispatch result back into a GO C3 solution dict.
 
@@ -466,9 +477,20 @@ def export(
     on ``dispatch_result``. Use this when you solved a two-stage
     workflow: pass the AC SCED solution as ``dispatch_result`` and the
     DC SCUC solution as ``dc_reserve_source``.
+
+    ``allow_consumer_reserve_shedding`` (default ``True``) caps each
+    consumer's exported active-reserve awards so the validator's
+    ``viol_cs_t_p_on_min`` / ``viol_cs_t_p_on_max`` constraints stay
+    feasible when AC SCED has curtailed the consumer's served power
+    below the SCUC-awarded reserve level. The shed amount is
+    implicitly accepted as zonal reserve shortfall. Set ``False``
+    only for diagnostics that need to expose the raw SCUC awards.
     """
     return _native.go_c3_export_solution(
-        problem.handle, dispatch_result, dc_reserve_source
+        problem.handle,
+        dispatch_result,
+        dc_reserve_source,
+        allow_consumer_reserve_shedding,
     )
 
 

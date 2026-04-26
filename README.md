@@ -32,14 +32,12 @@ built on the canonical dispatch and market layers in `surge-dispatch` and
 
 | Market | What it clears | Topology | Workflow |
 |---|---|---|---|
-| [`markets/rto/`](markets/rto/README.md) | ISO day-ahead energy + ancillary services with LMPs | Any `surge.Network` | DC SCUC MIP + LMP repricing LP |
 | [`markets/battery/`](markets/battery/README.md) | Single-site price-taker BESS against an LMP forecast | 1-bus in-memory | Single-stage time-coupled LP |
 | [`markets/go_c3/`](markets/go_c3/README.md) | GO Competition Challenge 3 scenarios | GO C3 JSON → adapter | DC SCUC MIP → AC SCED NLP |
 
 Public Python surface:
 
 ```python
-from markets.rto     import RtoPolicy,     RtoProblem,     solve
 from markets.battery import BatteryPolicy, BatteryProblem, solve
 from markets.go_c3   import GoC3Policy,    GoC3Problem,    solve
 ```
@@ -151,10 +149,10 @@ report = solve(problem, Path("out/ceiling"), policy=BatteryPolicy())
 print(report["revenue_summary"])
 ```
 
-A minimal ISO day-ahead clearing on `surge.case14()` is in
-[`markets/rto/README.md`](markets/rto/README.md); the GO Competition Challenge 3
-adapter (SCUC MIP → AC SCED NLP) is in
-[`markets/go_c3/README.md`](markets/go_c3/README.md).
+The GO Competition Challenge 3 adapter (SCUC MIP → AC SCED NLP) is in
+[`markets/go_c3/README.md`](markets/go_c3/README.md). The RTO dashboard
+([`dashboards/rto/`](dashboards/rto/)) is a configurable UI on top of
+that pipeline.
 
 ### CLI
 

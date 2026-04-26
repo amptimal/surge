@@ -36,6 +36,11 @@ pub struct NlpOptions {
     /// telling the interior-point method to initialise from the provided
     /// primal variables rather than computing an interior starting point.
     pub warm_start: bool,
+    /// Ipopt `nlp_scaling_method` (exact-Hessian path only). Default
+    /// `"gradient-based"`. Set to `"none"` to apply `tolerance` to
+    /// unscaled residuals — required when an external pi-model
+    /// reconstruction must see exact bus balance.
+    pub nlp_scaling_method: String,
 }
 
 impl Default for NlpOptions {
@@ -46,6 +51,7 @@ impl Default for NlpOptions {
             print_level: 0,
             hessian_mode: HessianMode::LimitedMemory,
             warm_start: false,
+            nlp_scaling_method: "gradient-based".to_string(),
         }
     }
 }

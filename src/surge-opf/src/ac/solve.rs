@@ -1612,6 +1612,7 @@ fn solve_ac_opf_with_context_once(
             HessianMode::LimitedMemory
         },
         warm_start: context.runtime.warm_start.is_some(),
+        nlp_scaling_method: options.nlp_scaling_method.clone(),
     };
 
     // ── Gurobi native NLP dispatch (bypasses constraint screening) ────────
@@ -3948,6 +3949,7 @@ mod tests {
             limit_reverse_mw_schedule: Vec::new(),
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
+            ptdf_per_bus: Vec::new(),
             limit_mw_active_period: None,
             breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
@@ -4003,6 +4005,7 @@ mod tests {
             limit_reverse_mw_schedule: Vec::new(),
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
+            ptdf_per_bus: Vec::new(),
             limit_mw_active_period: None,
             breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
@@ -4085,6 +4088,7 @@ mod tests {
             limit_reverse_mw_schedule: Vec::new(),
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
+            ptdf_per_bus: Vec::new(),
             limit_mw_active_period: None,
             breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
@@ -4181,6 +4185,7 @@ mod tests {
             limit_reverse_mw_schedule: Vec::new(),
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
+            ptdf_per_bus: Vec::new(),
             limit_mw_active_period: None,
             breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
@@ -4297,6 +4302,7 @@ mod tests {
             limit_reverse_mw_schedule: Vec::new(),
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
+            ptdf_per_bus: Vec::new(),
             limit_mw_active_period: None,
             breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });

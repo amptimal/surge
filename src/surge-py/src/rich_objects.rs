@@ -651,6 +651,8 @@ pub struct StorageParams {
     pub discharge_foldback_soc_mwh: Option<f64>,
     #[pyo3(get, set)]
     pub charge_foldback_soc_mwh: Option<f64>,
+    #[pyo3(get, set)]
+    pub daily_cycle_limit: Option<f64>,
 }
 
 impl StorageParams {
@@ -673,6 +675,7 @@ impl StorageParams {
             chemistry: storage.chemistry.clone(),
             discharge_foldback_soc_mwh: storage.discharge_foldback_soc_mwh,
             charge_foldback_soc_mwh: storage.charge_foldback_soc_mwh,
+            daily_cycle_limit: storage.daily_cycle_limit,
         }
     }
 
@@ -695,6 +698,7 @@ impl StorageParams {
             chemistry: self.chemistry.clone(),
             discharge_foldback_soc_mwh: self.discharge_foldback_soc_mwh,
             charge_foldback_soc_mwh: self.charge_foldback_soc_mwh,
+            daily_cycle_limit: self.daily_cycle_limit,
         })
     }
 }
@@ -702,7 +706,7 @@ impl StorageParams {
 #[pymethods]
 impl StorageParams {
     #[new]
-    #[pyo3(signature = (energy_capacity_mwh, charge_efficiency=None, discharge_efficiency=None, efficiency=None, soc_initial_mwh=None, soc_min_mwh=0.0, soc_max_mwh=None, variable_cost_per_mwh=0.0, degradation_cost_per_mwh=0.0, dispatch_mode="cost_minimization".to_string(), self_schedule_mw=0.0, discharge_offer=None, charge_bid=None, max_c_rate_charge=None, max_c_rate_discharge=None, chemistry=None, discharge_foldback_soc_mwh=None, charge_foldback_soc_mwh=None))]
+    #[pyo3(signature = (energy_capacity_mwh, charge_efficiency=None, discharge_efficiency=None, efficiency=None, soc_initial_mwh=None, soc_min_mwh=0.0, soc_max_mwh=None, variable_cost_per_mwh=0.0, degradation_cost_per_mwh=0.0, dispatch_mode="cost_minimization".to_string(), self_schedule_mw=0.0, discharge_offer=None, charge_bid=None, max_c_rate_charge=None, max_c_rate_discharge=None, chemistry=None, discharge_foldback_soc_mwh=None, charge_foldback_soc_mwh=None, daily_cycle_limit=None))]
     fn new(
         energy_capacity_mwh: f64,
         charge_efficiency: Option<f64>,
@@ -722,6 +726,7 @@ impl StorageParams {
         chemistry: Option<String>,
         discharge_foldback_soc_mwh: Option<f64>,
         charge_foldback_soc_mwh: Option<f64>,
+        daily_cycle_limit: Option<f64>,
     ) -> PyResult<Self> {
         // Efficiency resolution:
         //   * If charge_efficiency / discharge_efficiency are provided, use
@@ -757,6 +762,7 @@ impl StorageParams {
             chemistry,
             discharge_foldback_soc_mwh,
             charge_foldback_soc_mwh,
+            daily_cycle_limit,
         };
         let _ = storage.to_core()?;
         Ok(storage)

@@ -152,6 +152,14 @@ pub struct LossFactorPolicy {
     /// [`LossFactorWarmStartMode`] for the supported strategies.
     #[serde(default)]
     pub warm_start_mode: LossFactorWarmStartMode,
+    /// How losses are represented inside SCUC across security iterations
+    /// when running in `scuc_disable_bus_power_balance` (system-row) mode.
+    /// See [`ScucLossTreatment`] for the three options. Default
+    /// [`ScucLossTreatment::Static`] preserves prior behavior — losses
+    /// are a static `rate × total_load` adjustment that does not update
+    /// across iterations.
+    #[serde(default)]
+    pub scuc_loss_treatment: ScucLossTreatment,
 }
 
 impl Default for LossFactorPolicy {
@@ -161,8 +169,54 @@ impl Default for LossFactorPolicy {
             max_iterations: 3,
             tolerance: 1e-3,
             warm_start_mode: LossFactorWarmStartMode::default(),
+            scuc_loss_treatment: ScucLossTreatment::default(),
         }
     }
+}
+
+/// How the SCUC system-balance row represents transmission losses across
+/// security iterations.
+///
+/// Only consulted when `runtime.scuc_disable_bus_power_balance = true`
+/// (the GO C3 default). In per-bus-balance mode the existing
+/// `iterate_loss_factors` machinery handles loss representation directly
+/// from the per-bus rows, and this knob is ignored.
+///
+/// The three modes form a complexity/accuracy ladder:
+///
+/// * [`Static`](ScucLossTreatment::Static) — single scalar
+///   `rate × total_load` per period, baked into the system-row RHS.
+///   Same value every security iteration. Cheapest; ignores the realized
+///   dispatch.
+/// * [`ScalarFeedback`](ScucLossTreatment::ScalarFeedback) — after each
+///   security iteration's repaired DC PF, compute realized total losses
+///   per period and feed that back as next iteration's RHS. Damped with
+///   asymmetric bias toward higher (under-commitment costs more than
+///   over-commitment because AC SCED can't commit new units).
+/// * [`PenaltyFactors`](ScucLossTreatment::PenaltyFactors) — full
+///   marginal-loss-factor formulation: `Σ (1 − LF_g) · pg = Σ Pd + L_0`
+///   with the linearization-point correction. LFs are computed from
+///   realized DC flows + the loss PTDF, gauge-fixed against
+///   distributed-load slack, damped, and magnitude-capped. Most accurate;
+///   captures *where* gen is preferable (a renewable at a high-loss bus
+///   contributes effective MW < raw MW, so SCUC commits more thermal
+///   nearby up-front).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ScucLossTreatment {
+    /// Static `rate × total_load` per period; never updated across
+    /// security iterations. Preserves prior behavior.
+    #[default]
+    Static,
+    /// Per-period realized total losses fed forward across security
+    /// iterations with damping + asymmetric upward bias. RHS-only —
+    /// LHS coefficients stay at face value.
+    ScalarFeedback,
+    /// Full per-bus penalty factors applied to system-row LHS
+    /// coefficients (`(1 − LF_g)` on every injection), with RHS
+    /// linearization correction. Reference gauge: distributed-load
+    /// slack.
+    PenaltyFactors,
 }
 
 /// Cold-start strategy for the SCUC loss-factor warm-start on the

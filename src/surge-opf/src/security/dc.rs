@@ -4483,6 +4483,7 @@ mod tests {
             limit_reverse_mw_schedule: vec![],
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
+            ptdf_per_bus: Vec::new(),
             limit_mw_active_period: None,
             breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
@@ -4564,6 +4565,7 @@ mod tests {
             limit_reverse_mw_schedule: vec![],
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
+            ptdf_per_bus: Vec::new(),
             limit_mw_active_period: None,
             breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });

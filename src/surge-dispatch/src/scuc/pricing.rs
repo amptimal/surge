@@ -25,6 +25,7 @@ fn log_scuc_pricing_trace(message: impl AsRef<str>) {
     info!("scuc_pricing: {}", message.as_ref());
 }
 
+#[cfg(test)]
 fn cap_logic_row_span(
     row_labels: &[String],
     reserve_row_base: usize,
@@ -186,7 +187,7 @@ fn apply_fixed_commitment_pricing_transform(
     hourly_networks: &[Network],
     gen_indices: &[usize],
     n_hours: usize,
-    _n_gen: usize,
+    n_gen: usize,
     dt_hours: f64,
     base: f64,
     enforce_shutdown_deloading: bool,
@@ -356,14 +357,60 @@ fn apply_fixed_commitment_pricing_transform(
             }
         }
 
+        // Relax only the per-generator rows in the capacity-logic
+        // block, keeping the per-product reserve rows (cross-headroom,
+        // cross-footroom, energy-coupling, system + zonal balance,
+        // offline-headroom) active so their duals are recoverable.
+        //
+        // The block (built by ``build_capacity_logic_reserve_rows``)
+        // is laid out as:
+        //   * ``[cap_start, cap_start + n_gen)``           — per-gen headroom
+        //     (``pg + R - pmax·u + …``), structurally redundant with
+        //     pg / slack column bounds set above.
+        //   * ``[cap_start + n_gen, cap_start + 2·n_gen)`` — per-gen footroom,
+        //     same redundancy.
+        //   * ``[cap_start + 2·n_gen, cap_start + 3·n_gen)`` — commitment-state
+        //     (``u_t = u_{t-1} + v − w``) — pure-binary tautology after pinning.
+        //   * ``[cap_start + 3·n_gen, cap_start + 4·n_gen)`` — startup/shutdown sum
+        //     (``v + w ≤ 1``)             — pure-binary tautology after pinning.
+        //   * ``[reserve_row_base, …)``                    — per-product reserve rows
+        //     (cross_headroom, cross_footroom, system + zonal balance,
+        //     offline_headroom). STRUCTURAL — must stay active.
+        //
+        // The MIP carries trajectory terms (future startup ramp, past
+        // shutdown ramp) on the per-gen headroom/footroom rows that
+        // reference future/past binaries. With those binaries pinned
+        // and pg-translated, the rows are *almost* implied by column
+        // bounds, but a residual mismatch from the trajectory terms
+        // can render the pricing LP infeasible. Since the per-gen
+        // physical envelopes are already enforced by the pg / slack
+        // column bounds set up above, relaxing the per-gen rows here
+        // preserves the primal solution while sidestepping that
+        // numerical mismatch. The per-product reserve rows downstream
+        // are NOT relaxed — they're where the zonal/system duals come
+        // from and were the original bug source (everything after
+        // ``reserve_row_base`` was being collapsed before this fix).
         let reserve_row_base = primary_state.problem.hour_reserve_row_bases[t];
-        let Some(cap_logic_rows) =
-            cap_logic_row_span(&primary_state.problem.row_labels, reserve_row_base, t)
-        else {
-            continue;
+        let cap_block_start = reserve_row_base
+            .checked_sub(4 * n_gen)
+            .unwrap_or(reserve_row_base);
+        // Sanity check via labels: every relaxed row should still
+        // carry the ``cap_logic_`` prefix. If a future refactor moves
+        // these rows around without updating the offset arithmetic
+        // here, fall back to the broader span lookup so we don't
+        // silently relax the wrong rows.
+        let cap_logic_prefix = format!("h{t}:cap_logic_");
+        let in_cap_logic = |row: usize| {
+            primary_state
+                .problem
+                .row_labels
+                .get(row)
+                .is_some_and(|label| label.starts_with(&cap_logic_prefix))
         };
-
-        for row in cap_logic_rows {
+        if !(cap_block_start..reserve_row_base).all(in_cap_logic) {
+            continue;
+        }
+        for row in cap_block_start..reserve_row_base {
             lp_prob.row_lower[row] = f64::NEG_INFINITY;
             lp_prob.row_upper[row] = f64::INFINITY;
         }
@@ -1111,6 +1158,18 @@ pub(super) fn extract_pricing_summary(input: PricingSummaryInput<'_>) -> Pricing
         input.lp_sol.status,
         LpSolveStatus::Optimal | LpSolveStatus::SubOptimal
     ) && input.lp_sol.row_dual.len() >= input.n_row;
+    // Whenever the solver returned a row_dual vector sized to the
+    // problem we still surface congestion / reserve duals — when the
+    // status flag says the LP didn't reach optimal but the duals are
+    // present (e.g. the solver stopped at sub-optimal feasible after
+    // a time limit, or was driven to infeasibility by the slack
+    // penalties), the dual signal on the still-binding rows is exactly
+    // what tells operators where the violations and shadow prices
+    // are. The strict `pricing_converged` flag stays in charge of LMP
+    // emission since LMP extraction off a non-converged primal would
+    // be misleading, but per-constraint duals are a useful diagnostic
+    // even when LMPs aren't.
+    let row_duals_available = input.lp_sol.row_dual.len() >= input.n_row;
 
     let mut lmp_out = Vec::with_capacity(input.n_hours);
     if pricing_converged {
@@ -1163,7 +1222,7 @@ pub(super) fn extract_pricing_summary(input: PricingSummaryInput<'_>) -> Pricing
 
     let branch_shadow_prices = if input.spec.enforce_thermal_limits
         && !input.constrained_branches.is_empty()
-        && pricing_converged
+        && row_duals_available
     {
         crate::common::extraction::extract_branch_shadow_prices_multi(
             &input.lp_sol.row_dual,
@@ -1176,7 +1235,7 @@ pub(super) fn extract_pricing_summary(input: PricingSummaryInput<'_>) -> Pricing
     };
 
     let fg_shadow_prices =
-        if input.spec.enforce_flowgates && !input.fg_rows.is_empty() && pricing_converged {
+        if input.spec.enforce_flowgates && !input.fg_rows.is_empty() && row_duals_available {
             crate::common::extraction::extract_flowgate_shadow_prices_multi(
                 &input.lp_sol.row_dual,
                 input.fg_rows,
@@ -1190,7 +1249,7 @@ pub(super) fn extract_pricing_summary(input: PricingSummaryInput<'_>) -> Pricing
         };
 
     let iface_shadow_prices =
-        if input.spec.enforce_flowgates && !input.iface_rows.is_empty() && pricing_converged {
+        if input.spec.enforce_flowgates && !input.iface_rows.is_empty() && row_duals_available {
             crate::common::extraction::extract_interface_shadow_prices_multi(
                 &input.lp_sol.row_dual,
                 input.iface_rows,

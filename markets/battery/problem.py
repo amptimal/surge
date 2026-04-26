@@ -50,6 +50,7 @@ shortfall penalty.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -63,6 +64,28 @@ from surge.market import (
     linear_curtailment,
     request as _request_builder,
 )
+
+
+def _decouple_product(p: ReserveProductDef) -> ReserveProductDef:
+    """Strip ``balance_products`` and ``shared_limit_products`` from a
+    standard ISO reserve product definition.
+
+    The ISO templates (e.g. SPINNING) declare that reg-up awards can
+    substitute for spin's zonal requirement (``balance_products =
+    ("reg_up",)``). In an ISO clearing engine that keeps the system
+    whole at minimum penalty, this is correct — a single MW of reg-up
+    is a higher-quality service that also covers spin demand. But for a
+    single-asset battery operator's price-taker view, the
+    substitution-ladder credits the same MW twice (it reduces *both*
+    reg-up and spin slack penalties), so the LP picks reg-up over spin
+    even when spin's per-product price is higher. The operator's
+    actual revenue is per-product price × award, with no
+    cross-coupling — so we strip the ladder before handing the products
+    to the LP. Cross-product physical headroom is still enforced by the
+    SCUC's cross-headroom row family (sums all Up-direction awards),
+    which doesn't depend on ``shared_limit_products``.
+    """
+    return dataclasses.replace(p, balance_products=(), shared_limit_products=())
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +141,14 @@ class SiteSpec:
     #: (charge AND discharge). Sensible default 0 for a pure LMP
     #: arbitrage study; raise to e.g. 2–5 $/MWh for wear modelling.
     bess_degradation_cost_per_mwh: float = 0.0
+
+    #: Maximum full equivalent cycles per 24-hour window. One FEC =
+    #: full charge + full discharge of the rated energy capacity.
+    #: ``None`` (the default) leaves throughput uncapped. The cap is
+    #: enforced as a linear constraint inside the time-coupled SCUC
+    #: build; period-by-period (sequential) solves cannot enforce it
+    #: because they have no inter-period coupling.
+    bess_daily_cycle_limit: float | None = None
 
     #: Optional site baseline load (MW, per period). Adds a fixed
     #: load at the POI bus — the grid still supplies / absorbs the net.
@@ -374,6 +405,7 @@ class BatteryProblem:
                 charge_bid=charge_curve,
                 discharge_foldback_soc_mwh=dis_foldback_mwh,
                 charge_foldback_soc_mwh=ch_foldback_mwh,
+                daily_cycle_limit=self.site.bess_daily_cycle_limit,
             )
         else:
             bess_params = StorageParams(
@@ -386,6 +418,7 @@ class BatteryProblem:
                 degradation_cost_per_mwh=self.site.bess_degradation_cost_per_mwh,
                 discharge_foldback_soc_mwh=dis_foldback_mwh,
                 charge_foldback_soc_mwh=ch_foldback_mwh,
+                daily_cycle_limit=self.site.bess_daily_cycle_limit,
             )
         net.add_storage(
             bus=self.bus_number,
@@ -557,7 +590,9 @@ class BatteryProblem:
         # In ``pwl_offers`` mode the BESS offers at the strategy's bid
         # price; the LP clears only when shortfall > bid.
         if self.as_products:
-            builder.reserve_products([ap.product_def for ap in self.as_products])
+            builder.reserve_products(
+                [_decouple_product(ap.product_def) for ap in self.as_products]
+            )
             requirements: list[ZonalRequirement] = []
             shortfall_by_product: dict[str, float] = {}
             for ap in self.as_products:
@@ -583,13 +618,31 @@ class BatteryProblem:
             offer_costs = self._as_offer_costs_per_period(
                 policy, period_slice, shortfall_by_product
             )
+            # Per-period offered capacity. We hard-zero the BESS's offer
+            # for any (product, period) that has no demand
+            # (``price[t] == 0``) so the LP can't park headroom in a
+            # product with no buyer. Without this guard, when a product
+            # has zero price across the horizon the offer cost
+            # collapses to zero (``shortfall − price = 0``) and the LP
+            # objective becomes degenerate — the simplex can return any
+            # award up to capacity, including non-zero awards that
+            # silently steal discharge headroom from products that
+            # *do* have positive price (e.g. spinning reserve).
+            ap_prices_window = {
+                ap.product_def.id: ap.price_forecast_per_mwh[start:stop]
+                for ap in self.as_products
+            }
             bess_reserve_offers = GeneratorReserveOfferSchedule(
                 resource_id=self.BESS_RESOURCE_ID,
                 offers_by_period=[
                     [
                         {
                             "product_id": ap.product_def.id,
-                            "capacity_mw": self._as_capacity_for(ap),
+                            "capacity_mw": (
+                                self._as_capacity_for(ap)
+                                if float(ap_prices_window[ap.product_def.id][t]) > 0.0
+                                else 0.0
+                            ),
                             "cost_per_mwh": float(offer_costs[ap.product_def.id][t]),
                         }
                         for ap in self.as_products
@@ -598,6 +651,42 @@ class BatteryProblem:
                 ],
             )
             builder.reserve_offers([bess_reserve_offers])
+
+            # SOC-headroom guard for AS awards. When the operator opts
+            # in via ``BatteryPolicy.enforce_reserve_soc_capacity``, we
+            # pass per-product impact factors that the LP turns into
+            # per-period rows of the form
+            #
+            #   Σ_p∈Up   award[p] · dt / η_dis  ≤  SOC[t] − soc_min
+            #   Σ_p∈Down award[p] · dt · η_ch  ≤  soc_max − SOC[t]
+            #
+            # so every cleared MW of an award is backed by enough
+            # energy to survive a 100 %-deployment over the period.
+            if getattr(policy, "enforce_reserve_soc_capacity", False):
+                eta_ch = float(self.site.bess_charge_efficiency)
+                eta_dis = float(self.site.bess_discharge_efficiency)
+                impacts: list[dict[str, Any]] = []
+                for ap in self.as_products:
+                    if ap.product_def.direction == "Up":
+                        # Discharging delivers ``award_mw`` to the grid
+                        # but draws ``award_mw / η_dis`` from SOC, so
+                        # the impact factor is +1/η_dis (positive).
+                        factor = 1.0 / max(eta_dis, 1e-9)
+                    else:
+                        # Charging absorbs ``award_mw`` from the grid
+                        # and adds ``award_mw · η_ch`` to SOC, so the
+                        # impact factor is −η_ch (negative — consumes
+                        # SOC headroom rather than SOC).
+                        factor = -eta_ch
+                    impacts.append(
+                        {
+                            "resource_id": self.BESS_RESOURCE_ID,
+                            "product_id": ap.product_def.id,
+                            "values_mwh_per_mw": [factor] * n,
+                        }
+                    )
+                if impacts:
+                    builder.storage_reserve_soc_impacts(impacts)
 
     def _as_offer_costs_per_period(
         self,

@@ -133,7 +133,10 @@ ENV PATH="/opt/surge-venv/bin:${PATH}"
 RUN pip install --no-cache-dir --upgrade pip
 
 # Install the wheel + dashboard extras (fastapi, uvicorn, sse-starlette,
-# networkx, httpx) in one resolve so pip shares the dep solve.
+# networkx, scipy, httpx) in one resolve so pip shares the dep solve.
+# scipy is required by NetworkX ≥3.x for the layout algorithms the RTO
+# dashboard's grid tab uses (kamada_kawai_layout + spring_layout both
+# call into scipy.sparse for the all-pairs distance / FR matrices).
 COPY --from=wheel-builder /build/wheels/*.whl /tmp/
 RUN pip install --no-cache-dir \
       /tmp/surge_py-*.whl \
@@ -141,7 +144,9 @@ RUN pip install --no-cache-dir \
       'uvicorn[standard]>=0.30' \
       'sse-starlette>=2.0' \
       'networkx>=3.0' \
+      'scipy>=1.11' \
       'httpx>=0.27' \
+      'zstandard>=0.22' \
     && rm /tmp/*.whl
 
 # Dashboard code + market specs + benchmark harness live alongside the

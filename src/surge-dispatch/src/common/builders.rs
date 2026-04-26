@@ -225,11 +225,161 @@ pub(crate) fn build_thermal_rows(
 // Flowgate rows
 // ---------------------------------------------------------------------------
 
+/// Per-resource context required to emit a flowgate row in PTDF form
+/// (`Σ_i ptdf_eff_i · p_net_inj_i ≤ limit`) when
+/// `Flowgate::ptdf_per_bus` is populated. Pass `None` to keep the
+/// theta-form code path; callers running in
+/// `scuc_disable_bus_power_balance` mode pass `Some(&ctx)` so the
+/// PTDF-form path is taken for security cuts whose theta-form would
+/// otherwise be vestigial.
+///
+/// The ctx caches two things that turn `apply_ptdf_form_flowgate_row`
+/// from O(rows × all_columns) into O(rows × cut_nnz × cols_per_bus):
+///
+/// * `bus_pd_pu` — per-bus active load (pu). Same value for every row
+///   in this period; computing it inside the row loop allocates an
+///   `n_bus`-element vector and walks every load on each call.
+/// * `bus_to_cols` — `bus_idx → [(absolute_col, signed_scale)]`. Each
+///   entry encodes "this column's coefficient on the bus's net
+///   injection is `signed_scale`". A row's triplet for `(bus, col)` is
+///   then just `ptdf_coeff × signed_scale`. This lets the row loop
+///   iterate the cut's sparse `ptdf_per_bus` directly instead of
+///   scanning every generator / load / storage / HVDC band / vbid and
+///   probing a hashmap.
+pub(crate) struct FlowgatePtdfFormCtx<'a> {
+    pub network: &'a Network,
+    pub bus_map: &'a HashMap<u32, usize>,
+    pub pbusinj: &'a [f64],
+    pub hvdc_loss_a_bus: &'a [f64],
+    pub base: f64,
+    /// Slack column offsets are relative to this absolute LP-column
+    /// base; precomputed here so the row-build loop doesn't need to
+    /// see the raw layout.
+    pub col_base: usize,
+    /// Per-bus active load in pu (Σ load.P − Σ injection.P, /base).
+    pub bus_pd_pu: Vec<f64>,
+    /// Reverse index: bus_idx → list of (absolute LP column, signed
+    /// per-unit scale). The triplet for a flowgate row at this bus
+    /// becomes `Triplet { row, col, val: ptdf_coeff × signed_scale }`.
+    pub bus_to_cols: Vec<Vec<(usize, f64)>>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_flowgate_ptdf_form_ctx<'a>(
+    network: &'a Network,
+    setup: &'a DispatchSetup,
+    gen_indices: &'a [usize],
+    gen_bus_idx: &'a [usize],
+    spec: &'a DispatchProblemSpec<'a>,
+    bus_map: &'a HashMap<u32, usize>,
+    pbusinj: &'a [f64],
+    hvdc_loss_a_bus: &'a [f64],
+    hvdc_from_idx: &'a [Option<usize>],
+    hvdc_to_idx: &'a [Option<usize>],
+    hvdc_band_offsets: &'a [usize],
+    dl_list: &'a [&'a surge_network::market::DispatchableLoad],
+    active_vbids: &'a [usize],
+    col_base: usize,
+    pg_off: usize,
+    sto_ch_off: usize,
+    sto_dis_off: usize,
+    hvdc_off: usize,
+    dl_off: usize,
+    vbid_off: usize,
+    storage_in_pu: bool,
+    base: f64,
+) -> FlowgatePtdfFormCtx<'a> {
+    let n_bus = network.buses.len();
+
+    let bus_pd_mw = network.bus_load_p_mw_with_map(bus_map);
+    let bus_pd_pu: Vec<f64> = bus_pd_mw.iter().map(|x| x / base).collect();
+
+    let mut bus_to_cols: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n_bus];
+
+    // Generators (skip storage; their dispatch is via dis/ch columns).
+    for (j, &bus_idx) in gen_bus_idx.iter().enumerate() {
+        if network.generators[gen_indices[j]].is_storage() {
+            continue;
+        }
+        bus_to_cols[bus_idx].push((col_base + pg_off + j, 1.0));
+    }
+
+    // Storage discharge (+inj) / charge (−inj). SCED stores in pu;
+    // SCUC stores in MW (caller picks via `storage_in_pu`).
+    let sto_scale = if storage_in_pu { 1.0 } else { 1.0 / base };
+    for &(s, _, gi) in &setup.storage_gen_local {
+        let g = &network.generators[gi];
+        if let Some(&bus_idx) = bus_map.get(&g.bus) {
+            bus_to_cols[bus_idx].push((col_base + sto_dis_off + s, sto_scale));
+            bus_to_cols[bus_idx].push((col_base + sto_ch_off + s, -sto_scale));
+        }
+    }
+
+    // HVDC bands: positive band = power flows from→to, so withdrawal at
+    // from-bus (sign -1) and injection at to-bus minus losses
+    // (sign +(1 − loss_b_frac)).
+    for (k, hvdc) in spec.hvdc_links.iter().enumerate() {
+        if hvdc.is_banded() {
+            for (b, band) in hvdc.bands.iter().enumerate() {
+                let col = col_base + hvdc_off + hvdc_band_offsets[k] + b;
+                if let Some(fi) = hvdc_from_idx[k] {
+                    bus_to_cols[fi].push((col, -1.0));
+                }
+                if let Some(ti) = hvdc_to_idx[k] {
+                    bus_to_cols[ti].push((col, 1.0 - band.loss_b_frac));
+                }
+            }
+        } else {
+            let col = col_base + hvdc_off + hvdc_band_offsets[k];
+            if let Some(fi) = hvdc_from_idx[k] {
+                bus_to_cols[fi].push((col, -1.0));
+            }
+            if let Some(ti) = hvdc_to_idx[k] {
+                bus_to_cols[ti].push((col, 1.0 - hvdc.loss_b_frac));
+            }
+        }
+    }
+
+    // Dispatchable load: served amount is a withdrawal (-1 on injection).
+    for (k, dl) in dl_list.iter().enumerate() {
+        if let Some(&bus_idx) = bus_map.get(&dl.bus) {
+            bus_to_cols[bus_idx].push((col_base + dl_off + k, -1.0));
+        }
+    }
+
+    // Virtual bids: Inc = injection (+1), Dec = withdrawal (-1).
+    for (k, &bi) in active_vbids.iter().enumerate() {
+        let vb = &spec.virtual_bids[bi];
+        if let Some(&bus_idx) = bus_map.get(&vb.bus) {
+            let sign = match vb.direction {
+                surge_network::market::VirtualBidDirection::Inc => 1.0,
+                surge_network::market::VirtualBidDirection::Dec => -1.0,
+            };
+            bus_to_cols[bus_idx].push((col_base + vbid_off + k, sign));
+        }
+    }
+
+    FlowgatePtdfFormCtx {
+        network,
+        bus_map,
+        pbusinj,
+        hvdc_loss_a_bus,
+        base,
+        col_base,
+        bus_pd_pu,
+        bus_to_cols,
+    }
+}
+
 /// Build flowgate constraint rows.
 ///
 /// `n_rows = fg_rows.len()`.  Local row `ri` corresponds to `fg_rows[ri]`.
 ///
 /// `hour` selects the per-hour limit (pass `0` for SCED).
+///
+/// `ptdf_ctx` enables the PTDF-form code path described on
+/// [`FlowgatePtdfFormCtx`]. When `None`, all flowgate rows fall back
+/// to the theta form regardless of any `Flowgate::ptdf_per_bus` data.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_flowgate_rows(
     network: &Network,
@@ -245,6 +395,7 @@ pub(crate) fn build_flowgate_rows(
     slack_layout: Option<SoftLimitSlackLayout>,
     base: f64,
     hour: usize,
+    ptdf_ctx: Option<&FlowgatePtdfFormCtx<'_>>,
 ) -> LpBlock {
     let n = fg_rows.len();
     let mut block = LpBlock {
@@ -274,10 +425,29 @@ pub(crate) fn build_flowgate_rows(
         // slack with nonnegative domain" convention; objective-side
         // coefficients on those unused slacks never multiply a nonzero
         // primal, so the objective and dual are unchanged.
+        //
+        // This gate sits above the PTDF-form dispatch on purpose: PTDF
+        // rows are emitted at full bus density, so a single-period cut
+        // unfiltered would inflate the COO matrix by T× (e.g. T=18 on
+        // 617-bus D1) of fully-populated rows.
         if let Some(active) = fg.limit_mw_active_period {
             if hour != active as usize {
                 block.row_lower[ri] = -sentinel_pu;
                 block.row_upper[ri] = sentinel_pu;
+                continue;
+            }
+        }
+
+        // PTDF-form path: when the flowgate carries a non-empty
+        // `ptdf_per_bus` (populated by the SCUC security loop for
+        // cuts emitted in `scuc_disable_bus_power_balance` mode), the
+        // constraint is on dispatch variables directly via
+        // `Σ_i ptdf_eff_i × p_net_inj_i ≤ limit`. The theta-form
+        // fallback below is only correct when per-bus KCL ties theta
+        // to pg, which is exactly the case `ptdf_per_bus` is empty for.
+        if !fg.ptdf_per_bus.is_empty() {
+            if let Some(ctx) = ptdf_ctx {
+                apply_ptdf_form_flowgate_row(ctx, fg, ri, row, slack_layout, &mut block, hour);
                 continue;
             }
         }
@@ -345,6 +515,98 @@ pub(crate) fn build_flowgate_rows(
     }
 
     block
+}
+
+/// Emit a single flowgate row in PTDF/pg form. Used by
+/// [`build_flowgate_rows`] when `Flowgate::ptdf_per_bus` is non-empty
+/// and a [`FlowgatePtdfFormCtx`] was provided.
+///
+/// The constraint mirrors the theta form's economics but expressed as
+/// a direct linear combination of dispatch variables:
+///
+///   `Σ_i ptdf_eff_i · (pg_i + sto_dis_i − sto_ch_i + Σ_link hvdc_inj_link_i
+///                        − dl_i + Σ_vb vbid_inj_i)
+///     + slack_lo − slack_hi
+///     ∈ [-rev_limit, fwd_limit] − Σ_i ptdf_eff_i · fixed_terms_i`
+///
+/// where `fixed_terms_i = -(Pd_i + Gs_i)/base − pbusinj_i − hvdc_loss_a_i`
+/// is the bus's fixed-load contribution to net injection (moved to the
+/// row's RHS bounds). The signs match
+/// [`build_power_balance_rows`]: a positive coefficient there means
+/// withdrawal (subtract from net injection); a negative means injection
+/// (add to net injection). The `ptdf_eff_i × variable` triplet here
+/// uses the **injection-side** sign convention.
+fn apply_ptdf_form_flowgate_row(
+    ctx: &FlowgatePtdfFormCtx<'_>,
+    fg: &surge_network::network::Flowgate,
+    ri: usize,
+    row: usize,
+    slack_layout: Option<SoftLimitSlackLayout>,
+    block: &mut LpBlock,
+    hour: usize,
+) {
+    // Drive the row from the cut's sparse `ptdf_per_bus` list. For
+    // each (bus, ptdf_coeff) pair, look up the columns that inject at
+    // that bus from the precomputed reverse index on the ctx — that
+    // turns the row build into O(cut_nnz × cols_per_bus) instead of
+    // O(all_columns × hashmap-probe). Bus-number → bus-index lookups
+    // that miss this hour's `bus_map` (e.g. a bus that went out of
+    // service) are silently dropped, matching the prior behavior.
+    let mut rhs_offset = 0.0_f64;
+    let mut any_term = false;
+
+    for &(bus_num, ptdf_coeff) in &fg.ptdf_per_bus {
+        let Some(&bus_idx) = ctx.bus_map.get(&bus_num) else {
+            continue;
+        };
+        any_term = true;
+
+        for &(col, scale) in &ctx.bus_to_cols[bus_idx] {
+            block.triplets.push(Triplet {
+                row,
+                col,
+                val: ptdf_coeff * scale,
+            });
+        }
+
+        // RHS: fixed contribution to net injection is
+        //   -pd - gs - pbusinj - hvdc_loss_a
+        // f_l += ptdf × fixed_inj; move to RHS by negating.
+        let pd_pu = ctx.bus_pd_pu[bus_idx];
+        let gs_pu = ctx.network.buses[bus_idx].shunt_conductance_mw / ctx.base;
+        rhs_offset -=
+            ptdf_coeff * (-pd_pu - gs_pu - ctx.pbusinj[bus_idx] - ctx.hvdc_loss_a_bus[bus_idx]);
+    }
+
+    if !any_term {
+        // Bus mapping unusable on this hour: leave the row free so the
+        // LP is still solvable. Downstream telemetry warns if a cut
+        // ends up like this.
+        block.row_lower[ri] = -INACTIVE_FLOWGATE_LIMIT_MW / ctx.base;
+        block.row_upper[ri] = INACTIVE_FLOWGATE_LIMIT_MW / ctx.base;
+        return;
+    }
+
+    // Slack columns: +slack_lo on row, -slack_hi on row so a positive
+    // slack absorbs an upward (toward upper-bound) violation and a
+    // positive lo-slack absorbs downward (toward lower-bound).
+    if let Some(slack) = slack_layout {
+        block.triplets.push(Triplet {
+            row,
+            col: ctx.col_base + slack.lower_off + ri,
+            val: 1.0,
+        });
+        block.triplets.push(Triplet {
+            row,
+            col: ctx.col_base + slack.upper_off + ri,
+            val: -1.0,
+        });
+    }
+
+    let fg_limit_pu = fg.effective_limit_mw(hour) / ctx.base;
+    let fg_rev_pu = fg.effective_reverse_or_forward(hour) / ctx.base;
+    block.row_upper[ri] = fg_limit_pu + rhs_offset;
+    block.row_lower[ri] = -fg_rev_pu + rhs_offset;
 }
 
 /// Initialize flowgate nomogram metadata used by tightening loops.
@@ -733,6 +995,44 @@ pub(crate) fn build_power_balance_rows(
 /// Row bound RHS is `- Σ_b (Pd_b + Gs_b + pbusinj_b + hvdc_loss_a_b)`
 /// — the sum of the per-bus RHS values.
 #[allow(clippy::too_many_arguments)]
+/// System-row penalty-factor application: per-bus marginal-loss factors
+/// scale every negative-coefficient (injection) term in the system
+/// balance row by `(1 - LF[bus])`. Mirrors the per-bus
+/// `apply_bus_loss_factors` convention: only injections are scaled,
+/// withdrawals stay at face value, and `(1 - LF)` is clamped to
+/// `[0.5, 1.10]` to keep coefficients well-conditioned.
+pub(crate) struct SystemRowLossModel<'a> {
+    /// Per-bus marginal-loss factor `dloss/dp` in distributed-load slack
+    /// gauge. Length must equal `network.n_buses()`. Caller is
+    /// responsible for any damping or magnitude capping; this builder
+    /// only applies the `[0.5, 1.10]` coefficient clamp.
+    pub lf_per_bus: &'a [f64],
+}
+
+/// Minimum `|LF|` magnitude that gets baked into a system-row coefficient.
+/// Mirrors `losses::DLOSS_MIN`. Below this we treat LF as zero to avoid
+/// micro-perturbations to the warm basis without meaningfully changing
+/// the optimum.
+const SYS_ROW_LF_MIN: f64 = 1e-4;
+
+/// Clamp the effective `(1 - LF)` coefficient to this range when applying
+/// penalty factors on the system row. Mirrors `losses::apply_bus_loss_factors`.
+const SYS_ROW_LF_FACTOR_CLAMP: (f64, f64) = (0.5, 1.10);
+
+/// Compute the effective `(1 - LF[bus_idx])` factor for a system-row
+/// injection coefficient, with the same magnitude cutoff and clamp the
+/// per-bus path uses.
+#[inline]
+fn sys_row_inj_factor(lf_per_bus: &[f64], bus_idx: usize) -> f64 {
+    let lf = lf_per_bus.get(bus_idx).copied().unwrap_or(0.0);
+    if lf.abs() < SYS_ROW_LF_MIN {
+        1.0
+    } else {
+        (1.0 - lf).clamp(SYS_ROW_LF_FACTOR_CLAMP.0, SYS_ROW_LF_FACTOR_CLAMP.1)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_system_power_balance_row(
     network: &Network,
     setup: &DispatchSetup,
@@ -764,6 +1064,13 @@ pub(crate) fn build_system_power_balance_row(
     // Zero keeps the row lossless (equivalent to the `mult=0`
     // copperplate LP).
     expected_loss_pu: f64,
+    // Optional per-bus marginal-loss factors. When `Some`, every
+    // negative-coefficient (injection-side) triplet is scaled by
+    // `(1 - LF[bus_idx])`, with the same `[0.5, 1.10]` clamp the
+    // per-bus path uses. Withdrawals (DL, storage charge, HVDC from-bus,
+    // DEC vbid) stay at face value, mirroring `apply_bus_loss_factors`.
+    // None preserves prior static-row behavior exactly.
+    lf_model: Option<&SystemRowLossModel<'_>>,
 ) -> LpBlock {
     let n_bus = network.n_buses();
     let n_storage = setup.n_storage;
@@ -784,25 +1091,45 @@ pub(crate) fn build_system_power_balance_row(
     };
 
     // Non-storage generators: `-pg_k` on the system row (injection).
-    for (j, &_bus_idx) in gen_bus_idx.iter().enumerate() {
+    // With `lf_model` set, scale by `(1 - LF[bus_g])` to credit
+    // location-aware effective delivery — same convention as
+    // `apply_bus_loss_factors` on the per-bus path.
+    for (j, &bus_idx) in gen_bus_idx.iter().enumerate() {
         if network.generators[gen_indices[j]].is_storage() {
             continue;
         }
+        let raw = -1.0_f64;
+        let val = match lf_model {
+            Some(m) => raw * sys_row_inj_factor(m.lf_per_bus, bus_idx),
+            None => raw,
+        };
         block.triplets.push(Triplet {
             row,
             col: col_base + pg_off + j,
-            val: -1.0,
+            val,
         });
     }
 
     if n_storage > 0 {
         let sto_scale = if storage_in_pu { 1.0 } else { 1.0 / base };
-        for &(s, _, _gi) in &setup.storage_gen_local {
+        // For each storage unit, look up its bus via the local-gen index
+        // (`j`) — `setup.gen_bus_idx[j]` is the bus index in `bus_map`,
+        // matching how the per-bus path resolves storage bus locations.
+        for &(s, j, _gi) in &setup.storage_gen_local {
+            let bus_idx = setup.gen_bus_idx[j];
+            // Discharge: injection (negative coef) — apply (1-LF).
+            let raw_dis = -sto_scale;
+            let val_dis = match lf_model {
+                Some(m) => raw_dis * sys_row_inj_factor(m.lf_per_bus, bus_idx),
+                None => raw_dis,
+            };
             block.triplets.push(Triplet {
                 row,
                 col: col_base + sto_dis_off + s,
-                val: -sto_scale,
+                val: val_dis,
             });
+            // Charge: withdrawal (positive coef) — face value, no LF
+            // scaling, mirroring per-bus path.
             block.triplets.push(Triplet {
                 row,
                 col: col_base + sto_ch_off + s,
@@ -820,14 +1147,17 @@ pub(crate) fn build_system_power_balance_row(
                 for (b, band) in hvdc.bands.iter().enumerate() {
                     let col = col_base + hvdc_off + hvdc_band_offsets[k] + b;
                     if hvdc_from_idx[k].is_some() {
+                        // From-bus: withdrawal (+1), face value.
                         block.triplets.push(Triplet { row, col, val: 1.0 });
                     }
-                    if hvdc_to_idx[k].is_some() {
-                        block.triplets.push(Triplet {
-                            row,
-                            col,
-                            val: -(1.0 - band.loss_b_frac),
-                        });
+                    if let Some(to_bus_idx) = hvdc_to_idx[k] {
+                        // To-bus: injection of (1-loss_b_frac), apply LF.
+                        let raw = -(1.0 - band.loss_b_frac);
+                        let val = match lf_model {
+                            Some(m) => raw * sys_row_inj_factor(m.lf_per_bus, to_bus_idx),
+                            None => raw,
+                        };
+                        block.triplets.push(Triplet { row, col, val });
                     }
                 }
             } else {
@@ -835,18 +1165,19 @@ pub(crate) fn build_system_power_balance_row(
                 if hvdc_from_idx[k].is_some() {
                     block.triplets.push(Triplet { row, col, val: 1.0 });
                 }
-                if hvdc_to_idx[k].is_some() {
-                    block.triplets.push(Triplet {
-                        row,
-                        col,
-                        val: -(1.0 - hvdc.loss_b_frac),
-                    });
+                if let Some(to_bus_idx) = hvdc_to_idx[k] {
+                    let raw = -(1.0 - hvdc.loss_b_frac);
+                    let val = match lf_model {
+                        Some(m) => raw * sys_row_inj_factor(m.lf_per_bus, to_bus_idx),
+                        None => raw,
+                    };
+                    block.triplets.push(Triplet { row, col, val });
                 }
             }
         }
     }
 
-    // DL served MW is a withdrawal, so +1 on the system row.
+    // DL served MW is a withdrawal, so +1 on the system row (face value).
     for (k, dl) in dl_list.iter().enumerate() {
         if bus_map.contains_key(&dl.bus) {
             block.triplets.push(Triplet {
@@ -859,15 +1190,25 @@ pub(crate) fn build_system_power_balance_row(
 
     for (k, &bi) in active_vbids.iter().enumerate() {
         let vb = &spec.virtual_bids[bi];
-        if bus_map.contains_key(&vb.bus) {
-            let coeff = match vb.direction {
+        if let Some(&vb_bus_idx) = bus_map.get(&vb.bus) {
+            let raw = match vb.direction {
                 surge_network::market::VirtualBidDirection::Inc => -1.0,
                 surge_network::market::VirtualBidDirection::Dec => 1.0,
+            };
+            // INC behaves like an injection (-1 raw); apply LF. DEC is a
+            // withdrawal (+1), face value.
+            let val = if raw < 0.0 {
+                match lf_model {
+                    Some(m) => raw * sys_row_inj_factor(m.lf_per_bus, vb_bus_idx),
+                    None => raw,
+                }
+            } else {
+                raw
             };
             block.triplets.push(Triplet {
                 row,
                 col: col_base + vbid_off + k,
-                val: coeff,
+                val,
             });
         }
     }
@@ -982,6 +1323,39 @@ pub(crate) fn build_dc_network_rows(input: DcNetworkRowsInput<'_>) -> LpBlock {
         ),
     );
 
+    // Build the PTDF-form context only when the SCUC LP runs without
+    // per-bus KCL — that's the only case where security cuts populate
+    // `Flowgate::ptdf_per_bus` and need a non-theta enforcement path.
+    // The constructor precomputes per-bus load and a bus→column reverse
+    // index so the per-row triplet emission is O(cut_nnz).
+    let ptdf_ctx_owned = if input.skip_bus_balance {
+        Some(build_flowgate_ptdf_form_ctx(
+            input.dispatch_network,
+            input.setup,
+            input.gen_indices,
+            input.gen_bus_idx,
+            input.spec,
+            input.bus_map,
+            input.pbusinj,
+            input.hvdc_loss_a_bus,
+            input.hvdc_from_idx,
+            input.hvdc_to_idx,
+            input.hvdc_band_offsets,
+            input.dl_list,
+            input.active_vbids,
+            input.col_base,
+            input.pg_off,
+            input.sto_ch_off,
+            input.sto_dis_off,
+            input.hvdc_off,
+            input.dl_off,
+            input.vbid_off,
+            input.storage_in_pu,
+            input.base,
+        ))
+    } else {
+        None
+    };
     append_block(
         &mut block,
         build_flowgate_rows(
@@ -998,6 +1372,7 @@ pub(crate) fn build_dc_network_rows(input: DcNetworkRowsInput<'_>) -> LpBlock {
             input.flowgate_slack,
             input.base,
             input.hour,
+            ptdf_ctx_owned.as_ref(),
         ),
     );
 

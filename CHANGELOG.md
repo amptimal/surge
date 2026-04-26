@@ -6,6 +6,73 @@ this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows Semantic Versioning intent.
 
+## [0.1.7] — 2026-04-26
+
+`surge-dispatch` polish release: end-to-end shadow prices, Q-LMPs,
+faster N-1 screening, and SCUC correctness fixes. New in-process
+Rust→Python tracing broadcast on `surge-py`. GO C3 defaults updated.
+
+### Added (`surge-dispatch`)
+
+- Per-branch and per-contingency shadow prices flow from AC SCED
+  through to `BranchThermal` constraint results; security-loop
+  flowgates retain their `N1_t{period}_…` names. SCUC pricing
+  extraction emits per-constraint duals whenever the dual vector is
+  full-length, while LMPs still gate on optimal pricing-LP status.
+- Per-bus Q-LMP on AC SCED dispatch results.
+- Per-iteration security SCUC timings in `run-report.json`.
+- Optional per-iteration scalar loss-feedback pass in SCUC.
+
+### Added (`surge-py`)
+
+- In-process Rust→Python tracing broadcast (replaces fd-tee, which
+  deadlocked under load); typed `.pyi` stubs.
+
+### Fixed
+
+- `surge-dispatch`: PTDF-form security cuts now bind dispatch when
+  `scuc_disable_bus_power_balance=true` (previously absorbed by free
+  per-bus slacks).
+- `surge-dispatch`: AC SCED no-storage path now threads `dt_hours`
+  (was hard-coded to 1 h, miscosting sub-hourly markets).
+- `surge-dispatch`: SCUC PF system-row RHS sign — drop the loss
+  double-count that hung AC SCED on loss-feedback runs.
+- `surge-dispatch`: sparse-aware reserve extraction preserves
+  storage SoC coupling across the SCUC/SCED handoff.
+- `surge-dispatch`: zonal / system reserve duals preserved through
+  the pricing LP so AS clearing prices match.
+- `surge-opf`: AC-OPF Ipopt `constr_viol_tol` bound to `tol` so
+  unscaled bus balance tracks the requested tolerance.
+
+### Performance (`surge-dispatch`)
+
+- ~45–65× faster N-1 security screening: per-period parallelism via
+  `rayon` and flat per-branch state in `HourlySecurityContext`
+  remove the inner-loop `HashMap` rebuild on 6049-bus and larger.
+- 16× sparser PTDF security cuts on the
+  `scuc_disable_bus_power_balance` path: active-period gating moved
+  above PTDF row construction, `bus_load_p_mw_with_map` hoisted out
+  of the per-row loop, per-row `HashMap` allocation eliminated.
+  617-bus D1 SCUC: 118 M NZ / 20.9 s → ~7 M / sub-second.
+
+### Changed
+
+- GO C3 exporter: consumer reserve shedding
+  (`ExportOptions::allow_consumer_reserve_shedding`, default on)
+  caps per-consumer up/down reserve awards to the available room
+  after `ac_dispatch` curtailment, fixing spurious validator
+  `viol_cs_t_p_on_*` flags on physically valid solutions.
+- GO C3 defaults: `scuc_loss_treatment="scalar_feedback"` (was
+  static), `scuc_security_preseed_count_per_period=0` (was 1000).
+
+### Build
+
+- Dashboard Docker image installs `zstandard` for compressed
+  network blob round-trips.
+
+Dashboards (`dashboards/rto`, `dashboards/battery`) saw substantial
+work this cycle but are not part of the published release surface.
+
 ## [0.1.6] — 2026-04-24
 
 `surge-dispatch` release: SCUC LP tightening, large-network

@@ -49,6 +49,22 @@ pub(super) struct ScucProblemBuildInput<'a> {
     pub network: &'a Network,
     pub solve: &'a DcSolveSession<'a>,
     pub problem_plan: &'a ScucProblemPlan<'a>,
+    /// Optional system-row loss override from the security loop. Read
+    /// only when `spec.scuc_disable_bus_power_balance = true` and
+    /// `spec.scuc_loss_treatment != Static`. Carries:
+    ///
+    /// * `dloss_dp[t][bus]` — per-bus penalty factor in distributed-load
+    ///   slack gauge for period `t`. Consumed by `PenaltyFactors` mode
+    ///   to scale system-row injection coefficients by `(1 − LF[bus])`.
+    /// * `total_losses_mw[t]` — realized total system loss in MW for
+    ///   period `t`. Overrides the static `rate × total_load`
+    ///   estimate; consumed by both `ScalarFeedback` and
+    ///   `PenaltyFactors`.
+    ///
+    /// `None` preserves prior static-row behavior exactly. The caller
+    /// (security loop) is responsible for damping, magnitude capping,
+    /// and gauge fixing before threading the override through here.
+    pub sys_row_loss_override: Option<&'a crate::scuc::losses::LossFactorWarmStart>,
 }
 
 pub(super) struct ScucProblemBuildState {
@@ -1605,6 +1621,10 @@ fn count_rows(input: &ScucProblemBuildInput<'_>) -> (usize, usize, usize, usize,
         } else {
             super::rows::pumped_hydro_transition_rows(&row_metadata.ph_mode_units, n_hours)
         }
+        + super::rows::storage_daily_cycle_rows(
+            setup,
+            super::rows::day_buckets(spec, n_hours).len(),
+        )
         + if skip_dr_rows {
             0
         } else {
@@ -1764,6 +1784,8 @@ pub(super) fn build_problem(input: ScucProblemBuildInput<'_>) -> ScucProblemBuil
     } else {
         super::rows::pumped_hydro_transition_rows(&row_metadata.ph_mode_units, n_hours)
     };
+    let n_storage_daily_cycle_rows =
+        super::rows::storage_daily_cycle_rows(setup, super::rows::day_buckets(spec, n_hours).len());
     let n_cc_rows = if skip_cc_rows {
         0
     } else {
@@ -2114,15 +2136,25 @@ pub(super) fn build_problem(input: ScucProblemBuildInput<'_>) -> ScucProblemBuil
             // expectation is still preserved: we subtract an
             // aggregate `expected_loss_pu` from the row RHS so the
             // equality reads `Σ pg = Σ load + Σ expected_loss` in
-            // aggregate. Rate comes from the existing loss warm-
-            // start mode:
-            //   * Uniform { rate }     → rate
-            //   * LoadPattern { rate } → rate
-            //   * DcPf                 → 0.02 (default uniform rate)
-            //   * Disabled             → 0
+            // aggregate.
+            //
+            // Three sources for `expected_loss_pu`, picked by
+            // `spec.scuc_loss_treatment`:
+            //
+            // 1. `Static` (default) — `rate × total_load` from the
+            //    `loss_factor_warm_start_mode` rate. Same value every
+            //    security iteration.
+            // 2. `ScalarFeedback` — realized total losses from prior
+            //    security iter's repaired DC PF, threaded through
+            //    `sys_row_loss_override.total_losses_mw[hour]`. RHS
+            //    only; LHS coefficients stay at face value.
+            // 3. `PenaltyFactors` — same realized total on RHS, plus
+            //    per-bus `(1 − LF[bus])` on every injection coefficient
+            //    via the `lf_model` parameter to the row builder.
+            //
             // Gated on `spec.use_loss_factors` so SCUC runs with
             // `use_loss_factors = false` stay lossless by construction.
-            let expected_loss_pu = if spec.use_loss_factors {
+            let static_expected_loss_pu = if spec.use_loss_factors {
                 let rate = match spec.loss_factor_warm_start_mode {
                     crate::request::network::LossFactorWarmStartMode::Uniform { rate } => rate,
                     crate::request::network::LossFactorWarmStartMode::LoadPattern { rate } => rate,
@@ -2138,6 +2170,62 @@ pub(super) fn build_problem(input: ScucProblemBuildInput<'_>) -> ScucProblemBuil
             } else {
                 0.0
             };
+            let override_active = spec.use_loss_factors
+                && !matches!(
+                    spec.scuc_loss_treatment,
+                    crate::request::network::ScucLossTreatment::Static,
+                )
+                && input
+                    .sys_row_loss_override
+                    .map(|w| w.is_populated())
+                    .unwrap_or(false);
+            // RHS sign convention is mode-dependent:
+            //
+            // * `ScalarFeedback`: same convention as `Static` — add the
+            //   realized total loss to the RHS so `Σ pg = Σ Pd + L_0`.
+            //   LHS coefficients stay at face value, so this is a pure
+            //   RHS swap from `rate × load` to realized.
+            //
+            // * `PenaltyFactors`: the LHS already gets `(1 − LF)` on
+            //   every gen, which (under the distributed-load slack
+            //   gauge property `Σ LF · pg^0 ≈ 2 · L_0`) effectively
+            //   discounts gen by `2 · L_0`. The proper linearization
+            //   correction at the prior iter's dispatch is
+            //   `RHS_shift = L_0 − Σ LF · pg^0 ≈ L_0 − 2 · L_0 = −L_0`.
+            //   So the loss term moves to the RHS with a *minus* sign,
+            //   not a plus. Without this flip the system over-commits
+            //   by about `2 · L_0` (≈ 4 % of load on a 2 % loss rate),
+            //   and AC SCED hangs trying to dispatch the surplus down.
+            let pf_active = override_active
+                && matches!(
+                    spec.scuc_loss_treatment,
+                    crate::request::network::ScucLossTreatment::PenaltyFactors,
+                );
+            let expected_loss_pu = if override_active {
+                let w = input.sys_row_loss_override.expect("override_active");
+                let realized_pu = w.total_losses_mw.get(hour).copied().unwrap_or(0.0) / base;
+                if pf_active {
+                    -realized_pu
+                } else {
+                    realized_pu
+                }
+            } else {
+                static_expected_loss_pu
+            };
+            // PenaltyFactors mode: bind the per-bus LF slice for this
+            // period and pass it to the row builder. ScalarFeedback and
+            // Static modes pass `None` — RHS-only updates.
+            let lf_slice_storage: Option<&[f64]> = if pf_active {
+                input
+                    .sys_row_loss_override
+                    .and_then(|w| w.dloss_dp.get(hour))
+                    .map(|v| v.as_slice())
+            } else {
+                None
+            };
+            let lf_model = lf_slice_storage.map(|lf_per_bus| builders::SystemRowLossModel {
+                lf_per_bus,
+            });
             let sys_row = current_row + n_flow;
             let sys_block = builders::build_system_power_balance_row(
                 net_t,
@@ -2165,6 +2253,7 @@ pub(super) fn build_problem(input: ScucProblemBuildInput<'_>) -> ScucProblemBuil
                 false,
                 base,
                 expected_loss_pu,
+                lf_model.as_ref(),
             );
             triplets.extend(sys_block.triplets);
             row_lower[sys_row] = sys_block.row_lower[0];
@@ -2677,6 +2766,30 @@ pub(super) fn build_problem(input: ScucProblemBuildInput<'_>) -> ScucProblemBuil
         }
     }
     current_row += n_pumped_hydro_transition_rows;
+
+    if n_storage_daily_cycle_rows > 0 {
+        super::rows::build_storage_daily_cycle_rows(super::rows::ScucStorageDailyCycleRowsInput {
+            network: input.network,
+            spec,
+            setup,
+            layout,
+            n_hours,
+            row_base: current_row,
+        })
+        .write_into_preallocated(
+            &mut triplets,
+            &mut row_lower,
+            &mut row_upper,
+            current_row,
+        );
+        for (i, label) in row_labels[current_row..current_row + n_storage_daily_cycle_rows]
+            .iter_mut()
+            .enumerate()
+        {
+            *label = format!("storage_daily_cycle_{i}");
+        }
+    }
+    current_row += n_storage_daily_cycle_rows;
 
     if !skip_cc_rows {
         super::rows::build_cc_rows(ScucCcRowsInput {

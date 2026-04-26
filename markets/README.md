@@ -16,7 +16,6 @@ live — not the dashboards.
 
 | Market | What it does | Topology | Clearing |
 |---|---|---|---|
-| [`markets/rto/`](rto/README.md) | ISO day-ahead energy + AS clearing with LMPs | Any `surge.Network` (e.g. `surge.case118`) | SCUC MIP + repricing LP |
 | [`markets/battery/`](battery/README.md) | Single-site price-taker BESS optimisation | 1-bus network built in-memory | Single-stage time-coupled LP |
 | [`markets/go_c3/`](go_c3/README.md) | GO Competition Challenge 3 | GO C3 JSON → Rust adapter | SCUC MIP → AC SCED NLP |
 
@@ -220,7 +219,6 @@ implementation (`_market_payload` + `build_network`).
 ## Public API a caller sees
 
 ```python
-from markets.rto       import RtoPolicy,      RtoProblem,      solve
 from markets.battery   import BatteryPolicy,  BatteryProblem,  solve
 from markets.go_c3     import GoC3Policy,     GoC3Problem,     solve
 ```

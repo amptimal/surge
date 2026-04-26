@@ -620,6 +620,17 @@ pub struct RawDispatchSolution {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_diagnostics: Vec<crate::model_diagnostic::ModelDiagnostic>,
 
+    /// Augmented flowgate name list — set by the security loop when
+    /// the inner SCUC network has more flowgates than the caller's
+    /// `network` (because security cuts get added per iteration).
+    /// Indexed by the inner network's flowgate position so that
+    /// `aux_flowgate_names[idx]` aligns with
+    /// `period.flowgate_shadow_prices[idx]`. Empty when the security
+    /// loop did not augment the network (so caller can use
+    /// `network.flowgates[idx].name` directly).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aux_flowgate_names: Vec<String>,
+
     /// Final loss-factor state from the SCUC refinement iteration —
     /// `dloss_dp[t][bus]` and `total_losses_mw[t]`. Internal plumbing
     /// used by the security loop to warm-start the next iteration's
@@ -694,6 +705,7 @@ impl RawDispatchSolution {
             cc_transition_cost: 0.0,
             cc_transition_costs: Vec::new(),
             model_diagnostics: Vec::new(),
+            aux_flowgate_names: Vec::new(),
             bus_loss_allocation_mw: Vec::new(),
             scuc_final_loss_warm_start: None,
         }
@@ -1433,12 +1445,20 @@ fn attach_keyed_period_views(
             )
         })
         .collect();
-    let flowgate_constraint_ids: Vec<String> = network
-        .flowgates
-        .iter()
-        .filter(|fg| fg.in_service && fg.contingency_branch.is_none())
-        .map(|fg| fg.name.clone())
-        .collect();
+    // ``period.flowgate_shadow_prices`` and ``period.flowgate_*_slack``
+    // are sized to the inner LP network's flowgate list. When the
+    // security loop augmented the caller's network with N-1 cuts,
+    // those cuts won't appear in the outer ``network.flowgates`` —
+    // the loop attaches the augmented name list as
+    // ``result.aux_flowgate_names`` so the constraint IDs stay
+    // meaningful (``N1_t{period}_{ctg_from}_{ctg_to}_{mon_from}_{mon_to}``
+    // or ``HVDC_N1_t...``). Falls back to the unfiltered caller-network
+    // names for non-security paths.
+    let flowgate_constraint_ids: Vec<String> = if !result.aux_flowgate_names.is_empty() {
+        result.aux_flowgate_names.clone()
+    } else {
+        network.flowgates.iter().map(|fg| fg.name.clone()).collect()
+    };
 
     for (t, period) in result.periods.iter_mut().enumerate() {
         let period_spec = problem_spec.period(t);
@@ -1718,6 +1738,7 @@ fn attach_keyed_period_views(
                 mec: period.lmp_energy.get(bus_index).copied().unwrap_or(0.0),
                 mcc: period.lmp_congestion.get(bus_index).copied().unwrap_or(0.0),
                 mlc: period.lmp_loss.get(bus_index).copied().unwrap_or(0.0),
+                q_lmp: period.q_lmp.get(bus_index).copied(),
                 angle_rad: result
                     .bus_angles_rad
                     .get(t)
@@ -2008,8 +2029,23 @@ fn attach_keyed_period_views(
                     .map(|rate| reserve.shortfall_mw * rate * dt_h),
             });
         }
+        // Only emit shadow-price entries for constraints whose dual
+        // is materially non-zero. On large security-constrained SCUC
+        // runs the augmented network can carry tens of thousands of
+        // contingency cuts; emitting an entry per (cut × period)
+        // produces hundreds of thousands of rows in
+        // ``constraint_results`` and dominates Rust→Python
+        // serialization wall time. The dual is the ONLY information
+        // these entries carry — when it's effectively zero the row
+        // is noise. Slack-positive entries (from ``scuc/extract.rs``
+        // and ``sced/extract.rs``) follow the same pattern: emit
+        // only when there's something to report.
+        const SHADOW_PRICE_TOL: f64 = 1e-6;
         let _akpv_branch_t0 = std::time::Instant::now();
         for (idx, price) in period.branch_shadow_prices.iter().copied().enumerate() {
+            if price.abs() <= SHADOW_PRICE_TOL {
+                continue;
+            }
             let constraint_id = branch_constraint_ids
                 .get(idx)
                 .cloned()
@@ -2026,6 +2062,9 @@ fn attach_keyed_period_views(
 
         let _akpv_flowgate_t0 = std::time::Instant::now();
         for (idx, price) in period.flowgate_shadow_prices.iter().copied().enumerate() {
+            if price.abs() <= SHADOW_PRICE_TOL {
+                continue;
+            }
             let constraint_id = flowgate_constraint_ids
                 .get(idx)
                 .cloned()
@@ -2040,6 +2079,9 @@ fn attach_keyed_period_views(
         }
         akpv_flowgate_secs += _akpv_flowgate_t0.elapsed().as_secs_f64();
         for (idx, price) in period.interface_shadow_prices.iter().copied().enumerate() {
+            if price.abs() <= SHADOW_PRICE_TOL {
+                continue;
+            }
             let constraint_id = network
                 .interfaces
                 .get(idx)
@@ -2765,6 +2807,7 @@ fn emit_public_keyed_solution(
         cc_transition_cost: _,
         cc_transition_costs: _,
         model_diagnostics,
+        aux_flowgate_names: _,
         bus_q_slack_pos_mvar: _,
         bus_q_slack_neg_mvar: _,
         bus_p_slack_pos_mw: _,
@@ -2858,6 +2901,7 @@ fn emit_public_keyed_solution(
                     mec: bus.mec,
                     mcc: bus.mcc,
                     mlc: bus.mlc,
+                    q_lmp: bus.q_lmp,
                     angle_rad: bus.angle_rad,
                     voltage_pu: bus.voltage_pu,
                     net_injection_mw: bus.net_injection_mw,
@@ -3325,10 +3369,12 @@ fn ac_sced_period_to_dispatch_result(
     let period = RawDispatchPeriodResult {
         pg_mw: sol.pg_mw,
         lmp: sol.lmp,
+        q_lmp: sol.q_lmp,
         lmp_energy,
         lmp_congestion,
         lmp_loss,
         total_cost: sol.total_cost,
+        branch_shadow_prices: sol.branch_shadow_prices,
         flowgate_shadow_prices: sol.flowgate_shadow_prices,
         interface_shadow_prices: sol.interface_shadow_prices,
         dr_results: sol.dr_results,
@@ -5295,10 +5341,12 @@ fn record_ac_sced_period_into_accumulator(
         RawDispatchPeriodResult {
             pg_mw: sol.pg_mw,
             lmp: sol.lmp,
+            q_lmp: sol.q_lmp,
             lmp_energy,
             lmp_congestion,
             lmp_loss,
             total_cost: sol.total_cost,
+            branch_shadow_prices: sol.branch_shadow_prices,
             flowgate_shadow_prices: sol.flowgate_shadow_prices,
             interface_shadow_prices: sol.interface_shadow_prices,
             dr_results: sol.dr_results,
@@ -6414,6 +6462,7 @@ mod tests {
                 max_iterations: input.max_loss_factor_iters,
                 tolerance: input.loss_factor_tol,
                 warm_start_mode: Default::default(),
+                scuc_loss_treatment: Default::default(),
             },
             forbidden_zones: crate::request::ForbiddenZonePolicy {
                 enabled: input.enforce_forbidden_zones,
@@ -6684,6 +6733,7 @@ mod tests {
                 pg_mw: vec![10.0],
                 qg_mvar: vec![2.0],
                 lmp: vec![30.0],
+                q_lmp: Vec::new(),
                 bus_voltage_pu: vec![1.0],
                 bus_angle_rad: vec![0.0],
                 storage_soc_mwh: Vec::new(),
@@ -6707,6 +6757,7 @@ mod tests {
                 zone_q_reserve_down_shortfall_mvar: Vec::new(),
                 total_cost: 100.0,
                 objective_terms: Vec::new(),
+                branch_shadow_prices: Vec::new(),
                 flowgate_shadow_prices: Vec::new(),
                 interface_shadow_prices: Vec::new(),
                 bus_q_slack_pos_mvar: Vec::new(),
@@ -6742,6 +6793,7 @@ mod tests {
                 pg_mw: vec![10.0, 0.0],
                 qg_mvar: vec![2.0, 0.0],
                 lmp: vec![30.0],
+                q_lmp: Vec::new(),
                 bus_voltage_pu: vec![1.0],
                 bus_angle_rad: vec![0.0],
                 storage_soc_mwh: Vec::new(),
@@ -6760,6 +6812,7 @@ mod tests {
                 zone_q_reserve_down_shortfall_mvar: Vec::new(),
                 total_cost: 100.0,
                 objective_terms: Vec::new(),
+                branch_shadow_prices: Vec::new(),
                 flowgate_shadow_prices: Vec::new(),
                 interface_shadow_prices: Vec::new(),
                 bus_q_slack_pos_mvar: Vec::new(),
@@ -6974,6 +7027,7 @@ mod tests {
                 chemistry: None,
                 discharge_foldback_soc_mwh: None,
                 charge_foldback_soc_mwh: None,
+                daily_cycle_limit: None,
             }),
             ..Generator::default()
         });
@@ -8149,6 +8203,7 @@ mod tests {
             limit_reverse_mw_schedule: Vec::new(),
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
+            ptdf_per_bus: Vec::new(),
             limit_mw_active_period: None,
             breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
@@ -8165,6 +8220,7 @@ mod tests {
             limit_reverse_mw_schedule: Vec::new(),
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
+            ptdf_per_bus: Vec::new(),
             limit_mw_active_period: None,
             breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
@@ -8360,6 +8416,7 @@ mod tests {
                 chemistry: None,
                 discharge_foldback_soc_mwh: None,
                 charge_foldback_soc_mwh: None,
+                daily_cycle_limit: None,
             }),
             ..Generator::default()
         };
@@ -9208,6 +9265,7 @@ mod tests {
                 chemistry: None,
                 discharge_foldback_soc_mwh: None,
                 charge_foldback_soc_mwh: None,
+                daily_cycle_limit: None,
             }),
             ..Generator::default()
         });
@@ -10422,6 +10480,7 @@ mod tests {
             chemistry: None,
             discharge_foldback_soc_mwh: None,
             charge_foldback_soc_mwh: None,
+            daily_cycle_limit: None,
         });
         net.generators.push(storage);
 

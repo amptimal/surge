@@ -1480,6 +1480,7 @@ fn test_scuc_storage_soc_trajectory() {
             chemistry: None,
             discharge_foldback_soc_mwh: None,
             charge_foldback_soc_mwh: None,
+            daily_cycle_limit: None,
         }),
         ..Generator::default()
     };
@@ -1579,6 +1580,153 @@ fn test_scuc_storage_soc_trajectory() {
     println!(
         "DISP-04 BESS test: SoC trajectory = [{:.1}, {:.1}, {:.1}, {:.1}] MWh",
         soc_traj[0], soc_traj[1], soc_traj[2], soc_traj[3]
+    );
+}
+
+/// `StorageParams::daily_cycle_limit` caps total per-day throughput in
+/// the time-coupled SCUC build. We construct a 24-period horizon with
+/// alternating low/high load that an unconstrained battery would
+/// micro-cycle through ~6 times, then re-solve with limit=1 and confirm
+/// the LP holds total throughput at or below `1 × 2 × E_mwh`.
+#[test]
+fn test_scuc_storage_daily_cycle_limit_caps_throughput() {
+    use surge_network::Network;
+    use surge_network::market::{CostCurve, LoadProfile, LoadProfiles};
+    use surge_network::network::{
+        Bus, BusType, CommitmentStatus, Generator, Load, StorageDispatchMode, StorageParams,
+    };
+
+    fn build_net() -> Network {
+        let mut net = Network::new("test_storage_daily_cycle");
+        net.base_mva = 100.0;
+        net.buses.push(Bus::new(1, BusType::Slack, 138.0));
+        net.loads.push(Load::new(1, 0.0, 0.0)); // overridden by load profile
+
+        // Cheap baseload: 100 MW @ $10/MWh, must-run.
+        let mut g_cheap = Generator::new(1, 0.0, 1.0);
+        g_cheap.pmin = 0.0;
+        g_cheap.pmax = 100.0;
+        g_cheap.in_service = true;
+        g_cheap.commitment.get_or_insert_default().status = CommitmentStatus::MustRun;
+        g_cheap.cost = Some(CostCurve::Polynomial {
+            startup: 0.0,
+            shutdown: 0.0,
+            coeffs: vec![10.0, 0.0],
+        });
+        net.generators.push(g_cheap);
+
+        // Peaker: 200 MW @ $200/MWh, must-run.
+        let mut g_peak = Generator::new(1, 0.0, 1.0);
+        g_peak.pmin = 0.0;
+        g_peak.pmax = 200.0;
+        g_peak.in_service = true;
+        g_peak.commitment.get_or_insert_default().status = CommitmentStatus::MustRun;
+        g_peak.cost = Some(CostCurve::Polynomial {
+            startup: 0.0,
+            shutdown: 0.0,
+            coeffs: vec![200.0, 0.0],
+        });
+        net.generators.push(g_peak);
+
+        // Battery: 50 MW / 100 MWh, perfect efficiency.
+        let bess = Generator {
+            bus: 1,
+            in_service: true,
+            pmin: -50.0,
+            pmax: 50.0,
+            machine_base_mva: 100.0,
+            cost: Some(CostCurve::Polynomial {
+                coeffs: vec![0.0],
+                startup: 0.0,
+                shutdown: 0.0,
+            }),
+            storage: Some(StorageParams {
+                charge_efficiency: 1.0,
+                discharge_efficiency: 1.0,
+                energy_capacity_mwh: 100.0,
+                soc_initial_mwh: 50.0,
+                soc_min_mwh: 0.0,
+                soc_max_mwh: 100.0,
+                variable_cost_per_mwh: 0.0,
+                degradation_cost_per_mwh: 0.0,
+                dispatch_mode: StorageDispatchMode::CostMinimization,
+                self_schedule_mw: 0.0,
+                discharge_offer: None,
+                charge_bid: None,
+                max_c_rate_charge: None,
+                max_c_rate_discharge: None,
+                chemistry: None,
+                discharge_foldback_soc_mwh: None,
+                charge_foldback_soc_mwh: None,
+                daily_cycle_limit: None,
+            }),
+            ..Generator::default()
+        };
+        net.generators.push(bess);
+        net
+    }
+
+    // 24 periods of alternating low/high load. With cheap-gen pmax=100,
+    // each high period needs 50 MW from battery or peaker; the battery
+    // wants to displace the peaker (saves $190/MWh).
+    let load_profile: Vec<f64> = (0..24)
+        .map(|t| if t % 2 == 0 { 50.0 } else { 150.0 })
+        .collect();
+
+    fn opts(load_profile: &[f64]) -> DispatchOptions {
+        DispatchOptions {
+            n_periods: 24,
+            dt_hours: 1.0,
+            enforce_thermal_limits: false,
+            load_profiles: LoadProfiles {
+                profiles: vec![LoadProfile {
+                    bus: 1,
+                    load_mw: load_profile.to_vec(),
+                }],
+                n_timesteps: 24,
+            },
+            horizon: Horizon::TimeCoupled,
+            commitment: CommitmentMode::AllCommitted,
+            ..DispatchOptions::default()
+        }
+    }
+
+    fn total_throughput(sol: &RawDispatchSolution) -> f64 {
+        sol.periods
+            .iter()
+            .map(|p| p.storage_charge_mw[0] + p.storage_discharge_mw[0])
+            .sum()
+    }
+
+    let net_unlim = build_net();
+    let sol_unlim = solve_scuc(&net_unlim, &opts(&load_profile)).unwrap();
+    let throughput_unlim = total_throughput(&sol_unlim);
+    assert!(
+        throughput_unlim > 600.0,
+        "without cap the LP should cycle far past 1 FEC; got {throughput_unlim:.1} MWh"
+    );
+
+    let mut net_capped = build_net();
+    net_capped.generators[2]
+        .storage
+        .as_mut()
+        .unwrap()
+        .daily_cycle_limit = Some(1.0);
+    let sol_capped = solve_scuc(&net_capped, &opts(&load_profile)).unwrap();
+    let throughput_capped = total_throughput(&sol_capped);
+    let cap_mwh = 1.0 * 2.0 * 100.0; // limit * 2 * energy_capacity_mwh
+    assert!(
+        throughput_capped <= cap_mwh + 1e-3,
+        "daily cycle cap should hold throughput ≤ {cap_mwh:.1}; got {throughput_capped:.4}"
+    );
+    // Cap must actually bind — otherwise the test isn't proving anything.
+    assert!(
+        throughput_capped > cap_mwh - 0.5,
+        "expected the cap to bind near {cap_mwh:.1} MWh; got {throughput_capped:.4}"
+    );
+    println!(
+        "daily-cycle: unlim throughput={:.1} MWh, capped throughput={:.4} MWh (cap={:.1})",
+        throughput_unlim, throughput_capped, cap_mwh
     );
 }
 
@@ -1939,6 +2087,7 @@ fn test_scuc_storage_soc_dt_hours_half() {
             chemistry: None,
             discharge_foldback_soc_mwh: None,
             charge_foldback_soc_mwh: None,
+            daily_cycle_limit: None,
         }),
         ..Generator::default()
     };
@@ -3016,6 +3165,87 @@ mod zonal_reserve_scuc_tests {
             assert!(
                 sol.periods[t].zonal_reserve_prices.contains_key("1:spin"),
                 "hour {t}: zone 1 should have a zonal spinning reserve price"
+            );
+        }
+    }
+
+    /// When the zonal reserve requirement exceeds the available
+    /// physical headroom AND ``shortfall_cost_per_unit`` is set on the
+    /// requirement, the LP must clear the slack at the supplied
+    /// scarcity rate. The dual on the binding zonal balance row equals
+    /// that rate (or close to it, modulo HiGHS sign convention) — so
+    /// the published ``zonal_reserve_prices`` entry must be non-zero.
+    ///
+    /// Repros the bug surfaced by the RTO dashboard: with positive
+    /// shortfall_mw on goc3_73's reg_up requirement and shortfall_cost
+    /// = $1000/MWh, the LP returned ``zonal_reserve_prices == 0`` for
+    /// every period.
+    #[test]
+    fn test_scuc_zonal_reserve_price_positive_under_shortfall() {
+        let mut net = two_area_network();
+        for g in &mut net.generators {
+            let phys_cap = (g.pmax - g.pmin).max(0.0);
+            if phys_cap > 0.0 {
+                g.market.get_or_insert_default().reserve_offers.push(
+                    surge_network::market::ReserveOffer {
+                        product_id: "spin".into(),
+                        capacity_mw: phys_cap,
+                        cost_per_mwh: 0.0,
+                    },
+                );
+            }
+        }
+
+        // Request 250 MW of zonal spin in zone 1. G1 (zone 1) maxes
+        // at 200 MW headroom, so 50 MW MUST short. Shortfall cost set
+        // to $1000/MWh — the slack column carries that rate, and the
+        // LP's dual on the binding zonal row should equal it.
+        let shortfall_cost = 1_000.0;
+        let opts = DispatchOptions {
+            n_periods: 2,
+            zonal_reserve_requirements: vec![ZonalReserveRequirement {
+                zone_id: 1,
+                product_id: "spin".into(),
+                requirement_mw: 250.0,
+                per_period_mw: None,
+                shortfall_cost_per_unit: Some(shortfall_cost),
+                served_dispatchable_load_coefficient: None,
+                largest_generator_dispatch_coefficient: None,
+                participant_bus_numbers: None,
+            }],
+            generator_area: vec![0, 1],
+            load_area: vec![0, 1],
+            enforce_thermal_limits: false,
+            horizon: Horizon::TimeCoupled,
+            commitment: CommitmentMode::Optimize(IndexedCommitmentOptions::default()),
+            ..DispatchOptions::default()
+        };
+        let sol = solve_scuc(&net, &opts).unwrap();
+
+        for t in 0..2 {
+            let key = "1:spin";
+            let price = sol.periods[t]
+                .zonal_reserve_prices
+                .get(key)
+                .copied()
+                .unwrap_or(0.0);
+            let shortfall_mw = sol.periods[t]
+                .zonal_reserve_shortfall
+                .get(key)
+                .copied()
+                .unwrap_or(0.0);
+            // Sanity: shortfall should be ~50 MW (250 req − 200 headroom).
+            assert!(
+                shortfall_mw > 49.0,
+                "hour {t}: expected ~50 MW shortfall, got {shortfall_mw:.2}"
+            );
+            // Pre-fix: the LP returned 0 even though slack was positive
+            // and slack_cost > 0 — the cap-logic relaxation in the
+            // pricing transform was collapsing the zonal balance row.
+            assert!(
+                price.abs() > 0.5,
+                "hour {t}: zonal price should be near ${shortfall_cost} \
+                 ($/MWh) under shortfall, got ${price:.4}"
             );
         }
     }
@@ -4589,6 +4819,7 @@ mod flowgate_scuc_tests {
             limit_reverse_mw_schedule: Vec::new(),
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
+            ptdf_per_bus: Vec::new(),
             limit_mw_active_period: None,
             breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
@@ -4632,6 +4863,7 @@ mod flowgate_scuc_tests {
             limit_reverse_mw_schedule: Vec::new(),
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
+            ptdf_per_bus: Vec::new(),
             limit_mw_active_period: None,
             breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
@@ -4707,6 +4939,7 @@ mod flowgate_scuc_tests {
             limit_reverse_mw_schedule: Vec::new(),
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
+            ptdf_per_bus: Vec::new(),
             limit_mw_active_period: None,
             breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
@@ -4722,6 +4955,7 @@ mod flowgate_scuc_tests {
             limit_reverse_mw_schedule: Vec::new(),
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
+            ptdf_per_bus: Vec::new(),
             limit_mw_active_period: None,
             breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
@@ -4948,6 +5182,7 @@ mod flowgate_scuc_tests {
             limit_reverse_mw_schedule: vec![],
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
+            ptdf_per_bus: Vec::new(),
             limit_mw_active_period: None,
             breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
@@ -5043,6 +5278,7 @@ mod flowgate_scuc_tests {
             limit_reverse_mw_schedule: vec![],
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
+            ptdf_per_bus: Vec::new(),
             limit_mw_active_period: None,
             breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
@@ -5393,6 +5629,7 @@ mod derate_tests {
                 chemistry: None,
                 discharge_foldback_soc_mwh: None,
                 charge_foldback_soc_mwh: None,
+                daily_cycle_limit: None,
             }),
             ..Generator::default()
         };
@@ -5474,6 +5711,7 @@ mod derate_tests {
                 chemistry: None,
                 discharge_foldback_soc_mwh: None,
                 charge_foldback_soc_mwh: None,
+                daily_cycle_limit: None,
             }),
             ..Generator::default()
         };
@@ -5565,6 +5803,7 @@ mod derate_tests {
                 chemistry: None,
                 discharge_foldback_soc_mwh: None,
                 charge_foldback_soc_mwh: None,
+                daily_cycle_limit: None,
             }),
             ..Generator::default()
         };
@@ -6445,6 +6684,7 @@ mod reserve_price_bug_tests {
                 chemistry: None,
                 discharge_foldback_soc_mwh: None,
                 charge_foldback_soc_mwh: None,
+                daily_cycle_limit: None,
             }),
             ..Generator::default()
         };
@@ -8737,6 +8977,7 @@ mod tests_pumped_hydro {
                 chemistry: None,
                 discharge_foldback_soc_mwh: None,
                 charge_foldback_soc_mwh: None,
+                daily_cycle_limit: None,
             }),
             ..Generator::default()
         };
@@ -8935,6 +9176,7 @@ mod tests_pumped_hydro {
                 chemistry: None,
                 discharge_foldback_soc_mwh: None,
                 charge_foldback_soc_mwh: None,
+                daily_cycle_limit: None,
             }),
             ..Generator::default()
         };
@@ -9991,6 +10233,7 @@ fn test_scuc_soc_reserve_coupling_limits_award() {
             chemistry: None,
             discharge_foldback_soc_mwh: None,
             charge_foldback_soc_mwh: None,
+            daily_cycle_limit: None,
         }),
         ..Generator::default()
     };
@@ -10164,6 +10407,7 @@ fn test_scuc_soc_reserve_coupling_limits_down_award_with_signed_impact() {
             chemistry: None,
             discharge_foldback_soc_mwh: None,
             charge_foldback_soc_mwh: None,
+            daily_cycle_limit: None,
         }),
         ..Generator::default()
     });
@@ -10287,6 +10531,7 @@ fn test_scuc_per_period_storage_self_schedule() {
             chemistry: None,
             discharge_foldback_soc_mwh: None,
             charge_foldback_soc_mwh: None,
+            daily_cycle_limit: None,
         }),
         ..Generator::default()
     };

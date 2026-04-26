@@ -26,7 +26,7 @@ your market's topology, forecasts, and offer schedule. The template
 smoke test (``tests/test_template_smoke.py``) exercises this
 skeleton end-to-end to catch contract drift.
 
-See :class:`markets.rto.problem.RtoProblem` for a rich-input example
+See :class:`markets.go_c3.problem.GoC3Problem` for a rich-input example
 and :class:`markets.battery.problem.BatteryProblem` for an in-memory
 network builder.
 """

@@ -133,7 +133,8 @@ pub use result::{
     DispatchableLoadPeriodDetail, EmissionsPeriodResult, FrequencyPeriodResult,
     GeneratorPeriodDetail, HvdcBandPeriodResult, HvdcPeriodResult, PenaltySummary,
     ReservePeriodResult, ReserveScope, ResourceHorizonResult, ResourcePeriodDetail,
-    ResourcePeriodResult, SecurityDispatchMetadata, StoragePeriodDetail,
+    ResourcePeriodResult, SecurityDispatchMetadata, SecurityIterationReport, SecuritySetupTimings,
+    StoragePeriodDetail,
 };
 pub use surge_solution::{
     ObjectiveBucket, ObjectiveLedgerMismatch, ObjectiveLedgerScopeKind, ObjectiveQuantityUnit,

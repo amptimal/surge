@@ -27,7 +27,10 @@ mod reserves;
 mod workflow;
 mod zones;
 
-pub use export::{export_go_c3_solution, export_go_c3_solution_with_reserve_source};
+pub use export::{
+    ExportOptions, export_go_c3_solution, export_go_c3_solution_with_options,
+    export_go_c3_solution_with_reserve_source,
+};
 pub use presets::{
     apply_goc3_policy_to_ac_opf, apply_reactive_support_pin_to_request, goc3_ac_opf_options,
     goc3_bandable_criteria, goc3_classification, goc3_consumer_q_to_p_ratios,

@@ -40,7 +40,7 @@ use surge_dispatch::{
 use surge_io::go_c3::types::{GoC3Bus, GoC3DeviceType};
 use surge_io::go_c3::{
     BranchRef as GoC3BranchRef, GoC3CommitmentMode, GoC3ConsumerMode, GoC3Context, GoC3Device,
-    GoC3DeviceTimeSeries, GoC3Formulation, GoC3Policy, GoC3Problem,
+    GoC3DeviceTimeSeries, GoC3Formulation, GoC3Policy, GoC3Problem, GoC3ScucLossTreatment,
 };
 use surge_network::market::OfferSchedule;
 use surge_opf::AcOpfOptions;
@@ -459,6 +459,19 @@ pub fn build_dispatch_request(
             _ => surge_dispatch::request::network::LossFactorWarmStartMode::Disabled,
         },
         None => surge_dispatch::request::network::LossFactorWarmStartMode::Disabled,
+    };
+    // SCUC system-row loss treatment selector. Maps the io-layer
+    // `GoC3ScucLossTreatment` enum 1:1 onto the surge-dispatch enum.
+    network.loss_factors.scuc_loss_treatment = match policy.scuc_loss_treatment {
+        GoC3ScucLossTreatment::Static => {
+            surge_dispatch::request::network::ScucLossTreatment::Static
+        }
+        GoC3ScucLossTreatment::ScalarFeedback => {
+            surge_dispatch::request::network::ScucLossTreatment::ScalarFeedback
+        }
+        GoC3ScucLossTreatment::PenaltyFactors => {
+            surge_dispatch::request::network::ScucLossTreatment::PenaltyFactors
+        }
     };
 
     // ── Commitment ───────────────────────────────────────────────────────

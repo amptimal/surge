@@ -87,6 +87,14 @@ pub(crate) fn solve_scuc_with_owned_network(
         network: &network,
         solve: &solve_session,
         problem_plan: &problem_plan,
+        // Same `LossFactorWarmStart` doubles as the security-loop's
+        // system-row loss override when the policy sets a non-Static
+        // `scuc_loss_treatment`. Borrowing here lets `build_problem`
+        // bake the realized losses (and, in PenaltyFactors mode, the
+        // per-bus LFs) into the system-balance row before the MIP runs.
+        // The Option is later `take()`n into `solve_problem` so the
+        // per-bus path can still consume the same warm-start.
+        sys_row_loss_override: initial_loss_warm_start.as_ref(),
     });
     timings.build_problem_secs = t.elapsed().as_secs_f64();
 

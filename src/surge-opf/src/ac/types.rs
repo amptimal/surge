@@ -539,6 +539,25 @@ pub struct AcOpfOptions {
     /// was already implemented and produces superior convergence for the vast
     /// majority of practical OPF problems.
     pub exact_hessian: bool,
+    /// Ipopt `nlp_scaling_method` setting (exact-Hessian path only).
+    ///
+    /// Default: `"gradient-based"` — Ipopt scales each constraint row by the
+    /// inverse of its max gradient magnitude. Helps convergence on poorly
+    /// conditioned problems but means the `tolerance` (primal-feasibility
+    /// `tol`) applies to **scaled** constraints. On networks with stiff
+    /// branches (very low-impedance ties, parallel lines with large `b_sr`),
+    /// the row-scaling factor at incident buses can be ~100×, which inflates
+    /// the unscaled bus-balance residual to ~`tol × max_gradient` — visible
+    /// as small but non-zero P/Q balance violations to any external pi-model
+    /// reconstruction (e.g. the GO C3 validator).
+    ///
+    /// Set to `"none"` to disable scaling and have `tol` apply directly to
+    /// unscaled residuals. Slower convergence on ill-conditioned problems
+    /// but exact balance against external recomputations.
+    ///
+    /// Other Ipopt-supported values: `"user-scaling"` (caller provides per-
+    /// constraint scale via `ipopt_user_scaling`).
+    pub nlp_scaling_method: String,
     /// Co-optimize switched shunt susceptance banks as continuous NLP variables.
     ///
     /// When `true`, each entry in `network.controls.switched_shunts_opf` is relaxed to a
@@ -701,6 +720,7 @@ impl Default for AcOpfOptions {
             min_rate_a: 1.0,
             enforce_angle_limits: false,
             exact_hessian: true,
+            nlp_scaling_method: "gradient-based".to_string(),
             optimize_switched_shunts: false,
             optimize_taps: false,
             optimize_phase_shifters: false,

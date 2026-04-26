@@ -104,6 +104,16 @@ pub struct StorageParams {
     /// energy capacity below ``soc_max_mwh``.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub charge_foldback_soc_mwh: Option<f64>,
+    /// Maximum full equivalent cycles per 24-hour window. One FEC =
+    /// one full charge + one full discharge, i.e. throughput of
+    /// `2 × energy_capacity_mwh`. The dispatch enforces it as a
+    /// linear cap on `Σ_t (charge_mw[t] + discharge_mw[t]) · dt`
+    /// inside each 24-hour bucket of the horizon (partial days are
+    /// pro-rated). Only the time-coupled SCUC build honours this —
+    /// in period-by-period SCED there is no inter-period coupling
+    /// to enforce against. ``None`` disables the cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_cycle_limit: Option<f64>,
 }
 
 /// Wire representation of [`StorageParams`] that accepts either the new
@@ -146,6 +156,8 @@ struct StorageParamsWire {
     discharge_foldback_soc_mwh: Option<f64>,
     #[serde(default)]
     charge_foldback_soc_mwh: Option<f64>,
+    #[serde(default)]
+    daily_cycle_limit: Option<f64>,
 }
 
 impl From<StorageParamsWire> for StorageParams {
@@ -179,6 +191,7 @@ impl From<StorageParamsWire> for StorageParams {
             chemistry: w.chemistry,
             discharge_foldback_soc_mwh: w.discharge_foldback_soc_mwh,
             charge_foldback_soc_mwh: w.charge_foldback_soc_mwh,
+            daily_cycle_limit: w.daily_cycle_limit,
         }
     }
 }
@@ -218,6 +231,8 @@ pub enum StorageValidationError {
         soc_min: f64,
         soc_max: f64,
     },
+    #[error("daily_cycle_limit must be > 0, got {0}")]
+    InvalidDailyCycleLimit(f64),
 }
 
 impl StorageParams {
@@ -246,6 +261,7 @@ impl StorageParams {
             chemistry: None,
             discharge_foldback_soc_mwh: None,
             charge_foldback_soc_mwh: None,
+            daily_cycle_limit: None,
         }
     }
 
@@ -313,6 +329,11 @@ impl StorageParams {
                     soc_min: self.soc_min_mwh,
                     soc_max: self.soc_max_mwh,
                 });
+            }
+        }
+        if let Some(limit) = self.daily_cycle_limit {
+            if !limit.is_finite() || limit <= 0.0 {
+                return Err(StorageValidationError::InvalidDailyCycleLimit(limit));
             }
         }
         Ok(())

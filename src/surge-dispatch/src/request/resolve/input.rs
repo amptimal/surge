@@ -97,6 +97,7 @@ pub(crate) fn build_input(
         max_loss_factor_iters: request.network.loss_factors.max_iterations,
         loss_factor_tol: request.network.loss_factors.tolerance,
         loss_factor_warm_start_mode: request.network.loss_factors.warm_start_mode,
+        scuc_loss_treatment: request.network.loss_factors.scuc_loss_treatment,
         enforce_forbidden_zones: request.network.forbidden_zones.enabled,
         foz_max_transit_periods: request.network.forbidden_zones.max_transit_periods,
         enforce_shutdown_deloading: request.network.commitment_transitions.shutdown_deloading,

@@ -573,6 +573,10 @@ pub(crate) struct DispatchInput {
     /// loss factors. See
     /// [`crate::request::network::LossFactorWarmStartMode`].
     pub loss_factor_warm_start_mode: crate::request::network::LossFactorWarmStartMode,
+    /// How losses are represented inside SCUC across security iterations
+    /// when running in `scuc_disable_bus_power_balance` mode. See
+    /// [`crate::request::network::ScucLossTreatment`].
+    pub scuc_loss_treatment: crate::request::network::ScucLossTreatment,
     pub enforce_forbidden_zones: bool,
     pub foz_max_transit_periods: Option<usize>,
     pub enforce_shutdown_deloading: bool,
@@ -686,6 +690,7 @@ impl Default for DispatchInput {
             max_loss_factor_iters: 3,
             loss_factor_tol: 1e-3,
             loss_factor_warm_start_mode: crate::request::network::LossFactorWarmStartMode::Disabled,
+            scuc_loss_treatment: crate::request::network::ScucLossTreatment::Static,
             enforce_forbidden_zones: false,
             foz_max_transit_periods: None,
             enforce_shutdown_deloading: false,

@@ -8,7 +8,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="static/dashboard.css">
+<link rel="stylesheet" href="static/dashboard.css?v=20260426f">
 </head>
 <body>
 
@@ -170,7 +170,16 @@
         <div class="config-section">
           <div class="section-label">Policy</div>
           <div class="field-stack">
-            <label class="field-row"><span class="field-label">Commitment</span>
+            <label class="field-row" title="Workflow shape: SCUC alone, SCUC then per-period DC SCED with commitment fixed, or SCUC then AC OPF reconcile (go_c3-style).">
+              <span class="field-label">Solve mode</span>
+              <select id="sel-solve-mode">
+                <option value="scuc">DC SCUC</option>
+                <option value="scuc_sced">DC SCED on SCUC</option>
+                <option value="scuc_ac_sced">AC SCED on SCUC</option>
+              </select>
+            </label>
+            <label class="field-row" title="Commitment source for the SCUC kick-off stage. Optimize solves the MIP; All committed assumes every in-service unit is online (skips the binary problem entirely).">
+              <span class="field-label">Commitment</span>
               <select id="sel-commitment">
                 <option value="optimize">Optimize (MIP)</option>
                 <option value="all_committed">All committed</option>
@@ -192,14 +201,104 @@
             </label>
           </div>
           <details class="policy-advanced">
-            <summary>Advanced penalties</summary>
+            <summary>Advanced</summary>
             <div class="field-stack">
+              <label class="field-row" title="NLP backend used by the AC SCED reconcile pass. Only consulted when the Solve mode is AC SCED on SCUC.">
+                <span class="field-label">NLP solver</span>
+                <select id="sel-nlp-solver">
+                  <option value="ipopt">Ipopt</option>
+                  <option value="copt">COPT</option>
+                </select>
+              </label>
               <label class="field-row"><span class="field-label">VOLL <em>$/MWh</em></span><input type="number" id="inp-voll-penalty" min="0" step="100"></label>
               <label class="field-row"><span class="field-label">Thermal overload <em>$/MWh</em></span><input type="number" id="inp-thermal" min="0" step="100"></label>
               <label class="field-row"><span class="field-label">Reserve shortfall <em>$/MWh</em></span><input type="number" id="inp-reserve-short" min="0" step="100"></label>
               <label class="field-row"><span class="field-label">Time limit <em>s</em></span><input type="number" id="inp-time-limit" min="0" step="1" placeholder="unlimited"></label>
             </div>
+            <div class="field-stack" style="margin-top: 0.5rem; padding-top: 0.5rem; border-top: 1px solid var(--border, #2a2a2a);">
+              <div class="tiny-hint">AC SCED tuning (only consulted on goc3 problems — IEEE cases use the Python pipeline).</div>
+              <label class="field-row" title="Reactive-support pin retry. When the AC OPF fails to converge, the native pipeline tightens Pg bounds on Q-capable generators (selected by q_range × local_load²) until cumulative |q_range| reaches factor × peak_system_load_mw. 0.0 disables. 0.2 is the canonical go_c3 default for 73-/617-bus cases.">
+                <span class="field-label">Reactive pin factor</span>
+                <input type="number" id="inp-reactive-pin" min="0" max="1" step="0.05">
+              </label>
+              <label class="field-row" title="Override Ipopt's convergence tolerance on the AC SCED pass. Empty = surge default.">
+                <span class="field-label">AC OPF tolerance</span>
+                <input type="number" id="inp-ac-opf-tol" min="0" step="1e-7" placeholder="default">
+              </label>
+              <label class="field-row" title="Override Ipopt's max iteration cap on the AC SCED pass. Empty = surge default (3000).">
+                <span class="field-label">AC OPF max iterations</span>
+                <input type="number" id="inp-ac-opf-max-iter" min="1" step="100" placeholder="default">
+              </label>
+              <label class="field-row" title="Drop branch thermal enforcement on the AC SCED pass. Diagnostic — masks SCUC commitment quality issues.">
+                <span class="field-label">Thermal limits</span>
+                <select id="sel-disable-sced-thermal">
+                  <option value="false">Enforce</option>
+                  <option value="true">Disabled</option>
+                </select>
+              </label>
+              <label class="field-row" title="Allow committed generators to dispatch to 0 on the AC SCED. Diagnostic — masks Pmin issues.">
+                <span class="field-label">Committed Pmin</span>
+                <select id="sel-relax-committed-pmin">
+                  <option value="false">Respect physical Pmin</option>
+                  <option value="true">Relax to 0 (diagnostic)</option>
+                </select>
+              </label>
+            </div>
           </details>
+        </div>
+
+        <!-- LOSSES (collapsible) ─────────────────────────────────── -->
+        <div class="config-section">
+          <div class="section-label">Losses</div>
+          <div class="field-stack">
+            <label class="field-row" title="Loss-factor cold-start strategy on the first SCUC security iteration. Disabled keeps the canonical lossless DC settlement (gen revenue == load payment + congestion rent). Uniform seeds every bus to the same rate. Load-pattern PTDF-weights it from the load profile (no DC PF). DC-PF runs a power flow per period (most accurate).">
+              <span class="field-label">Mode</span>
+              <select id="sel-loss-mode">
+                <option value="disabled">Disabled (lossless)</option>
+                <option value="uniform">Uniform rate</option>
+                <option value="load_pattern">Load-pattern PTDF</option>
+                <option value="dc_pf">DC power flow</option>
+              </select>
+            </label>
+            <label class="field-row" id="loss-rate-row" title="Loss rate seed. Typical 0.02 (2 %). Ignored for Disabled / DC-PF.">
+              <span class="field-label">Rate</span>
+              <input type="number" id="inp-loss-rate" min="0" max="0.5" step="0.005">
+            </label>
+            <label class="field-row" id="loss-iter-row" title="Refinement passes after the warm-start solve. 0 trusts the warm start; 1+ runs additional refinement LPs to drive the loss residual toward zero.">
+              <span class="field-label">Refinement iters</span>
+              <input type="number" id="inp-loss-iters" min="0" step="1">
+            </label>
+          </div>
+          <div class="tiny-hint">Lossless keeps the day-ahead settlement identity clean. Refinement passes are most useful when load shape forces uneven losses.</div>
+        </div>
+
+        <!-- SECURITY (collapsible) ───────────────────────────────── -->
+        <div class="config-section">
+          <div class="section-label">Security (N-1)</div>
+          <div class="field-stack">
+            <label class="field-row" title="When on, the SCUC iteratively screens N-1 contingencies, adding flowgate cuts each round until no monitored branch overloads under any single contingency.">
+              <span class="field-label">Screening</span>
+              <select id="sel-security-enabled">
+                <option value="false">Off</option>
+                <option value="true">On (iterative)</option>
+              </select>
+            </label>
+            <div id="security-fields" hidden>
+              <label class="field-row" title="Maximum outer-loop rounds. Each round re-solves the SCUC and adds violations as cuts; converges when no new violations surface.">
+                <span class="field-label">Max iterations</span>
+                <input type="number" id="inp-security-max-iter" min="1" step="1">
+              </label>
+              <label class="field-row" title="Cap on new contingency cuts added per iteration. Higher caps converge faster on networks with many simultaneous binding pairs.">
+                <span class="field-label">Cuts / iteration</span>
+                <input type="number" id="inp-security-max-cuts" min="1" step="100">
+              </label>
+              <label class="field-row" title="Topology-ranked cuts to seed before the first MIP. Reduces the outer-loop rounds needed on heavily contingency-bound networks.">
+                <span class="field-label">Preseed cuts / period</span>
+                <input type="number" id="inp-security-preseed" min="0" step="50">
+              </label>
+            </div>
+          </div>
+          <div class="tiny-hint">Default monitors every in-service branch with topology-ranked LODF preseeding.</div>
         </div>
 
       </div>
@@ -215,7 +314,12 @@
       <button class="results-tab" data-tab="lmps">LMPs</button>
       <button class="results-tab" data-tab="generators">Generators</button>
       <button class="results-tab" data-tab="loads">Loads</button>
+      <button class="results-tab" data-tab="hvdc" data-hvdc-tab hidden>HVDC</button>
       <button class="results-tab" data-tab="reserves">Reserves</button>
+      <button class="results-tab" data-tab="as-pricing">AS Pricing</button>
+      <button class="results-tab" data-tab="branches">Branches</button>
+      <button class="results-tab" data-tab="contingencies">Contingencies</button>
+      <button class="results-tab" data-tab="objective">Objective</button>
       <button class="results-tab" data-tab="violations">Violations</button>
       <button class="results-tab" data-tab="log">Log</button>
     </div>
@@ -270,6 +374,13 @@
             <input type="range" id="grid-period" min="0" max="0" step="1" value="0">
             <span id="grid-period-label">—</span>
           </label>
+          <label class="reactive-toggle" hidden id="grid-power-toggle-wrap">
+            Mode
+            <select id="sel-grid-power-mode">
+              <option value="active">Active ($/MWh)</option>
+              <option value="reactive">Reactive ($/MVAr-h)</option>
+            </select>
+          </label>
           <label>
             <input type="checkbox" id="grid-show-branches" checked>
             edges
@@ -286,21 +397,42 @@
 
     <section class="results-pane" data-pane="lmps" hidden>
       <div class="panel-head">
-        <h2>LMP heatmap <span class="panel-sub">buses × periods · $/MWh</span></h2>
+        <h2>LMP heatmap <span class="panel-sub" id="lmp-heatmap-source">buses × periods · $/MWh</span></h2>
         <div class="lmp-controls">
           <label>Filter bus
             <input type="text" id="inp-lmp-filter" placeholder="e.g. 4 or 1,3,5">
           </label>
         </div>
       </div>
-      <div id="lmp-heatmap" class="lmp-heatmap"></div>
-      <div id="lmp-lines" class="lmp-lines"></div>
+      <!-- Side-by-side P / Q layout. The Q column collapses (display:
+           none) on SCUC-only runs via ``.lmp-grid.has-q``; the P
+           column then takes the full width without the user having
+           to scroll. -->
+      <div id="lmp-grid" class="lmp-grid">
+        <div class="lmp-col">
+          <div class="lmp-col-head">Active LMP · $/MWh</div>
+          <div id="lmp-heatmap" class="lmp-heatmap"></div>
+          <div id="lmp-lines" class="lmp-lines"></div>
+        </div>
+        <div class="lmp-col" id="qlmp-section" hidden>
+          <div class="lmp-col-head">Reactive LMP · $/MVAr-h</div>
+          <div id="qlmp-heatmap" class="lmp-heatmap"></div>
+          <div id="qlmp-lines" class="lmp-lines"></div>
+        </div>
+      </div>
     </section>
 
     <section class="results-pane" data-pane="generators" hidden>
       <div class="panel-head">
-        <h2>Generator dispatch <span class="panel-sub">stacked MW · fuel mix by period</span></h2>
+        <h2>Generator dispatch <span class="panel-sub" id="gen-stack-sub">stacked MW · fuel mix by period</span></h2>
         <div class="gen-controls">
+          <label class="reactive-toggle" hidden id="gen-power-toggle-wrap">
+            Mode
+            <select id="sel-gen-power-mode">
+              <option value="active">Active (MW)</option>
+              <option value="reactive">Reactive (MVAr)</option>
+            </select>
+          </label>
           <label>Sort by
             <select id="sel-gen-sort">
               <option value="revenue">Revenue</option>
@@ -317,10 +449,27 @@
 
     <section class="results-pane" data-pane="loads" hidden>
       <div class="panel-head">
-        <h2>Load profile <span class="panel-sub">bus × period MW</span></h2>
+        <h2>Load profile <span class="panel-sub" id="load-stack-sub">bus × period MW</span></h2>
+        <div class="load-controls">
+          <label class="reactive-toggle" hidden id="load-power-toggle-wrap">
+            Mode
+            <select id="sel-load-power-mode">
+              <option value="active">Active (MW)</option>
+              <option value="reactive">Reactive (MVAr)</option>
+            </select>
+          </label>
+        </div>
       </div>
       <div id="load-chart" class="chart-readonly"></div>
       <div id="load-table" class="load-table"></div>
+    </section>
+
+    <section class="results-pane" data-pane="hvdc" hidden>
+      <div class="panel-head">
+        <h2>HVDC links <span class="panel-sub" id="hvdc-stack-sub">per-link real + reactive dispatch</span></h2>
+      </div>
+      <div id="hvdc-chart" class="chart-readonly"></div>
+      <div id="hvdc-table" class="hvdc-table"></div>
     </section>
 
     <section class="results-pane" data-pane="reserves" hidden>
@@ -328,6 +477,40 @@
         <h2>Reserve awards <span class="panel-sub">MW × clearing price by product</span></h2>
       </div>
       <div id="reserves-grid" class="reserves-grid"></div>
+    </section>
+
+    <section class="results-pane" data-pane="as-pricing" hidden>
+      <div class="panel-head">
+        <h2>AS clearing prices <span class="panel-sub">$/MWh × period · per zone × product</span></h2>
+        <div class="panel-note" id="as-pricing-note">—</div>
+      </div>
+      <div id="as-pricing-grid" class="as-pricing-grid"></div>
+    </section>
+
+    <section class="results-pane" data-pane="branches" hidden>
+      <div class="panel-head">
+        <h2>Branches <span class="panel-sub">near-binding / breached lines across the horizon</span></h2>
+        <label class="threshold-control">
+          <span>Threshold</span>
+          <input type="number" id="inp-branches-threshold" min="0" max="2" step="0.05" value="0.9">
+        </label>
+      </div>
+      <div id="branches-body" class="branches-body"></div>
+    </section>
+
+    <section class="results-pane" data-pane="contingencies" hidden>
+      <div class="panel-head">
+        <h2>Contingencies <span class="panel-sub">N-1 cuts that came within threshold of binding</span></h2>
+      </div>
+      <div id="contingencies-body" class="contingencies-body"></div>
+    </section>
+
+    <section class="results-pane" data-pane="objective" hidden>
+      <div class="panel-head">
+        <h2>Objective breakdown <span class="panel-sub">cost contributions by bucket · per period</span></h2>
+      </div>
+      <div id="objective-cards" class="objective-cards"></div>
+      <div id="objective-stack" class="objective-stack"></div>
     </section>
 
     <section class="results-pane" data-pane="violations" hidden>
@@ -351,6 +534,19 @@
 
 </main>
 
-<script src="static/dashboard.js"></script>
+<!-- Solve overlay: blocks the whole UI while a solve is running so
+     the user can't change inputs / fire another solve mid-flight. -->
+<div id="solve-overlay" class="solve-overlay" hidden>
+  <div class="solve-overlay-card">
+    <div class="solve-overlay-spinner"></div>
+    <div class="solve-overlay-title" id="solve-overlay-title">Solving…</div>
+    <div class="solve-overlay-sub" id="solve-overlay-sub">building dispatch request</div>
+    <div class="solve-overlay-elapsed" id="solve-overlay-elapsed">0.0 s</div>
+    <pre id="solve-overlay-log" class="solve-overlay-log"></pre>
+    <button type="button" id="solve-overlay-dismiss" class="solve-overlay-dismiss" hidden>Dismiss</button>
+  </div>
+</div>
+
+<script src="static/dashboard.js?v=20260426f"></script>
 </body>
 </html>

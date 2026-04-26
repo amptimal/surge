@@ -53,7 +53,7 @@ from .loads import (
     piecewise_linear_utility,
     quadratic_utility,
 )
-from .logging import SolveLogger
+from .logging import LogStream, SolveLogger
 from .offers import (
     GeneratorOfferSchedule,
     GeneratorReserveOfferSchedule,
@@ -157,6 +157,7 @@ __all__ = [
     "piecewise_linear_utility",
     "quadratic_utility",
     # Logging
+    "LogStream",
     "SolveLogger",
     # Problem contract
     "MarketProblem",

@@ -3582,6 +3582,7 @@ mod flowgate_tests {
             limit_reverse_mw_schedule: Vec::new(),
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
+            ptdf_per_bus: Vec::new(),
             limit_mw_active_period: None,
             breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
@@ -3628,6 +3629,7 @@ mod flowgate_tests {
             limit_reverse_mw_schedule: Vec::new(),
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
+            ptdf_per_bus: Vec::new(),
             limit_mw_active_period: None,
             breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
@@ -3698,6 +3700,7 @@ mod flowgate_tests {
             limit_reverse_mw_schedule: Vec::new(),
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
+            ptdf_per_bus: Vec::new(),
             limit_mw_active_period: None,
             breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
@@ -3732,6 +3735,7 @@ mod flowgate_tests {
             limit_reverse_mw_schedule: Vec::new(),
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
+            ptdf_per_bus: Vec::new(),
             limit_mw_active_period: None,
             breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
@@ -3747,6 +3751,7 @@ mod flowgate_tests {
             limit_reverse_mw_schedule: Vec::new(),
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
+            ptdf_per_bus: Vec::new(),
             limit_mw_active_period: None,
             breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });
@@ -3971,6 +3976,7 @@ mod flowgate_tests {
                 chemistry: None,
                 discharge_foldback_soc_mwh: None,
                 charge_foldback_soc_mwh: None,
+                daily_cycle_limit: None,
             }),
             ..Generator::default()
         };
@@ -4031,6 +4037,7 @@ mod flowgate_tests {
                 chemistry: None,
                 discharge_foldback_soc_mwh: None,
                 charge_foldback_soc_mwh: None,
+                daily_cycle_limit: None,
             }),
             ..Generator::default()
         };
@@ -4092,6 +4099,7 @@ mod flowgate_tests {
                 chemistry: None,
                 discharge_foldback_soc_mwh: None,
                 charge_foldback_soc_mwh: None,
+                daily_cycle_limit: None,
             }),
             ..Generator::default()
         };
@@ -4152,6 +4160,7 @@ mod flowgate_tests {
                 chemistry: None,
                 discharge_foldback_soc_mwh: None,
                 charge_foldback_soc_mwh: None,
+                daily_cycle_limit: None,
             }),
             ..Generator::default()
         };
@@ -4221,6 +4230,7 @@ mod flowgate_tests {
             chemistry: None,
             discharge_foldback_soc_mwh: None,
             charge_foldback_soc_mwh: None,
+            daily_cycle_limit: None,
         });
         net.generators.push(storage);
 
@@ -4319,6 +4329,7 @@ mod flowgate_tests {
                 chemistry: None,
                 discharge_foldback_soc_mwh: None,
                 charge_foldback_soc_mwh: None,
+                daily_cycle_limit: None,
             }),
             ..Generator::default()
         };
@@ -4441,6 +4452,7 @@ mod flowgate_tests {
                 chemistry: None,
                 discharge_foldback_soc_mwh: None,
                 charge_foldback_soc_mwh: None,
+                daily_cycle_limit: None,
             }),
             ..Generator::default()
         });
@@ -4563,6 +4575,7 @@ mod flowgate_tests {
                 chemistry: None,
                 discharge_foldback_soc_mwh: None,
                 charge_foldback_soc_mwh: None,
+                daily_cycle_limit: None,
             }),
             ..Generator::default()
         });
@@ -5176,6 +5189,7 @@ mod freq_sec_dr_tests {
             chemistry: None,
             discharge_foldback_soc_mwh: None,
             charge_foldback_soc_mwh: None,
+            daily_cycle_limit: None,
         });
         net.generators.push(bess);
 
@@ -5205,6 +5219,7 @@ mod freq_sec_dr_tests {
             chemistry: None,
             discharge_foldback_soc_mwh: None,
             charge_foldback_soc_mwh: None,
+            daily_cycle_limit: None,
         });
         net.generators.push(ph);
 
@@ -5972,6 +5987,7 @@ mod nomogram_sced_tests {
             limit_reverse_mw_schedule: vec![],
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
+            ptdf_per_bus: Vec::new(),
             limit_mw_active_period: None,
             breach_sides: surge_network::network::FlowgateBreachSides::Both,
         });

@@ -16,7 +16,12 @@ from typing import Any
 DEFAULT_COMMITMENT_MIP_REL_GAP = 1e-3
 
 
-_PYTHON_ONLY_FIELDS = ("log_level", "capture_solver_log", "scuc_only")
+_PYTHON_ONLY_FIELDS = (
+    "log_level",
+    "capture_solver_log",
+    "scuc_only",
+    "allow_ac_consumer_reserve_shedding",
+)
 
 
 @dataclass(frozen=True)
@@ -78,9 +83,9 @@ class GoC3Policy:
     reactive_support_pin_factor: float = 0.0
 
     # ── security screening
-    scuc_security_preseed_count_per_period: int = 250
-    scuc_security_max_iterations: int = 5
-    scuc_security_max_cuts_per_iteration: int = 2_500
+    scuc_security_preseed_count_per_period: int = 0
+    scuc_security_max_iterations: int = 10
+    scuc_security_max_cuts_per_iteration: int = 250_000
     # SCUC loss-factor cold-start warm start. Default
     # ("load_pattern", 0.02): PTDF-weighted per-bus sensitivity seeded
     # into the MIP before the first solve, avoiding a full lossless
@@ -130,6 +135,37 @@ class GoC3Policy:
     # cost of relying on security cuts + AC SCED for nodal physics.
     scuc_disable_bus_power_balance: bool = True
 
+    # SCUC system-row loss treatment across security iterations.
+    # Only consulted when ``scuc_disable_bus_power_balance=True`` (the
+    # canonical GO C3 path). Three modes:
+    #
+    # * ``"static"`` — single ``rate × total_load`` per period baked
+    #   into the system-row RHS. Same value every security iteration.
+    #   Cheapest; ignores realized dispatch. Use when you want the
+    #   pre-feedback baseline (e.g. for an A/B against the default).
+    # * ``"scalar_feedback"`` (default) — after each iter's repaired
+    #   DC PF, compute realized losses per period and feed forward as
+    #   next iter's RHS. Damped with asymmetric upward bias because
+    #   under-commitment costs more than over (AC SCED can't commit
+    #   new units to cover a loss-budget miss). On the 617-bus
+    #   validation cut (6 scenarios across D1/D2/D3, 2026-04-25) this
+    #   beat ``static`` on every single scenario by +$27 k–$803 k of
+    #   validator surplus per scenario, +$1.81 M aggregate (+0.094 %)
+    #   at near-static wall cost.
+    # * ``"penalty_factors"`` — full marginal-loss-factor formulation:
+    #   ``Σ (1 − LF_g) · pg = Σ Pd − L_0`` (linearization-corrected
+    #   under distributed-load slack). LFs from realized flows + loss
+    #   PTDF, damped, magnitude-capped. Theoretically more accurate
+    #   because it adds the locational signal — but on the 617-bus cut
+    #   it consistently came in second-best (+$1.54 M aggregate vs
+    #   scalar's +$1.81 M). Available as an opt-in when locational
+    #   asymmetries are suspected.
+    #
+    # Ignored when ``scuc_disable_bus_power_balance=False`` — the per-
+    # bus path's own ``iterate_loss_factors`` machinery handles loss
+    # representation directly.
+    scuc_loss_treatment: str = "scalar_feedback"
+
     # ── runtime
     ac_sced_period_concurrency: int | None = 2
     run_pricing: bool = False
@@ -137,6 +173,22 @@ class GoC3Policy:
     # ── logging (Python-only — stripped from the Rust-facing dict)
     log_level: str = "info"
     capture_solver_log: bool = False
+
+    # When True, the GO C3 solution exporter caps each consumer's
+    # active-reserve awards so the validator's `viol_cs_t_p_on_min` /
+    # `viol_cs_t_p_on_max` constraints stay feasible after AC SCED
+    # curtails the consumer's served power below the SCUC-awarded
+    # reserve level. Up-direction awards (reg_up / syn / ramp_up_on)
+    # are capped at `max(0, p_on - p_lb)`; down-direction awards
+    # (reg_down / ramp_down_on) at `max(0, p_ub - p_on)`. The shed
+    # amount is implicitly accepted as zonal reserve shortfall —
+    # preferable to letting the validator stamp the whole solution
+    # `feas=0` over a bookkeeping mismatch between the SCUC reserve
+    # award and the AC-curtailed dispatch. Default True: the GO C3
+    # path's AC SCED has no consumer-side reserve coupling row, so
+    # this mismatch is the rule rather than the exception. Set False
+    # only for diagnostics that need to expose the raw SCUC awards.
+    allow_ac_consumer_reserve_shedding: bool = True
 
     def to_dict(self, *, pin_factor: float | None = None) -> dict[str, Any]:
         """Render as the dict the Rust ``parse_policy`` reads.

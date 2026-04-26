@@ -32,6 +32,14 @@ const state = {
 
 const DIST_SHAPES = ['gaussian', 'uniform', 'triangular'];
 
+// Min gaps enforced on neighbour-on-contact pushes.
+// PWL: dragging segment k that crosses k±1 pushes k±1 to maintain this
+// gap (in $/MWh). Cascades only as far as collisions chain.
+// Band: dragging P50 across P10/P90 pushes that band edge to maintain
+// this gap. One-hop only — bands have no further neighbours.
+const MIN_PWL_PRICE_GAP = 0.5;
+const MIN_BAND_GAP = 0.5;
+
 // Quantile half-width factor per shape, expressed as k such that
 // P10 = P50 − k · (spread_fraction · P50). Symmetric around P50;
 // prices clamp at 0.
@@ -44,11 +52,31 @@ const DIST_QUANTILE_K = {
   triangular: 0.553,
 };
 
-function computeDistributionBand(p50, shape, spreadFraction) {
+function computeDistributionBand(p50, shape, spreadFraction, opts = {}) {
   const k = DIST_QUANTILE_K[shape] || DIST_QUANTILE_K.gaussian;
   const s = Math.max(0, spreadFraction || 0);
-  const p10 = p50.map(v => Math.max(0, v - k * s * v));
-  const p90 = p50.map(v => v + k * s * v);
+  // Two modes:
+  //   * relative (LMP/AS) — half-spread = k · s · |p50|. ``s`` is the
+  //     coefficient of variation; the implicit σ scales with p50. The
+  //     shape constant ``k`` maps σ to the P10/P90 quantile gap.
+  //   * absolute (BA ACE / CR) — half-spread = s · absoluteScale. ``s``
+  //     directly equals (P90 − P50) / absoluteScale, so a sidebar input
+  //     of "20 %" produces a ±20 unit band on a ±100 axis. The shape
+  //     constant drops out here; the sampler re-derives σ from the
+  //     resulting (p50, p10, p90) at draw time, so all three shapes
+  //     still respect the user's quantile choice.
+  // ``lowerFloor``: clamp p10 above this (defaults to 0 in relative
+  // mode for back-compat; ``null`` in absolute mode unless overridden).
+  const absoluteScale = opts.absoluteScale;
+  const lowerFloor = opts.lowerFloor === undefined
+    ? (absoluteScale === undefined ? 0 : null)
+    : opts.lowerFloor;
+  const half = (v) => absoluteScale === undefined ? k * s * v : s * absoluteScale;
+  const p10 = p50.map(v => {
+    const x = v - half(v);
+    return lowerFloor === null ? x : Math.max(lowerFloor, x);
+  });
+  const p90 = p50.map(v => v + half(v));
   return { p10, p90 };
 }
 
@@ -57,18 +85,23 @@ function computeDistributionBand(p50, shape, spreadFraction) {
 // scenario loads and after time-axis resampling.
 function ensureDistributions(scen) {
   scen.distributions = scen.distributions || {};
-  const ensure = (key, p50) => {
+  const ensure = (key, p50, opts = {}) => {
     const d = scen.distributions[key] || {};
     d.shape = DIST_SHAPES.includes(d.shape) ? d.shape : 'gaussian';
+    const defaultSpread = opts.defaultSpread ?? 0.20;
     d.spread_fraction = (typeof d.spread_fraction === 'number' && d.spread_fraction >= 0)
-      ? d.spread_fraction : 0.20;
+      ? d.spread_fraction : defaultSpread;
     d.editable = !!d.editable;
+    if (opts.subPeriods !== undefined) {
+      d.n_sub_periods = (typeof d.n_sub_periods === 'number' && d.n_sub_periods >= 1)
+        ? Math.round(d.n_sub_periods) : opts.subPeriods;
+    }
     // Compute bands from formula when no overrides exist OR when
     // the arrays don't match the current period count.
     const n = p50.length;
     if (!Array.isArray(d.p10) || d.p10.length !== n ||
         !Array.isArray(d.p90) || d.p90.length !== n) {
-      const computed = computeDistributionBand(p50, d.shape, d.spread_fraction);
+      const computed = computeDistributionBand(p50, d.shape, d.spread_fraction, opts);
       d.p10 = computed.p10;
       d.p90 = computed.p90;
     }
@@ -76,16 +109,36 @@ function ensureDistributions(scen) {
   };
   ensure('lmp', scen.lmp_forecast_per_mwh);
   (scen.as_products || []).forEach(ap => ensure(`as_${ap.product_id}`, ap.price_forecast_per_mwh));
+  // BA ACE / CR distributions piggyback on the same band machinery but
+  // use an absolute scale (% axis) and don't clamp p10 at zero (ACE can
+  // be negative). Their P50 is implicit — flat zero at every period.
+  const n = (scen.lmp_forecast_per_mwh || []).length;
+  const aceP50 = (scen.distributions.ba_ace && scen.distributions.ba_ace.p50)
+    || new Array(n).fill(0);
+  const crP50 = (scen.distributions.cr_pct && scen.distributions.cr_pct.p50)
+    || new Array(n).fill(0);
+  ensure('ba_ace', aceP50, { defaultSpread: 0.20, subPeriods: 12, absoluteScale: 100 });
+  ensure('cr_pct', crP50, { defaultSpread: 0.02, subPeriods: 1, absoluteScale: 100, lowerFloor: 0 });
 }
 
 function recomputeBandFromFormula(key, scen) {
   const d = scen.distributions[key];
   if (!d) return;
-  const p50 = key === 'lmp'
-    ? scen.lmp_forecast_per_mwh
-    : (scen.as_products || []).find(ap => `as_${ap.product_id}` === key)?.price_forecast_per_mwh;
+  let p50 = null;
+  let opts = {};
+  if (key === 'lmp') {
+    p50 = scen.lmp_forecast_per_mwh;
+  } else if (key.startsWith('as_')) {
+    p50 = (scen.as_products || []).find(ap => `as_${ap.product_id}` === key)?.price_forecast_per_mwh;
+  } else if (key === 'ba_ace') {
+    p50 = d.p50;
+    opts = { absoluteScale: 100 };
+  } else if (key === 'cr_pct') {
+    p50 = d.p50;
+    opts = { absoluteScale: 100, lowerFloor: 0 };
+  }
   if (!p50) return;
-  const b = computeDistributionBand(p50, d.shape, d.spread_fraction);
+  const b = computeDistributionBand(p50, d.shape, d.spread_fraction, opts);
   d.p10 = b.p10;
   d.p90 = b.p90;
 }
@@ -106,7 +159,7 @@ const MODE_HINTS = {
 // (amber / rose / purple), cool family for down (blue / indigo).
 const AS_COLORS = {
   reg_up:    '#fbbf24',   // amber
-  syn:       '#22d3ee',   // cyan   — spinning (distinct from LMP purple)
+  syn:       '#d946ef',   // fuchsia — spinning (warm, far from blue reg_down + amber reg_up + rose nsyn)
   nsyn:      '#f472b6',   // rose   — non-spin
   ramp_up_on:    '#fb923c',   // orange
   ramp_up_off:   '#f97316',   // deeper orange
@@ -126,6 +179,11 @@ class EditableLineChart {
     // pattern as setData() below.
     this.min = opts.min !== undefined ? opts.min : 0;
     this.max = opts.max !== undefined ? opts.max : 100;
+    // ``fixedAxis``: pin the y-axis exactly to [min, max] regardless of
+    // data, and clamp drag at both ends. Used for BA ACE where the
+    // ±100 % envelope is intrinsic and we don't want the axis breathing
+    // in and out as P50/band points move around.
+    this.fixedAxis = !!opts.fixedAxis;
     this.color = opts.color || '#a78bfa';
     this.colorDim = opts.colorDim || 'rgba(167,139,250,0.15)';
     this.onChange = opts.onChange || (() => {});
@@ -153,6 +211,7 @@ class EditableLineChart {
     this.data = data.slice();
     if (opts.min !== undefined) this.min = opts.min;
     if (opts.max !== undefined) this.max = opts.max;
+    if (opts.fixedAxis !== undefined) this.fixedAxis = !!opts.fixedAxis;
     if (opts.color) this.color = opts.color;
     if (opts.colorDim) this.colorDim = opts.colorDim;
     if (opts.onChange) this.onChange = opts.onChange;
@@ -179,6 +238,7 @@ class EditableLineChart {
   }
 
   _yRange() {
+    if (this.fixedAxis) return [this.min, this.max];
     if (!this.data.length) return [this.min, this.max];
     // Pull in band bounds + overlay references so the full envelope
     // drives the axis. ``this.min`` is a hard lower clamp; ``this.max``
@@ -544,6 +604,9 @@ class EditableLineChart {
       const clampedY = Math.max(this._PAD_T, Math.min(this._PAD_T + this._innerH, svgY));
       const raw = fromY(clampedY);
       let newVal = (this.min === null || this.min === undefined) ? raw : Math.max(this.min, raw);
+      if (this.fixedAxis && this.max !== null && this.max !== undefined) {
+        newVal = Math.min(this.max, newVal);
+      }
       // Preserve ordering: P10 ≤ P50 ≤ P90.
       const p50v = this.data[idx];
       if (kind === 'p90') newVal = Math.max(p50v, newVal);
@@ -605,6 +668,7 @@ class EditableLineChart {
     point.circle.classList.add('dragging');
 
     const noFloor = this.min === null || this.min === undefined;
+    let bandPushed = false;
     const onMove = (ev) => {
       const rect = this.svg.getBoundingClientRect();
       const svgY = (ev.clientY - rect.top) * (this.svg.viewBox.baseVal.height / rect.height);
@@ -613,13 +677,36 @@ class EditableLineChart {
       // value follows the cursor past the bottom edge so the user can
       // drag to arbitrarily negative values — the axis rescales on drop.
       const visualY = Math.max(this._PAD_T, Math.min(this._PAD_T + this._innerH, svgY));
-      const valueY = noFloor ? Math.max(this._PAD_T, svgY) : visualY;
+      // For axes that can grow (anything other than ``fixedAxis``), let
+      // the *value* follow the cursor freely past the current top or
+      // bottom edge — the dot still visually clamps to the plot area,
+      // and a single ``render()`` on drop expands the axis to the new
+      // bounds. Without this, the cursor pinned at ``PAD_T`` always
+      // mapped to the current ``yMax``, which forced the user to
+      // release-and-re-grab to grow the axis past one ~8 % padding step.
+      const valueY = this.fixedAxis ? visualY : svgY;
       const raw = fromY(valueY);
-      const newVal = noFloor ? raw : Math.max(this.min, raw);
+      let newVal = noFloor ? raw : Math.max(this.min, raw);
+      if (this.fixedAxis && this.max !== null && this.max !== undefined) {
+        newVal = Math.min(this.max, newVal);
+      }
       this.data[idx] = newVal;
       point.circle.setAttribute('cy', visualY);
       point.text.setAttribute('y', visualY - 9);
       point.text.textContent = this.formatValue(newVal);
+      // Push P10/P90 band edges only when newVal actually crosses them.
+      // One-hop: the band has no further neighbours, so no chain.
+      if (this._hasBand && this.band) {
+        if (newVal > this.band.p90[idx] - MIN_BAND_GAP) {
+          this.band.p90[idx] = newVal + MIN_BAND_GAP;
+          bandPushed = true;
+        }
+        if (newVal < this.band.p10[idx] + MIN_BAND_GAP) {
+          this.band.p10[idx] = newVal - MIN_BAND_GAP;
+          bandPushed = true;
+        }
+        if (bandPushed) this._updateBandLive();
+      }
       this._updatePathsLive();
     };
     const onUp = () => {
@@ -629,9 +716,13 @@ class EditableLineChart {
       point.circle.removeEventListener('pointerup', onUp);
       point.circle.removeEventListener('pointercancel', onUp);
       this.onChange(this.data.slice());
-      // A drag with no floor may have pushed the value below the current
-      // axis yMin; re-render so the axis grows to fit the new value.
-      if (noFloor) this.render();
+      if (bandPushed && this.band && this.band.onBandChange) {
+        this.band.onBandChange(this.band.p10.slice(), this.band.p90.slice(), idx, 'p50-push');
+      }
+      // Any non-pinned axis re-renders on drop so it expands (or
+      // contracts) to fit the new data envelope. Skipped on
+      // ``fixedAxis`` because the axis is intrinsic there.
+      if (!this.fixedAxis) this.render();
     };
     point.circle.addEventListener('pointermove', onMove);
     point.circle.addEventListener('pointerup', onUp);
@@ -990,6 +1081,16 @@ class DispatchChart {
         rect.setAttribute('stroke', seg.color);
         rect.setAttribute('stroke-width', '0.8');
         rect.setAttribute('stroke-opacity', '0.85');
+      } else if (seg.implied) {
+        // AS-implied post-clearing deployment — translucent fill with a
+        // dashed outline so it reads as "what we expect to flow on top
+        // of what actually cleared".
+        rect.setAttribute('fill', seg.color);
+        rect.setAttribute('fill-opacity', '0.22');
+        rect.setAttribute('stroke', seg.color);
+        rect.setAttribute('stroke-width', '1.1');
+        rect.setAttribute('stroke-dasharray', '3 2');
+        rect.setAttribute('stroke-opacity', '0.85');
       } else {
         rect.setAttribute('fill', seg.color);
         if (seg.opacity !== undefined) rect.setAttribute('fill-opacity', seg.opacity);
@@ -1084,10 +1185,13 @@ class DispatchChart {
       (i) => {
         const d = this.data[i] || { up: [], down: [] };
         const rows = [];
+        // Net counts cleared energy + AS-implied deployment but excludes
+        // undeployed AS reservation (the hatched segments) — those are
+        // capacity *held*, not power flowing in real time.
         let netUp = 0, netDn = 0;
         (d.up || []).forEach(seg => {
           if (!(seg.mw > 1e-9)) return;
-          netUp += seg.mw;
+          if (!seg.hatch) netUp += seg.mw;
           rows.push(
             `<div class="sc-tooltip-row"><span><span class="sw" style="background:${seg.color}"></span>${escapeHtml(seg.label)}</span>` +
             `<span class="val">+${seg.mw.toFixed(2)} MW</span></div>`
@@ -1095,7 +1199,7 @@ class DispatchChart {
         });
         (d.down || []).forEach(seg => {
           if (!(seg.mw > 1e-9)) return;
-          netDn += seg.mw;
+          if (!seg.hatch) netDn += seg.mw;
           rows.push(
             `<div class="sc-tooltip-row"><span><span class="sw" style="background:${seg.color}"></span>${escapeHtml(seg.label)}</span>` +
             `<span class="val">−${seg.mw.toFixed(2)} MW</span></div>`
@@ -1157,8 +1261,16 @@ class LineReadOnlyChart {
       if (this.fanBand.upper) allValues.push(...this.fanBand.upper);
       if (this.fanBand.lower) allValues.push(...this.fanBand.lower);
     }
-    const yMax = this.yMax ?? Math.max(1, ...allValues) * 1.08;
-    const yMin = this.yMin ?? Math.min(0, ...allValues);
+    // ``yMin``/``yMax`` act as soft bounds: the axis honours them when
+    // the data fits inside, but expands to include any excursions (e.g.
+    // an AS-implied SOC trace drifting beyond [0, E_max]) so violations
+    // stay visible instead of being clipped.
+    let yMax = this.yMax ?? Math.max(1, ...allValues) * 1.08;
+    let yMin = this.yMin ?? Math.min(0, ...allValues);
+    if (allValues.length) {
+      yMax = Math.max(yMax, ...allValues);
+      yMin = Math.min(yMin, ...allValues);
+    }
     const ySpan = yMax - yMin || 1;
     const toX = (i) => PAD_L + (i / Math.max(1, n - 1)) * innerW;
     const toY = (v) => PAD_T + innerH - ((v - yMin) / ySpan) * innerH;
@@ -1187,7 +1299,10 @@ class LineReadOnlyChart {
       svg.appendChild(label);
     }
 
-    // Guide lines (e.g. SOC min/max)
+    // Guide lines (e.g. SOC min/max + physical 0/capacity bounds).
+    // ``kind: 'physical'`` renders solid in a neutral colour so the
+    // operating bounds (dashed red) read as a tighter window inside
+    // the physical envelope.
     this.guideLines.forEach(g => {
       if (g.y < yMin || g.y > yMax) return;
       const y = toY(g.y);
@@ -1196,8 +1311,18 @@ class LineReadOnlyChart {
       line.setAttribute('y1', y); line.setAttribute('y2', y);
       line.setAttribute('stroke', g.color);
       line.setAttribute('stroke-width', 1);
-      line.setAttribute('stroke-dasharray', '3 3');
+      if (g.kind !== 'physical') line.setAttribute('stroke-dasharray', '3 3');
       svg.appendChild(line);
+      if (g.label) {
+        const label = document.createElementNS(svgNS, 'text');
+        label.setAttribute('class', 'sc-axis-label');
+        label.setAttribute('x', W - PAD_R - 3);
+        label.setAttribute('y', y - 2);
+        label.setAttribute('text-anchor', 'end');
+        label.setAttribute('fill', g.color);
+        label.textContent = g.label;
+        svg.appendChild(label);
+      }
     });
 
     // X labels — time-based ticks aligned to start_iso + resolution.
@@ -1243,6 +1368,7 @@ class LineReadOnlyChart {
       poly.setAttribute('fill', 'none');
       poly.setAttribute('stroke', s.color);
       poly.setAttribute('stroke-width', 2);
+      if (s.dashArray) poly.setAttribute('stroke-dasharray', s.dashArray);
       poly.setAttribute('points', s.data.map((v, i) => `${toX(i)},${toY(v)}`).join(' '));
       svg.appendChild(poly);
     });
@@ -1295,17 +1421,22 @@ function readAsset() {
   s.bess_power_charge_mw = parseFloat($('inp-charge-mw').value) || 0;
   s.bess_power_discharge_mw = parseFloat($('inp-discharge-mw').value) || 0;
   s.bess_energy_mwh = parseFloat($('inp-energy').value) || 0;
-  s.bess_charge_efficiency = parseFloat($('inp-eff-charge').value) || 0;
-  s.bess_discharge_efficiency = parseFloat($('inp-eff-discharge').value) || 0;
-  s.bess_soc_min_fraction = parseFloat($('inp-soc-min').value) || 0;
-  s.bess_soc_max_fraction = parseFloat($('inp-soc-max').value) || 1;
-  // Foldback fields accept blank ("off") as well as a fraction.
+  // The four fraction-valued inputs are presented in % to the user and
+  // round-tripped to fractions in the scenario.
+  s.bess_charge_efficiency = (parseFloat($('inp-eff-charge').value) || 0) / 100;
+  s.bess_discharge_efficiency = (parseFloat($('inp-eff-discharge').value) || 0) / 100;
+  s.bess_soc_min_fraction = (parseFloat($('inp-soc-min').value) || 0) / 100;
+  s.bess_soc_max_fraction = (parseFloat($('inp-soc-max').value) || 100) / 100;
+  // Foldback fields accept blank ("off") as well as a SOC %.
   const foldDis = $('inp-foldback-dis').value.trim();
   const foldCh = $('inp-foldback-ch').value.trim();
-  s.bess_discharge_foldback_fraction = foldDis === '' ? null : parseFloat(foldDis);
-  s.bess_charge_foldback_fraction = foldCh === '' ? null : parseFloat(foldCh);
+  s.bess_discharge_foldback_fraction = foldDis === '' ? null : parseFloat(foldDis) / 100;
+  s.bess_charge_foldback_fraction = foldCh === '' ? null : parseFloat(foldCh) / 100;
   s.bess_initial_soc_mwh = parseFloat($('inp-soc-init').value) || 0;
   s.bess_degradation_cost_per_mwh = parseFloat($('inp-deg').value) || 0;
+  // Cycles/day cap accepts blank ("off") as well as a positive number.
+  const cyc = $('inp-cycles-per-day').value.trim();
+  s.bess_daily_cycle_limit = cyc === '' ? null : parseFloat(cyc);
   // POI is no longer configured from the UI — the server derives a
   // non-binding default from the BESS MW limits. Same for the legacy
   // single-field round-trip, which the server will split sqrt-wise if it
@@ -1330,16 +1461,22 @@ function writeAsset() {
       s.bess_discharge_efficiency = 0.98;
     }
   }
-  $('inp-eff-charge').value = s.bess_charge_efficiency;
-  $('inp-eff-discharge').value = s.bess_discharge_efficiency;
-  $('inp-soc-min').value = s.bess_soc_min_fraction;
-  $('inp-soc-max').value = s.bess_soc_max_fraction;
+  // Display fractional fields as percentages. ``+`` strips floating-
+  // point fuzz like 0.1 + 0.2 → 0.30000000000000004 by re-rounding.
+  $('inp-eff-charge').value = +(s.bess_charge_efficiency * 100).toFixed(2);
+  $('inp-eff-discharge').value = +(s.bess_discharge_efficiency * 100).toFixed(2);
+  $('inp-soc-min').value = +(s.bess_soc_min_fraction * 100).toFixed(2);
+  $('inp-soc-max').value = +(s.bess_soc_max_fraction * 100).toFixed(2);
   const foldDis = s.bess_discharge_foldback_fraction;
   const foldCh = s.bess_charge_foldback_fraction;
-  $('inp-foldback-dis').value = (foldDis === null || foldDis === undefined) ? '' : foldDis;
-  $('inp-foldback-ch').value = (foldCh === null || foldCh === undefined) ? '' : foldCh;
+  $('inp-foldback-dis').value =
+    (foldDis === null || foldDis === undefined) ? '' : +(foldDis * 100).toFixed(2);
+  $('inp-foldback-ch').value =
+    (foldCh === null || foldCh === undefined) ? '' : +(foldCh * 100).toFixed(2);
   $('inp-soc-init').value = s.bess_initial_soc_mwh;
   $('inp-deg').value = s.bess_degradation_cost_per_mwh;
+  const cyc = s.bess_daily_cycle_limit;
+  $('inp-cycles-per-day').value = (cyc === null || cyc === undefined) ? '' : cyc;
 }
 
 function readTimeAxis() {
@@ -1372,10 +1509,14 @@ function renderPeriodsDisplay() {
 function readPolicy() {
   state.scenario.policy.dispatch_mode = $('sel-dispatch-mode').value;
   state.scenario.policy.period_coupling = $('sel-period-coupling').value;
+  const enforce = $('inp-enforce-reserve-soc');
+  state.scenario.policy.enforce_reserve_soc_capacity = !!(enforce && enforce.checked);
 }
 function writePolicy() {
   $('sel-dispatch-mode').value = state.scenario.policy.dispatch_mode || 'optimal_foresight';
   $('sel-period-coupling').value = state.scenario.policy.period_coupling || 'coupled';
+  const enforce = $('inp-enforce-reserve-soc');
+  if (enforce) enforce.checked = !!state.scenario.policy.enforce_reserve_soc_capacity;
   updateModeHint();
   const pwlVisible = state.scenario.policy.dispatch_mode === 'pwl_offers';
   $('pwl-section').style.display = pwlVisible ? '' : 'none';
@@ -1496,47 +1637,55 @@ function clearPwlOverrides(direction) {
   if (!direction || direction === 'charge')    s.charge_bid_price_per_period = null;
 }
 
-// Clamp a proposed PWL price for (direction, segIdx, periodIdx) so it
-// preserves the ordering invariants the solver relies on:
-//   * discharge prices strictly ascending with segment index
-//   * charge prices strictly descending with segment index
-//   * d[0] > c[0] at every period (no crossed buy/sell spread)
-// Neighbor prices are the *effective* per-period values (override or
-// baseline), so the clamp works identically whether the neighbors have
-// been customised or not.
+// Clamp a proposed PWL price against the only invariant that can't be
+// resolved by cascading: discharge[0] > charge[0] at every period (no
+// crossed buy/sell spread). Same-direction ordering is now handled by
+// :func:`cascadePwlPush`, which pushes neighbours on contact instead of
+// clamping the dragged segment.
 function clampPwlPrice(direction, segIdx, periodIdx, raw) {
   const s = state.scenario.pwl_strategy;
-  if (!s) return raw;
+  if (!s || segIdx !== 0) return raw;
   const EPS = 1e-3;
-  const neighbor = (dir, i) => {
-    const segs = dir === 'discharge'
-      ? s.discharge_offer_segments : s.charge_bid_segments;
-    if (!segs || i < 0 || i >= segs.length) return null;
-    return effectiveSegmentPrices(dir, i)[periodIdx];
-  };
-  let lo = -Infinity;
-  let hi = Infinity;
   if (direction === 'discharge') {
-    const prev = neighbor('discharge', segIdx - 1);
-    const next = neighbor('discharge', segIdx + 1);
-    if (prev !== null && isFinite(prev)) lo = Math.max(lo, prev + EPS);
-    if (next !== null && isFinite(next)) hi = Math.min(hi, next - EPS);
-    if (segIdx === 0) {
-      const c0 = neighbor('charge', 0);
-      if (c0 !== null && isFinite(c0)) lo = Math.max(lo, c0 + EPS);
-    }
+    const c0 = effectiveSegmentPrices('charge', 0)[periodIdx];
+    if (isFinite(c0)) return Math.max(c0 + EPS, raw);
   } else {
-    const prev = neighbor('charge', segIdx - 1);
-    const next = neighbor('charge', segIdx + 1);
-    if (prev !== null && isFinite(prev)) hi = Math.min(hi, prev - EPS);
-    if (next !== null && isFinite(next)) lo = Math.max(lo, next + EPS);
-    if (segIdx === 0) {
-      const d0 = neighbor('discharge', 0);
-      if (d0 !== null && isFinite(d0)) hi = Math.min(hi, d0 - EPS);
-    }
+    const d0 = effectiveSegmentPrices('discharge', 0)[periodIdx];
+    if (isFinite(d0)) return Math.min(d0 - EPS, raw);
   }
-  if (lo > hi) return raw;
-  return Math.min(hi, Math.max(lo, raw));
+  return raw;
+}
+
+// After moving segment ``segIdx`` at period ``periodIdx`` to ``newVal``,
+// walk neighbours outward and push each one only when it has actually
+// been crossed (within ``MIN_PWL_PRICE_GAP``). Stops as soon as a
+// neighbour is no longer in contact — distant segments are left alone.
+function cascadePwlPush(direction, segIdx, periodIdx, newVal) {
+  const s = state.scenario.pwl_strategy;
+  if (!s) return;
+  const segs = direction === 'discharge'
+    ? s.discharge_offer_segments : s.charge_bid_segments;
+  if (!segs) return;
+  // +1 for ascending (discharge), -1 for descending (charge).
+  const sign = direction === 'discharge' ? 1 : -1;
+  const push = (start, step) => {
+    let prev = newVal;
+    for (let j = start; j >= 0 && j < segs.length; j += step) {
+      const cur = effectiveSegmentPrices(direction, j)[periodIdx];
+      // Required gap from prev to cur: sign * step * (cur - prev) >= MIN_GAP.
+      // Cross detected when this is violated.
+      const have = sign * step * (cur - prev);
+      if (have < MIN_PWL_PRICE_GAP) {
+        const target = Math.max(0, prev + sign * step * MIN_PWL_PRICE_GAP);
+        setSegmentPriceOverride(direction, j, periodIdx, target);
+        prev = target;
+      } else {
+        return;
+      }
+    }
+  };
+  push(segIdx + 1, +1);
+  push(segIdx - 1, -1);
 }
 
 // True when there is at least one per-period override set for the
@@ -1819,6 +1968,7 @@ function getPriceTabs() {
       min: null,
       max: 100,
       formatValue: (v) => '$' + v.toFixed(0),
+      rangeFormat: (mn, mx) => `$${mn.toFixed(0)}–${mx.toFixed(0)}`,
       distKey: 'lmp',
     },
   ];
@@ -1834,8 +1984,43 @@ function getPriceTabs() {
       min: 0,
       max: 30,
       formatValue: (v) => '$' + v.toFixed(1),
+      rangeFormat: (mn, mx) => `$${mn.toFixed(0)}–${mx.toFixed(0)}`,
       distKey: `as_${ap.product_id}`,
     });
+  });
+  // BA ACE — pinned to the ±100 % envelope. The P50 line itself lives
+  // on the distribution spec (``distributions.ba_ace.p50``) since it
+  // doesn't ride alongside a price forecast like LMP/AS.
+  tabs.push({
+    key: 'ba_ace',
+    title: 'BA ACE',
+    color: '#f97316', // distinct orange so it doesn't clash with reg-up amber
+    getData: () => state.scenario.distributions?.ba_ace?.p50,
+    setData: (d) => { state.scenario.distributions.ba_ace.p50 = d; },
+    min: -100,
+    max: 100,
+    fixedAxis: true,
+    formatValue: (v) => v.toFixed(0) + '%',
+    rangeFormat: (mn, mx) => `${mn.toFixed(0)} – ${mx.toFixed(0)} %`,
+    distKey: 'ba_ace',
+    bandOpts: { absoluteScale: 100 },
+    showSubPeriods: true,
+  });
+  // CR % — pinned to the [0, 100] envelope, like ACE.
+  tabs.push({
+    key: 'cr_pct',
+    title: 'CR %',
+    color: '#14b8a6', // teal
+    getData: () => state.scenario.distributions?.cr_pct?.p50,
+    setData: (d) => { state.scenario.distributions.cr_pct.p50 = d; },
+    min: 0,
+    max: 100,
+    fixedAxis: true,
+    formatValue: (v) => v.toFixed(0) + '%',
+    rangeFormat: (mn, mx) => `${mn.toFixed(0)} – ${mx.toFixed(0)} %`,
+    distKey: 'cr_pct',
+    bandOpts: { absoluteScale: 100, lowerFloor: 0 },
+    showSubPeriods: true,
   });
   return tabs;
 }
@@ -1852,6 +2037,12 @@ function renderPriceChart() {
   const band = buildBandForKey(tab.distKey);
   const colorDim = tab.color + '1f';
   const referenceLines = buildPwlReferenceLines(tab);
+  // Post-hoc deployment factor overlay (BA ACE and CR % only). Shows
+  // the per-period rectified-mean fractions the api computed from the
+  // active distribution, so the user can sanity-check that, e.g.,
+  // dragging ACE P50 to −40 drives the reg-up factor up to ~40 %.
+  const factorLines = buildAsFactorReferenceLines(tab);
+  factorLines.forEach(l => referenceLines.unshift(l));
   // Monte Carlo mean-of-samples overlay for the active tab. Drawn as a
   // smooth dashed line in the MC purple so it reads as "what did the
   // solver actually see" against the P50 baseline.
@@ -1886,6 +2077,7 @@ function renderPriceChart() {
   if (state.priceChart) {
     state.priceChart.setData(tab.getData(), {
       min: tab.min, max: tab.max,
+      fixedAxis: !!tab.fixedAxis,
       color: tab.color, colorDim,
       onChange, band, referenceLines,
       seriesName: tab.title,
@@ -1894,6 +2086,7 @@ function renderPriceChart() {
     state.priceChart = new EditableLineChart(container, {
       data: tab.getData(),
       min: tab.min, max: tab.max,
+      fixedAxis: !!tab.fixedAxis,
       color: tab.color, colorDim,
       formatValue: tab.formatValue,
       onChange,
@@ -1906,6 +2099,47 @@ function renderPriceChart() {
   // Chart.formatValue needs to update when the active tab changes because
   // it's set on instance creation. Patch directly.
   state.priceChart.formatValue = tab.formatValue;
+}
+
+// Build post-hoc-deployment validation overlays for the BA ACE and CR
+// % tabs. The api returns per-period rectified-mean fractions
+// (``regup``, ``regdown``, ``cr`` in %) that the SOC drift / dispatch
+// chart use; surfacing those same arrays as reference lines on the
+// editable distribution chart lets the user verify the math matches
+// the curve they drew.
+function buildAsFactorReferenceLines(tab) {
+  if (tab.key !== 'ba_ace' && tab.key !== 'cr_pct') return [];
+  const ai = (state.lastResult && state.lastResult.as_implied) || null;
+  const factors = ai && ai.factors_pct;
+  if (!factors) return [];
+  const n = (state.scenario.distributions?.[tab.distKey]?.p50 || []).length;
+  const refs = [];
+  const push = (values, color, name) => {
+    if (!Array.isArray(values) || values.length !== n) return;
+    refs.push({
+      values: values.slice(),
+      color,
+      opacity: 0.85,
+      dashArray: '5 3',
+      strokeWidth: 1.6,
+      smooth: true,
+      name,
+      label: name,
+    });
+  };
+  if (tab.key === 'ba_ace') {
+    // Sign-code so the deployment lines mirror the ACE direction that
+    // triggers them: reg-up deploys when ACE is *negative*, so plot it
+    // on the negative side of the axis (−% deployed); reg-down deploys
+    // on positive ACE, plot on the positive side. Same magnitudes as
+    // the post-hoc math; just visually anchored to the right side of
+    // the chart.
+    push(factors.regup.map(v => -v), AS_COLORS.reg_up || '#fbbf24', 'reg-up % deployed');
+    push(factors.regdown, AS_COLORS.reg_down || '#60a5fa', 'reg-down % deployed');
+  } else {
+    push(factors.cr, AS_COLORS.syn || '#d946ef', 'CR % deployed');
+  }
+  return refs;
 }
 
 // Build the PWL bid reference lines for the active price tab. In
@@ -1966,6 +2200,7 @@ function buildPwlReferenceLines(tab) {
             clampPwlPrice(direction, i, periodIdx, rawPrice),
           onDrag: (periodIdx, newPrice) => {
             setSegmentPriceOverride(direction, i, periodIdx, newPrice);
+            cascadePwlPush(direction, i, periodIdx, newPrice);
           },
           onDragEnd: () => {
             renderPwlEditorBar();
@@ -2014,11 +2249,14 @@ function renderPriceTabs() {
     const mn = data.length ? Math.min(...data) : 0;
     const mx = data.length ? Math.max(...data) : 0;
     const active = tab.key === state.activePriceTab;
+    const range = tab.rangeFormat
+      ? tab.rangeFormat(mn, mx)
+      : `$${mn.toFixed(0)}–${mx.toFixed(0)}`;
     return `
       <button class="price-tab${active ? ' active' : ''}" data-tab="${escapeHtml(tab.key)}">
         <span class="price-tab-swatch" style="background:${tab.color}"></span>
         <span class="price-tab-name">${escapeHtml(tab.title)}</span>
-        <span class="price-tab-range">$${mn.toFixed(0)}–${mx.toFixed(0)}</span>
+        <span class="price-tab-range">${escapeHtml(range)}</span>
       </button>
     `;
   }).join('');
@@ -2041,7 +2279,11 @@ function refreshActiveTabRange() {
   const mn = data.length ? Math.min(...data) : 0;
   const mx = data.length ? Math.max(...data) : 0;
   const activeEl = $('price-tabs').querySelector('.price-tab.active .price-tab-range');
-  if (activeEl) activeEl.textContent = `$${mn.toFixed(0)}–${mx.toFixed(0)}`;
+  if (activeEl) {
+    activeEl.textContent = tab.rangeFormat
+      ? tab.rangeFormat(mn, mx)
+      : `$${mn.toFixed(0)}–${mx.toFixed(0)}`;
+  }
 }
 
 function renderPriceDistControls() {
@@ -2054,24 +2296,105 @@ function renderPriceDistControls() {
 function updatePresetsVisibility() {
   const presets = $('price-presets');
   const asActions = $('as-actions');
-  const isLmp = state.activePriceTab === 'lmp';
-  if (presets) presets.classList.toggle('hidden', !isLmp);
-  if (asActions) asActions.classList.toggle('hidden', isLmp);
+  const tab = state.activePriceTab || 'lmp';
+  // Duck-curve presets only make sense for LMP. The Zero button is
+  // useful on every non-LMP tab (AS prices, BA ACE P50, CR % P50).
+  if (presets) presets.classList.toggle('hidden', tab !== 'lmp');
+  if (asActions) asActions.classList.toggle('hidden', tab === 'lmp');
 }
 
 function zeroActiveAsProduct() {
-  if (!state.activePriceTab || !state.activePriceTab.startsWith('as_')) return;
-  const productId = state.activePriceTab.slice(3);
-  const ap = (state.scenario.as_products || []).find(p => p.product_id === productId);
-  if (!ap) return;
-  const n = ap.price_forecast_per_mwh.length;
-  ap.price_forecast_per_mwh = new Array(n).fill(0);
-  // Reset the distribution band to formula-driven (p50 = 0 collapses).
-  const d = state.scenario.distributions && state.scenario.distributions[`as_${productId}`];
+  const key = state.activePriceTab;
+  if (!key) return;
+  const tab = activePriceTab();
+  const data = tab && tab.getData ? tab.getData() : null;
+  if (!Array.isArray(data)) return;
+  const n = data.length;
+  const zeros = new Array(n).fill(0);
+  // ``setData`` on the tab descriptor is the canonical write back into
+  // the scenario — works uniformly for LMP, AS prices, and the P50
+  // arrays of ba_ace / cr_pct.
+  if (tab.setData) tab.setData(zeros);
+  // Collapse the distribution too: spread → 0, P10/P90 onto the P50.
+  // Otherwise the band would keep its old shape against a zeroed P50,
+  // which is rarely what the user wants from a "Zero" button.
+  const d = state.scenario.distributions && state.scenario.distributions[tab.distKey];
   if (d) {
+    d.spread_fraction = 0;
+    d.p10 = zeros.slice();
+    d.p90 = zeros.slice();
     d.dirty = false;
-    recomputeBandFromFormula(`as_${productId}`, state.scenario);
   }
+  renderPriceTabs();
+  renderPriceChart();
+  renderPriceDistControls();
+}
+
+// Restore the active tab — and its distribution — to whatever the
+// server's ``default-scenario`` endpoint returns. Cheap network call,
+// preserves the rest of the scenario (site, policy, time axis edits).
+async function resetActiveTab() {
+  const tab = activePriceTab();
+  if (!tab) return;
+  let defaults;
+  try {
+    defaults = await fetch('api/default-scenario').then(r => r.json());
+  } catch (e) {
+    showSolveError('failed to load defaults: ' + e.message);
+    return;
+  }
+  const n = (state.scenario.lmp_forecast_per_mwh || []).length;
+  const resampleTo = (arr) => arr && arr.length === n ? arr.slice() : resample(arr || [], n);
+  // Delete the active tab's distribution entry up front so
+  // ``ensureDistributions`` reseeds it from scratch using its formula
+  // defaults — without this, a prior Zero (which collapses spread to 0
+  // and zeros P10/P90) survives Reset whenever the server's
+  // default-scenario doesn't carry an explicit distribution entry for
+  // that key (true for LMP / AS — those are JS-side seeded). For ACE /
+  // CR the explicit ``dDef`` below overwrites the entry anyway.
+  if (state.scenario.distributions) {
+    delete state.scenario.distributions[tab.distKey];
+  }
+  if (tab.key === 'lmp') {
+    state.scenario.lmp_forecast_per_mwh = resampleTo(defaults.lmp_forecast_per_mwh);
+    const dDef = (defaults.distributions || {}).lmp;
+    if (dDef && state.scenario.distributions) {
+      state.scenario.distributions.lmp = {
+        ...dDef,
+        p10: resampleTo(dDef.p10),
+        p50: resampleTo(dDef.p50 || state.scenario.lmp_forecast_per_mwh),
+        p90: resampleTo(dDef.p90),
+      };
+    }
+  } else if (tab.key.startsWith('as_')) {
+    const productId = tab.key.slice(3);
+    const ap = (state.scenario.as_products || []).find(p => p.product_id === productId);
+    const apDef = (defaults.as_products || []).find(p => p.product_id === productId);
+    if (ap && apDef) {
+      ap.price_forecast_per_mwh = resampleTo(apDef.price_forecast_per_mwh);
+    }
+    const dDef = (defaults.distributions || {})[tab.distKey];
+    if (dDef && state.scenario.distributions) {
+      state.scenario.distributions[tab.distKey] = {
+        ...dDef,
+        p10: resampleTo(dDef.p10),
+        p50: resampleTo(dDef.p50 || (ap ? ap.price_forecast_per_mwh : [])),
+        p90: resampleTo(dDef.p90),
+      };
+    }
+  } else {
+    // ba_ace / cr_pct: distribution-only; no parallel forecast array.
+    const dDef = (defaults.distributions || {})[tab.distKey];
+    if (dDef && state.scenario.distributions) {
+      state.scenario.distributions[tab.distKey] = {
+        ...dDef,
+        p10: resampleTo(dDef.p10),
+        p50: resampleTo(dDef.p50),
+        p90: resampleTo(dDef.p90),
+      };
+    }
+  }
+  ensureDistributions(state.scenario);
   renderPriceTabs();
   renderPriceChart();
   renderPriceDistControls();
@@ -2097,6 +2420,11 @@ function buildBandForKey(key) {
 function renderDistControls(containerEl, key, chartRef) {
   const d = state.scenario.distributions[key];
   if (!d) return;
+  const showSubPeriods = key === 'ba_ace' || key === 'cr_pct';
+  const subPeriodsHtml = showSubPeriods
+    ? `<span class="dist-label" style="padding-left:6px" title="Sub-periods per economic period — finer ACE/CR granularity. Affects MC variance only; the deterministic post-hoc deployment expectation is the same regardless.">sub</span>
+       <input type="number" class="dist-sub-periods" value="${d.n_sub_periods || 1}" min="1" max="60" step="1">`
+    : '';
   containerEl.innerHTML = `
     <span class="dist-label">Dist</span>
     <select class="dist-select">
@@ -2105,6 +2433,7 @@ function renderDistControls(containerEl, key, chartRef) {
     <span class="dist-label" style="padding-left:4px">±</span>
     <input type="number" class="dist-spread" value="${Math.round(d.spread_fraction * 100)}" min="0" max="100" step="5">
     <span class="dist-spread-suffix">%</span>
+    ${subPeriodsHtml}
     <button class="dist-edit-toggle${d.editable ? ' on' : ''}" type="button" title="Edit P10/P90 band bounds">Edit</button>
     <button class="dist-reset${d.dirty ? ' visible' : ''}" type="button" title="Reset custom overrides">reset</button>
   `;
@@ -2112,6 +2441,13 @@ function renderDistControls(containerEl, key, chartRef) {
   const spreadEl = containerEl.querySelector('.dist-spread');
   const toggleEl = containerEl.querySelector('.dist-edit-toggle');
   const resetEl = containerEl.querySelector('.dist-reset');
+  const subEl = containerEl.querySelector('.dist-sub-periods');
+  if (subEl) {
+    subEl.addEventListener('input', () => {
+      const n = Math.max(1, Math.min(60, parseInt(subEl.value, 10) || 1));
+      d.n_sub_periods = n;
+    });
+  }
 
   selectEl.addEventListener('change', () => {
     d.shape = selectEl.value;
@@ -2187,6 +2523,7 @@ function renderResults(result) {
   $('rev-as').textContent = fmtMoney(sum.as_revenue_dollars);
   $('rev-deg').textContent = fmtMoney(-Math.abs(sum.degradation_cost_dollars || 0));
   $('rev-net').textContent = fmtMoney(sum.net_revenue_dollars);
+  renderAsBreakdownRows(result || state.lastResult, mc);
   const chargeMwh = sum.total_charge_mwh ?? 0;
   const dischargeMwh = sum.total_discharge_mwh ?? 0;
   $('rev-charge-mwh').textContent = chargeMwh.toFixed(1) + ' MWh';
@@ -2252,6 +2589,10 @@ function renderResults(result) {
   };
   let anyDischarge = false, anyCharge = false;
 
+  const asImplied = (scheduleSource.as_implied) || (result || state.lastResult || {}).as_implied;
+  const impliedRows = (asImplied && asImplied.rows) || [];
+  const impliedByPeriod = new Map(impliedRows.map(r => [r.period, r]));
+  let anyImpliedDeploy = false, anyImpliedUndep = false;
   const dispatchData = schedule.map((row) => {
     const disch = row.discharge_mw || 0;
     const chg = row.charge_mw || 0;
@@ -2264,25 +2605,44 @@ function renderResults(result) {
     if (chg > 1e-9) down.push({ mw: chg, color: RED, label: 'Charge' });
 
     const awards = awardsByPeriod.get(row.period) || {};
+    const impl = impliedByPeriod.get(row.period);
+    const impliedAwards = (impl && impl.awards_implied) || {};
+    // Per-product AS reservation: stacks on top of the cleared energy
+    // and is split into a "deployed" portion (solid, sits adjacent to
+    // the energy bar — it IS power flowing in real time) and an
+    // "undeployed" portion (hatched, the unused remainder of the
+    // reservation that stays held). Total height per product == cleared
+    // award, so the inverter pmin/pmax cap still bounds the bar.
     stackOrder.forEach(pid => {
-      const mw = awards[pid] || 0;
-      if (mw <= 1e-9) return;
+      const award = awards[pid] || 0;
+      if (award <= 1e-9) return;
       const color = AS_COLORS[pid] || '#a78bfa';
       const dir = asDirections[pid] || 'Up';
-      // AS segments rendered with a diagonal-stripe pattern to read as
-      // "reserved capacity" rather than the solid fill used for energy
-      // flow. Reservations and flow can then stack on the same column
-      // without the eye collapsing them into one block.
-      const seg = { mw, color, label: pid, hatch: true };
-      if (dir === 'Down') down.push(seg);
-      else up.push(seg);
-      pushActive(shortProductName(pid), color, true);
+      const deployed = Math.max(0, Math.min(award, impliedAwards[pid] || 0));
+      const undeployed = Math.max(0, award - deployed);
+      const target = dir === 'Down' ? down : up;
+      if (deployed > 1e-9) {
+        target.push({ mw: deployed, color, label: `${pid} deployed`, implied: true });
+        anyImpliedDeploy = true;
+      }
+      if (undeployed > 1e-9) {
+        target.push({ mw: undeployed, color, label: `${pid} held`, hatch: true });
+        anyImpliedUndep = true;
+        pushActive(shortProductName(pid), color, true);
+      } else if (deployed > 1e-9) {
+        // Reservation fully deployed — keep the legend entry so the
+        // user can still read the AS color → product mapping.
+        pushActive(shortProductName(pid), color, true);
+      }
     });
     return { up, down };
   });
 
   if (anyDischarge) pushActive('Discharge', EMERALD);
   if (anyCharge) pushActive('Charge', RED);
+  if (anyImpliedDeploy) {
+    activeSeries.push({ label: 'AS deployed', color: '#94a3b8', implied: true });
+  }
 
   const dispatchEl = $('chart-dispatch');
   const site = state.scenario.site || {};
@@ -2311,10 +2671,21 @@ function renderResults(result) {
   // empty primary series so the fan band carries the display.
   const socData = mc ? [] : schedule.map(r => r.soc_mwh || 0);
   const socSeries = [{
-    name: 'SOC',
+    name: 'SOC · cleared',
     color: '#a78bfa',
     data: socData,
   }];
+  // AS-implied SOC trajectory — overlays the cleared one when ACE/CR
+  // dists are non-zero. Drawn dashed in a slate tone so it reads as
+  // "implied / shadow" against the solid cleared trace.
+  if (asImplied && impliedRows.length === schedule.length && anyImpliedDeploy) {
+    socSeries.push({
+      name: 'SOC · AS-implied',
+      color: '#94a3b8',
+      data: impliedRows.map(r => r.soc_mwh_implied || 0),
+      dashArray: '5 3',
+    });
+  }
   const socFan = mc ? {
     lower: mc.perPeriod.map(p => p.soc.p10),
     upper: mc.perPeriod.map(p => p.soc.p90),
@@ -2324,18 +2695,27 @@ function renderResults(result) {
   // still knows the period count — use the median SOC line.
   if (mc) socSeries[0].data = socFan.median.slice();
   const socEl = $('chart-soc');
-  const socMin = (site.bess_soc_min_fraction || 0) * (site.bess_energy_mwh || 1);
-  const socMax = (site.bess_soc_max_fraction || 1) * (site.bess_energy_mwh || 1);
+  const energyMwh = site.bess_energy_mwh || 0;
+  const socMin = (site.bess_soc_min_fraction || 0) * (energyMwh || 1);
+  const socMax = (site.bess_soc_max_fraction || 1) * (energyMwh || 1);
   const socOpts = {
     series: socSeries,
     yMin: 0,
     yMax: site.bess_energy_mwh || undefined,
+    // Legend lives in the panel head (#soc-legend); the in-chart legend
+    // collided with the top-of-chart "E_max" guide and was hard to read.
     showLegend: false,
     unit: 'MWh',
     valuePrecision: 2,
     guideLines: [
-      { y: socMin, color: 'rgba(248,113,113,0.35)', label: 'min' },
-      { y: socMax, color: 'rgba(248,113,113,0.35)', label: 'max' },
+      // Physical envelope: solid neutral lines at 0 and the rated
+      // energy capacity. The operating LP bounds (dashed red below)
+      // sit inside this envelope.
+      { y: 0, color: 'rgba(148,163,184,0.55)', label: '0', kind: 'physical' },
+      { y: energyMwh, color: 'rgba(148,163,184,0.55)', label: `${energyMwh} MWh`, kind: 'physical' },
+      // Operating LP bounds (soc_min_fraction · E, soc_max_fraction · E).
+      { y: socMin, color: 'rgba(248,113,113,0.45)', label: `min ${socMin.toFixed(0)}` },
+      { y: socMax, color: 'rgba(248,113,113,0.45)', label: `max ${socMax.toFixed(0)}` },
     ],
     fanBand: socFan,
   };
@@ -2344,6 +2724,74 @@ function renderResults(result) {
     state.socChart = new LineReadOnlyChart(socEl, socOpts);
     observeResize(socEl, () => state.socChart.render());
   }
+  renderSocLegend(socSeries);
+  // The post-hoc factor overlays on the BA ACE / CR price-chart tabs
+  // come from this run's ``as_implied.factors_pct``; refresh the price
+  // chart so they redraw in sync with the dispatch / SOC results.
+  if (state.priceChart) renderPriceChart();
+}
+
+function renderAsBreakdownRows(result, mc) {
+  const el = $('rev-as-breakdown');
+  if (!el) return;
+  // Pick the same scheduleSource the dispatch chart used: in MC mode
+  // the median-net run carries a representative as_breakdown; in
+  // deterministic mode it's the last solve's payload.
+  let asBreakdown = [];
+  if (mc && mc.runs && mc.runs.length > 0) {
+    const sorted = mc.runs
+      .map((r, i) => ({ i, net: r.netRevenue }))
+      .sort((a, b) => a.net - b.net);
+    asBreakdown = mc.runs[sorted[Math.floor(sorted.length / 2)].i].asBreakdown || [];
+  } else if (result) {
+    asBreakdown = result.as_breakdown || [];
+  }
+  // Per-product totals across the horizon. Iterate in the order the
+  // user has them in ``as_products`` so the row order is stable from
+  // solve to solve.
+  const totals = new Map();
+  asBreakdown.forEach(p => {
+    (p.awards || []).forEach(a => {
+      totals.set(a.product_id, (totals.get(a.product_id) || 0) + (a.revenue_dollars || 0));
+    });
+  });
+  const order = (state.scenario.as_products || []).map(ap => ap.product_id);
+  // Tack on any awarded product the scenario doesn't list (defensive —
+  // shouldn't happen but keeps stragglers visible).
+  for (const pid of totals.keys()) {
+    if (!order.includes(pid)) order.push(pid);
+  }
+  const rows = order
+    .filter(pid => totals.has(pid))
+    .map(pid => {
+      const ap = (state.scenario.as_products || []).find(a => a.product_id === pid);
+      const name = shortProductName(ap?.title || pid);
+      const color = AS_COLORS[pid] || '#a78bfa';
+      return `<div class="rev-row sub rev-as-product">
+        <span><span class="rev-as-swatch" style="background:${color}"></span>${escapeHtml(name)}</span>
+        <span>${fmtMoney(totals.get(pid))}</span>
+      </div>`;
+    });
+  el.innerHTML = rows.join('');
+}
+
+function renderSocLegend(series) {
+  const el = $('soc-legend');
+  if (!el) return;
+  // Skip the legend when there's only the cleared trace — adds nothing.
+  if (!series || series.length < 2) {
+    el.innerHTML = '';
+    return;
+  }
+  el.innerHTML = series.map(s => {
+    const swatchStyle = s.dashArray
+      ? `border-top: 2px dashed ${s.color}; background: transparent; height: 0; border-radius: 0;`
+      : `background:${s.color}; height: 2px; border-radius: 0;`;
+    return `<span class="chart-legend-item">
+      <span class="chart-legend-swatch" style="width:14px; ${swatchStyle}"></span>
+      <span>${escapeHtml(s.name)}</span>
+    </span>`;
+  }).join('');
 }
 
 function renderDispatchLegend(items, upBound, downBound) {
@@ -2479,32 +2927,42 @@ async function solve() {
 
 // ═══ Monte Carlo over price distributions ════════════════════════════
 
-// Draw a single sample from a price distribution centered on ``p50``
-// with the 90th quantile at ``p90``. ``shape`` picks the distribution
-// family; ``minValue`` caps the sample at a floor (null = no floor).
-function drawPriceSample(shape, p50, p90, minValue) {
-  const spread = Math.max(0, p90 - p50);
+// Draw a single sample from a two-piece price distribution: each half
+// gets its own width derived from its own quantile (lower from p10,
+// upper from p90), so an asymmetric band the user has shaped — e.g.
+// after pushing one edge with a P50 drag — produces an asymmetric
+// sample. Pick a side with prob 0.5 (so p50 is the median), then draw
+// from the appropriate half-distribution. ``shape`` picks the family;
+// ``minValue`` caps the sample at a floor (null = no floor).
+function drawPriceSample(shape, p50, p10, p90, minValue) {
+  const upperSpread = Math.max(0, p90 - p50);
+  const lowerSpread = Math.max(0, p50 - p10);
   let v = p50;
-  if (spread > 0) {
-    if (shape === 'uniform') {
-      // Symmetric uniform band: P90 − P50 = 0.4·(b−a), so half-range = 1.25·spread.
-      const half = spread / 0.8;
-      v = p50 + (Math.random() * 2 - 1) * half;
-    } else if (shape === 'triangular') {
-      // Symmetric triangular with mode = P50, width w such that
-      // P90 − P50 = 0.553·w, so w = spread / 0.553.
-      const w = spread / 0.553;
-      const u = Math.random();
-      v = u < 0.5
-        ? p50 - w + Math.sqrt(u * 2) * w
-        : p50 + w - Math.sqrt((1 - u) * 2) * w;
-    } else {
-      // Gaussian (default). σ = spread / 1.282.
-      const sigma = spread / 1.282;
-      const u1 = Math.random() || 1e-9;
-      const u2 = Math.random();
-      const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
-      v = p50 + z * sigma;
+  if (upperSpread > 0 || lowerSpread > 0) {
+    const upper = Math.random() < 0.5;
+    const spread = upper ? upperSpread : lowerSpread;
+    const sign = upper ? 1 : -1;
+    if (spread > 0) {
+      if (shape === 'uniform') {
+        // Half-uniform [p50, p50 + w] with mass 1/2: 80th-percentile of
+        // that half sits at 0.8·w, so w = halfSpread / 0.8.
+        const half = spread / 0.8;
+        v = p50 + sign * Math.random() * half;
+      } else if (shape === 'triangular') {
+        // Half-triangle (peak at p50, tail at p50 ± w): 80th-percentile
+        // of that half sits at w·(1 − √0.2) ≈ 0.553·w → w = spread/0.553.
+        // Inverse CDF: t = w · (1 − √(1 − u)).
+        const w = spread / 0.553;
+        const u = Math.random();
+        v = p50 + sign * w * (1 - Math.sqrt(1 - u));
+      } else {
+        // Half-normal with σ = spread / 1.282. Box-Muller → |Z|.
+        const sigma = spread / 1.282;
+        const u1 = Math.random() || 1e-9;
+        const u2 = Math.random();
+        const z = Math.abs(Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2));
+        v = p50 + sign * z * sigma;
+      }
     }
   }
   return (minValue === null || minValue === undefined) ? v : Math.max(minValue, v);
@@ -2523,12 +2981,14 @@ function buildSampledScenario() {
   if (n === 0) return scen;
 
   const drawSeries = (p50Arr, distSpec, minValue) => {
-    if (!distSpec || !distSpec.p90 || distSpec.p90.length !== p50Arr.length
+    if (!distSpec || !distSpec.p10 || !distSpec.p90
+        || distSpec.p10.length !== p50Arr.length
+        || distSpec.p90.length !== p50Arr.length
         || !(distSpec.spread_fraction > 0)) {
       return p50Arr.slice();
     }
     return p50Arr.map((p50, i) => drawPriceSample(
-      distSpec.shape || 'gaussian', p50, distSpec.p90[i], minValue
+      distSpec.shape || 'gaussian', p50, distSpec.p10[i], distSpec.p90[i], minValue
     ));
   };
 
@@ -3080,10 +3540,17 @@ function applyTimeAxis() {
     ap.price_forecast_per_mwh = transform(ap.price_forecast_per_mwh);
   });
   // Drop any cached distribution bands so ensureDistributions reseeds
-  // them from the new P50 values (the tiled / resampled prices).
-  Object.values(state.scenario.distributions || {}).forEach(d => {
+  // them from the new P50 values (the tiled / resampled prices). For
+  // BA ACE / CR the P50 itself is stored on the distribution (not on
+  // a parallel forecast array), so it has to be resampled too —
+  // otherwise the post-hoc deployment math indexes a stale-length P50
+  // and throws "list index out of range".
+  Object.entries(state.scenario.distributions || {}).forEach(([key, d]) => {
     d.p10 = null;
     d.p90 = null;
+    if ((key === 'ba_ace' || key === 'cr_pct') && Array.isArray(d.p50)) {
+      d.p50 = transform(d.p50);
+    }
   });
   ensureDistributions(state.scenario);
   // Per-period PWL override matrices need to follow the horizon size
@@ -3245,6 +3712,8 @@ async function init() {
   $('sel-period-coupling').addEventListener('change', () => {
     readPolicy(); writePolicy(); renderPwlEditorBar();
   });
+  const enforceBox = $('inp-enforce-reserve-soc');
+  if (enforceBox) enforceBox.addEventListener('change', () => { readPolicy(); });
   const resetBtn = $('pwl-editor-reset');
   if (resetBtn) resetBtn.addEventListener('click', resetAllPwlOverrides);
 
@@ -3260,6 +3729,8 @@ async function init() {
   });
   const zeroBtn = $('btn-as-zero');
   if (zeroBtn) zeroBtn.addEventListener('click', zeroActiveAsProduct);
+  const tabResetBtn = $('btn-as-reset');
+  if (tabResetBtn) tabResetBtn.addEventListener('click', () => { resetActiveTab(); });
 
   // Sidebar collapse/expand.
   const toggle = $('sidebar-toggle');

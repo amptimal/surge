@@ -170,6 +170,20 @@ pub struct Flowgate {
     ///   `Σ coeff_i·b_dc_i·(θ_from_i − θ_to_i) + Σ hvdc_coeff_k·P_hvdc[k] ∈ [-limit, limit]`
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hvdc_coefficients: Vec<(usize, f64)>,
+    /// Per-bus effective PTDF coefficients for the monitored aggregate.
+    ///
+    /// When non-empty, the LP row builder switches from the theta-form
+    /// constraint `Σ coeff·b_dc·Δθ ≤ limit` to the PTDF/injection form
+    /// `Σ_i ptdf_eff_i · p_net_inj_i ≤ limit`. The latter directly
+    /// constrains generator/load/storage/HVDC variables and is the
+    /// only form that binds dispatch when the SCUC LP runs in
+    /// `scuc_disable_bus_power_balance` mode (where theta is decoupled
+    /// from `pg`). Each entry is `(bus_number, eff_ptdf_pu)` where
+    /// `eff_ptdf_pu = Σ_term coefficient_term · ptdf_l_term[bus_idx]`,
+    /// summed over the flowgate's `monitored` terms. Only buses with
+    /// non-trivial PTDF contribution are stored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ptdf_per_bus: Vec<(u32, f64)>,
     /// Per-band HVDC coefficients for banded N-1 HVDC contingency constraints.
     /// Each entry: `(hvdc_link_index, band_index, coefficient_pu)`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -276,6 +290,8 @@ struct FlowgateSerde {
     pub hvdc_coefficients: Vec<(usize, f64)>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hvdc_band_coefficients: Vec<(usize, usize, f64)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ptdf_per_bus: Vec<(u32, f64)>,
     #[serde(default)]
     pub limit_mw_active_period: Option<u32>,
     #[serde(default)]
@@ -321,6 +337,7 @@ impl TryFrom<FlowgateSerde> for Flowgate {
             limit_reverse_mw_schedule: value.limit_reverse_mw_schedule,
             hvdc_coefficients: value.hvdc_coefficients,
             hvdc_band_coefficients: value.hvdc_band_coefficients,
+            ptdf_per_bus: value.ptdf_per_bus,
             limit_mw_active_period: value.limit_mw_active_period,
             breach_sides: value.breach_sides,
         })
@@ -484,6 +501,7 @@ mod tests {
             limit_reverse_mw_schedule: vec![],
             hvdc_coefficients: vec![],
             hvdc_band_coefficients: vec![],
+            ptdf_per_bus: vec![],
             limit_mw_active_period: None,
             breach_sides: FlowgateBreachSides::Both,
         };
