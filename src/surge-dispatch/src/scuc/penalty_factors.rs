@@ -9,7 +9,7 @@
 //! 2. **`repair_theta_from_dc_pf`** computes physical angles consistent
 //!    with the SCUC dispatch (already runs every iter for screening).
 //! 3. **`compute_realized_loss_factors`** (this module) reads those
-//!    angles, hits each period's loss-PTDF, and returns a
+//!    angles, evaluates an adjoint sparse loss-sensitivity solve, and returns a
 //!    `LossFactorWarmStart` populated with:
 //!    * `dloss_dp[t][bus]` — per-bus marginal loss factor in
 //!      distributed-load-slack gauge.
@@ -26,7 +26,7 @@
 //! 6. The blended, capped state is threaded back into
 //!    `ScucProblemBuildInput::sys_row_loss_override` for iter `k+1`.
 //!
-//! Gauge fix (distributed-load slack): `compute_dc_loss_sensitivities`
+//! Gauge fix (distributed-load slack): the adjoint DC loss-sensitivity solve
 //! returns LFs against the network's implicit slack reference. We
 //! convert to distributed-load gauge by subtracting the load-weighted
 //! mean: `LF_distributed[i] = LF_raw[i] − Σ_j (load_share[j] · LF_raw[j])`.
@@ -36,7 +36,6 @@
 
 use std::collections::HashMap;
 
-use surge_dc::PtdfRows;
 use surge_network::Network;
 use tracing::warn;
 
@@ -75,9 +74,6 @@ pub(super) const DEFAULT_UPWARD_STEP_CAP: f64 = 0.10;
 ///   theta extraction and here so `dloss_dp[t][bus_idx]` indexes the
 ///   right buses.
 /// * `theta_by_hour` — `[t][bus_idx]` repaired DC PF angles (radians).
-/// * `loss_ptdf_by_hour` — per-period loss-PTDF rows, used as the
-///   sensitivity matrix for `compute_dc_loss_sensitivities`. Caller
-///   precomputes once per security iter.
 ///
 /// Output: `LossFactorWarmStart` with `dloss_dp` in distributed-load
 /// slack gauge and `total_losses_mw` in MW. NOT yet damped or capped —
@@ -86,12 +82,10 @@ pub(super) fn compute_realized_loss_factors(
     hourly_networks: &[Network],
     bus_maps: &[HashMap<u32, usize>],
     theta_by_hour: &[Vec<f64>],
-    loss_ptdf_by_hour: &[PtdfRows],
 ) -> LossFactorWarmStart {
     let n_hours = hourly_networks.len();
     debug_assert_eq!(bus_maps.len(), n_hours);
     debug_assert_eq!(theta_by_hour.len(), n_hours);
-    debug_assert_eq!(loss_ptdf_by_hour.len(), n_hours);
 
     let mut dloss_dp: Vec<Vec<f64>> = Vec::with_capacity(n_hours);
     let mut total_losses_mw: Vec<f64> = Vec::with_capacity(n_hours);
@@ -108,12 +102,19 @@ pub(super) fn compute_realized_loss_factors(
         }
 
         // Raw single-bus-slack LFs from the realized branch flows.
-        let lf_raw = surge_opf::advanced::compute_dc_loss_sensitivities(
-            net,
-            theta,
-            bus_map,
-            &loss_ptdf_by_hour[t],
-        );
+        let lf_raw = match surge_opf::advanced::compute_dc_loss_sensitivities_adjoint(
+            net, theta, bus_map,
+        ) {
+            Ok(lf_raw) => lf_raw,
+            Err(err) => {
+                warn!(
+                    period = t,
+                    %err,
+                    "PenaltyFactors: adjoint loss sensitivity failed; using zero loss factors for this period"
+                );
+                vec![0.0; n_bus]
+            }
+        };
 
         // Convert to distributed-load slack: subtract load-weighted
         // mean so Σ load_share · LF = 0. This makes the LFs gauge-
@@ -397,7 +398,7 @@ mod tests {
         // After distributed-load slack normalization, the load-share-
         // weighted average of LFs must be (close to) zero — that's the
         // gauge condition we're imposing.
-        use surge_dc::{PtdfRequest, compute_ptdf, solve_dc};
+        use surge_dc::solve_dc;
         use surge_network::Network;
         use surge_network::network::{Branch, Bus, BusType, Generator, Load};
 
@@ -415,14 +416,10 @@ mod tests {
 
         let bus_map = net.bus_index_map();
         let theta = solve_dc(&net).expect("DC PF").theta;
-        let monitored: Vec<usize> = (0..net.n_branches()).collect();
-        let ptdf = compute_ptdf(&net, &PtdfRequest::for_branches(&monitored)).expect("PTDF");
-
         let realized = compute_realized_loss_factors(
             std::slice::from_ref(&net),
             std::slice::from_ref(&bus_map),
             std::slice::from_ref(&theta),
-            std::slice::from_ref(&ptdf),
         );
 
         assert_eq!(realized.dloss_dp.len(), 1);

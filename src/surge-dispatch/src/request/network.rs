@@ -59,6 +59,19 @@ pub enum SecurityPreseedMethod {
     MaxLodfTopology,
 }
 
+/// Strategy for selecting iterative security cuts after each screening pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityCutStrategy {
+    /// Preserve the historical behavior: add up to
+    /// `max_cuts_per_iteration` worst violations every round.
+    Fixed,
+    /// Use large batches while the screen is violation-heavy, then switch
+    /// to a smaller last-mile batch once the remaining set is modest.
+    #[default]
+    Adaptive,
+}
+
 /// Optional N-1 security policy for DC time-coupled dispatch.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 #[serde(default)]
@@ -84,6 +97,28 @@ pub struct SecurityPolicy {
     pub preseed_count_per_period: usize,
     /// Ranking method used to pick the top-N pairs when pre-seeding.
     pub preseed_method: SecurityPreseedMethod,
+    /// Cut-selection strategy used by the iterative screener.
+    pub cut_strategy: SecurityCutStrategy,
+    /// Optional cap on active iterative cuts retained in the model. When
+    /// set, stale active cuts are retired first after a round adds new
+    /// cuts; retired pairs may be rediscovered by later screens if they
+    /// become violated again.
+    pub max_active_cuts: Option<usize>,
+    /// Optional activity-aging threshold. Active cuts whose slack and shadow
+    /// price remain near zero for this many solved rounds are retired even
+    /// before `max_active_cuts` is reached.
+    pub cut_retire_after_rounds: Option<usize>,
+    /// Violation-count threshold below which `Adaptive` switches to the
+    /// smaller targeted batch cap.
+    pub targeted_cut_threshold: usize,
+    /// Last-mile per-round cap used by `Adaptive` once the remaining
+    /// violation count is at or below `targeted_cut_threshold`.
+    pub targeted_cut_cap: usize,
+    /// Emit the final near-binding contingency report. This is an
+    /// informational diagnostic only; disabling it does not change the
+    /// security screen, added cuts, validation-relevant solution, or
+    /// aggregate security metadata.
+    pub near_binding_report: bool,
 }
 
 impl Default for SecurityPolicy {
@@ -97,6 +132,12 @@ impl Default for SecurityPolicy {
             hvdc_contingencies: Vec::new(),
             preseed_count_per_period: 0,
             preseed_method: SecurityPreseedMethod::None,
+            cut_strategy: SecurityCutStrategy::Fixed,
+            max_active_cuts: None,
+            cut_retire_after_rounds: None,
+            targeted_cut_threshold: 50_000,
+            targeted_cut_cap: 50_000,
+            near_binding_report: false,
         }
     }
 }
@@ -244,14 +285,14 @@ pub enum LossFactorWarmStartMode {
     /// network's losses are dominated by a roughly uniform background
     /// loss rate rather than strong per-bus asymmetries.
     Uniform { rate: f64 },
-    /// Seed `dloss` from the loss-PTDF applied to the per-bus load
-    /// vector, normalised so total weighted losses match `rate ×
-    /// total_load`. No DC PF invocation. Captures per-bus variation
-    /// from network topology + load pattern alone.
+    /// Seed `dloss` from a synthetic load-pattern DC PF plus sparse
+    /// adjoint loss sensitivities, normalised so total weighted losses
+    /// match `rate × total_load`. Captures per-bus variation from
+    /// network topology + load pattern without materialising loss PTDFs.
     LoadPattern { rate: f64 },
-    /// Seed from a DC power flow on each hourly network's initial-
-    /// condition dispatch. Most accurate cold-start; costs one DC PF
-    /// per period (sub-ms on 617-bus). Falls back to
+    /// Seed from a DC power flow on each hourly load pattern with
+    /// pmax-balanced generation. Most accurate cold-start; costs one DC
+    /// PF plus one adjoint solve per period. Falls back to
     /// `Uniform { rate: 0.02 }` if the DC PF fails.
     DcPf,
 }

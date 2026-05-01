@@ -487,11 +487,11 @@ class LossFactorWarmStartMode_Variant1(TypedDict):
     mode: Literal['uniform']
     rate: float
 class LossFactorWarmStartMode_Variant2(TypedDict):
-    """Seed `dloss` from the loss-PTDF applied to the per-bus load vector, normalised so total weighted losses match `rate × total_load`. No DC PF invocation. Captures per-bus variation from network topology + load pattern alone."""
+    """Seed `dloss` from a synthetic load-pattern DC PF plus sparse adjoint loss sensitivities, normalised so total weighted losses match `rate × total_load`. Captures per-bus variation from network topology + load pattern without materialising loss PTDFs."""
     mode: Literal['load_pattern']
     rate: float
 class LossFactorWarmStartMode_Variant3(TypedDict):
-    """Seed from a DC power flow on each hourly network's initial- condition dispatch. Most accurate cold-start; costs one DC PF per period (sub-ms on 617-bus). Falls back to `Uniform { rate: 0.02 }` if the DC PF fails."""
+    """Seed from a DC power flow on each hourly load pattern with pmax-balanced generation. Most accurate cold-start; costs one DC PF plus one adjoint solve per period. Falls back to `Uniform { rate: 0.02 }` if the DC PF fails."""
     mode: Literal['dc_pf']
 # Cold-start strategy for the SCUC loss-factor warm-start on the first security iteration.
 LossFactorWarmStartMode = Union[LossFactorWarmStartMode_Variant0, LossFactorWarmStartMode_Variant1, LossFactorWarmStartMode_Variant2, LossFactorWarmStartMode_Variant3]
@@ -559,6 +559,7 @@ class SecurityPolicy(TypedDict, total=False):
     hvdc_contingencies: list[HvdcLinkRef]
     preseed_count_per_period: int
     preseed_method: SecurityPreseedMethod
+    near_binding_report: bool
 
 
 class ThermalLimitPolicy(TypedDict, total=False):

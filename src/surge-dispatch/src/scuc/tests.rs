@@ -893,11 +893,21 @@ fn test_indexed_connectivity_cut_emits_sum_row_triplets() {
         /* n_block_vars_per_hour */ 0, /* n_reg_vars */ 0,
     );
     layout.finish_post_reserve(
-        /* reserve_var_count */ 0, /* n_blk_res_vars_per_hour */ 0,
-        /* n_foz_delta */ 0, /* n_foz_phi */ 0, /* n_foz_rho */ 0,
-        /* n_ph_mode_vars_per_hour */ 0, /* n_bus */ 3, /* n_pb_curt_segs */ 0,
-        /* n_pb_excess_segs */ 0, /* n_branch_flow */ 0, /* n_fg_rows */ 0,
-        /* n_iface_rows */ 0, /* n_gen */ 0, /* n_angle_diff_rows */ 0,
+        /* reserve_var_count */ 0,
+        /* n_blk_res_vars_per_hour */ 0,
+        /* n_foz_delta */ 0,
+        /* n_foz_phi */ 0,
+        /* n_foz_rho */ 0,
+        /* n_ph_mode_vars_per_hour */ 0,
+        /* n_bus */ 3,
+        /* n_pb_curt_segs */ 0,
+        /* n_pb_excess_segs */ 0,
+        /* n_branch_flow */ 0,
+        Vec::new(),
+        Vec::new(),
+        /* n_iface_rows */ 0,
+        /* n_gen */ 0,
+        /* n_angle_diff_rows */ 0,
         /* n_branch_switching_binaries_per_hour */ 3,
         /* n_branch_switching_flow_per_hour */ 3,
     );
@@ -918,6 +928,60 @@ fn test_indexed_connectivity_cut_emits_sum_row_triplets() {
     let cols: Vec<usize> = triplets.iter().map(|t| t.col).collect();
     assert!(cols.contains(&layout.branch_commitment_col(1, 0)));
     assert!(cols.contains(&layout.branch_commitment_col(1, 2)));
+}
+
+#[test]
+fn test_scuc_flowgate_layout_allocates_one_sided_slacks_compactly() {
+    let mut layout = super::layout::ScucLayout::build_prefix(
+        /* n_bus */ 3, /* n_gen */ 0, /* n_delta_per_hour */ 0,
+        /* use_plc */ false, /* n_bp */ 0, /* n_storage */ 0,
+        /* n_sto_dis_epi */ 0, /* n_sto_ch_epi */ 0, /* n_hvdc_vars */ 0,
+        /* n_pwl_gen */ 0, /* n_dl */ 0, /* n_vbid */ 0,
+        /* n_block_vars_per_hour */ 0, /* n_reg_vars */ 0,
+    );
+    layout.finish_post_reserve(
+        /* reserve_var_count */ 0,
+        /* n_blk_res_vars_per_hour */ 0,
+        /* n_foz_delta */ 0,
+        /* n_foz_phi */ 0,
+        /* n_foz_rho */ 0,
+        /* n_ph_mode_vars_per_hour */ 0,
+        /* n_bus */ 3,
+        /* n_pb_curt_segs */ 0,
+        /* n_pb_excess_segs */ 0,
+        /* n_branch_flow */ 0,
+        vec![Some(0), None, Some(1)],
+        vec![None, Some(0), Some(1)],
+        /* n_iface_rows */ 0,
+        /* n_gen */ 0,
+        /* n_angle_diff_rows */ 0,
+        /* n_branch_switching_binaries_per_hour */ 0,
+        /* n_branch_switching_flow_per_hour */ 0,
+    );
+
+    assert_eq!(layout.flowgate_upper_slack - layout.flowgate_lower_slack, 2);
+    assert_eq!(
+        layout.interface_lower_slack - layout.flowgate_upper_slack,
+        2
+    );
+    assert_eq!(
+        layout.flowgate_lower_slack_col_opt(0, 0),
+        Some(layout.flowgate_lower_slack)
+    );
+    assert_eq!(layout.flowgate_lower_slack_col_opt(0, 1), None);
+    assert_eq!(
+        layout.flowgate_lower_slack_col_opt(0, 2),
+        Some(layout.flowgate_lower_slack + 1)
+    );
+    assert_eq!(layout.flowgate_upper_slack_col_opt(0, 0), None);
+    assert_eq!(
+        layout.flowgate_upper_slack_col_opt(0, 1),
+        Some(layout.flowgate_upper_slack)
+    );
+    assert_eq!(
+        layout.flowgate_upper_slack_col_opt(0, 2),
+        Some(layout.flowgate_upper_slack + 1)
+    );
 }
 
 /// The spec carries `branch_switching_big_m_factor` with a default of

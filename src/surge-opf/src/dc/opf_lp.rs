@@ -89,7 +89,6 @@ struct DcOpfModelBuild {
     active_vbids: Vec<usize>,
     island_refs: IslandRefs,
     pbusinj: Vec<f64>,
-    loss_ptdf: Option<surge_dc::PtdfRows>,
 }
 
 struct DcOpfExecution {
@@ -173,28 +172,7 @@ fn execute_dc_opf_model(
     map_lp_status(sol.status.clone())?;
 
     if options.use_loss_factors {
-        use super::loss_factors::{compute_dc_loss_sensitivities, compute_total_dc_losses};
-        if model.loss_ptdf.is_none() {
-            let monitored_branches: Vec<usize> = network
-                .branches
-                .iter()
-                .enumerate()
-                .filter(|(_, branch)| branch.in_service && branch.x.abs() >= 1e-20)
-                .map(|(idx, _)| idx)
-                .collect();
-            model.loss_ptdf = Some(
-                surge_dc::compute_ptdf(
-                    network,
-                    &surge_dc::PtdfRequest::for_branches(&monitored_branches),
-                )
-                .map_err(|e| DcOpfError::SolverError(format!("loss-factor PTDF failed: {e}")))?,
-            );
-        }
-        let loss_ptdf = model
-            .loss_ptdf
-            .as_ref()
-            .expect("loss-factor PTDF initialized above");
-
+        use super::loss_factors::{compute_dc_loss_sensitivities_adjoint, compute_total_dc_losses};
         let bus_pd_mw = network.bus_load_p_mw();
         let gen_csc_positions: Vec<usize> = (0..model.n_gen)
             .map(|j| {
@@ -216,7 +194,10 @@ fn execute_dc_opf_model(
 
         for loss_iter in 0..options.max_loss_iter {
             let theta = &sol.x[model.theta_offset..model.theta_offset + model.n_bus];
-            let dloss_dp = compute_dc_loss_sensitivities(network, theta, bus_map, loss_ptdf);
+            let dloss_dp =
+                compute_dc_loss_sensitivities_adjoint(network, theta, bus_map).map_err(|e| {
+                    DcOpfError::SolverError(format!("loss-factor adjoint solve failed: {e}"))
+                })?;
 
             if loss_iter > 0 {
                 let max_change = dloss_dp
@@ -274,7 +255,7 @@ fn decode_dc_opf_result(
     model: DcOpfModelBuild,
     execution: DcOpfExecution,
     solve_time: f64,
-) -> DcOpfResult {
+) -> Result<DcOpfResult, DcOpfError> {
     let DcOpfExecution {
         solution: sol,
         solver_name,
@@ -325,16 +306,11 @@ fn decode_dc_opf_result(
         .collect();
 
     let (lmp_energy, lmp_congestion, lmp_loss) = if options.use_loss_factors {
-        use super::loss_factors::compute_dc_loss_sensitivities;
-        let dloss_dp = compute_dc_loss_sensitivities(
-            network,
-            theta_vals,
-            bus_map,
-            model
-                .loss_ptdf
-                .as_ref()
-                .expect("loss-factor PTDF should be available when use_loss_factors=true"),
-        );
+        use super::loss_factors::compute_dc_loss_sensitivities_adjoint;
+        let dloss_dp = compute_dc_loss_sensitivities_adjoint(network, theta_vals, bus_map)
+            .map_err(|e| {
+                DcOpfError::SolverError(format!("loss-factor adjoint solve failed: {e}"))
+            })?;
         super::island_lmp::decompose_lmp_with_losses(&lmp, &dloss_dp, &model.island_refs)
     } else {
         super::island_lmp::decompose_lmp_lossless(&lmp, &model.island_refs)
@@ -645,13 +621,13 @@ fn decode_dc_opf_result(
         angle_diff_slack_low_rad: vec![],
     };
 
-    DcOpfResult {
+    Ok(DcOpfResult {
         opf,
         hvdc_dispatch_mw,
         hvdc_shadow_prices,
         gen_limit_violations,
         is_feasible,
-    }
+    })
 }
 
 /// Solve DC-OPF using the sparse B-theta formulation.
@@ -1553,13 +1529,10 @@ pub fn solve_dc_opf_lp_with_runtime(
         active_vbids,
         island_refs,
         pbusinj,
-        loss_ptdf: None,
     };
     let execution = execute_dc_opf_model(network, options, &runtime, &mut model)?;
     let solve_time = start.elapsed().as_secs_f64();
-    Ok(decode_dc_opf_result(
-        network, options, &ctx, model, execution, solve_time,
-    ))
+    decode_dc_opf_result(network, options, &ctx, model, execution, solve_time)
 }
 
 #[cfg(test)]

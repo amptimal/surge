@@ -34,6 +34,8 @@ pub(super) struct ScucLayout {
     pub branch_upper_slack: usize,
     pub flowgate_lower_slack: usize,
     pub flowgate_upper_slack: usize,
+    pub flowgate_lower_slack_local: Vec<Option<usize>>,
+    pub flowgate_upper_slack_local: Vec<Option<usize>>,
     pub interface_lower_slack: usize,
     pub interface_upper_slack: usize,
     pub headroom_slack: usize,
@@ -150,6 +152,8 @@ impl ScucLayout {
             branch_upper_slack: 0,
             flowgate_lower_slack: 0,
             flowgate_upper_slack: 0,
+            flowgate_lower_slack_local: Vec::new(),
+            flowgate_upper_slack_local: Vec::new(),
             interface_lower_slack: 0,
             interface_upper_slack: 0,
             headroom_slack: 0,
@@ -180,7 +184,8 @@ impl ScucLayout {
         n_pb_curt_segs: usize,
         n_pb_excess_segs: usize,
         n_branch_flow: usize,
-        n_fg_rows: usize,
+        flowgate_lower_slack_local: Vec<Option<usize>>,
+        flowgate_upper_slack_local: Vec<Option<usize>>,
         n_iface_rows: usize,
         n_gen: usize,
         n_angle_diff_rows_arg: usize,
@@ -199,8 +204,18 @@ impl ScucLayout {
         self.branch_lower_slack = self.pb_excess_seg + n_pb_excess_segs;
         self.branch_upper_slack = self.branch_lower_slack + n_branch_flow;
         self.flowgate_lower_slack = self.branch_upper_slack + n_branch_flow;
-        self.flowgate_upper_slack = self.flowgate_lower_slack + n_fg_rows;
-        self.interface_lower_slack = self.flowgate_upper_slack + n_fg_rows;
+        let n_flowgate_lower_slacks = flowgate_lower_slack_local
+            .iter()
+            .filter(|entry| entry.is_some())
+            .count();
+        let n_flowgate_upper_slacks = flowgate_upper_slack_local
+            .iter()
+            .filter(|entry| entry.is_some())
+            .count();
+        self.flowgate_upper_slack = self.flowgate_lower_slack + n_flowgate_lower_slacks;
+        self.interface_lower_slack = self.flowgate_upper_slack + n_flowgate_upper_slacks;
+        self.flowgate_lower_slack_local = flowgate_lower_slack_local;
+        self.flowgate_upper_slack_local = flowgate_upper_slack_local;
         self.interface_upper_slack = self.interface_lower_slack + n_iface_rows;
         self.headroom_slack = self.interface_upper_slack + n_iface_rows;
         self.footroom_slack = self.headroom_slack + n_gen;
@@ -415,12 +430,30 @@ impl ScucLayout {
         self.col(hour, self.branch_upper_slack + row_idx)
     }
 
+    pub fn flowgate_lower_slack_col_opt(&self, hour: usize, row_idx: usize) -> Option<usize> {
+        self.flowgate_lower_slack_local
+            .get(row_idx)
+            .copied()
+            .flatten()
+            .map(|local| self.col(hour, self.flowgate_lower_slack + local))
+    }
+
+    pub fn flowgate_upper_slack_col_opt(&self, hour: usize, row_idx: usize) -> Option<usize> {
+        self.flowgate_upper_slack_local
+            .get(row_idx)
+            .copied()
+            .flatten()
+            .map(|local| self.col(hour, self.flowgate_upper_slack + local))
+    }
+
     pub fn flowgate_lower_slack_col(&self, hour: usize, row_idx: usize) -> usize {
-        self.col(hour, self.flowgate_lower_slack + row_idx)
+        self.flowgate_lower_slack_col_opt(hour, row_idx)
+            .expect("flowgate lower slack column not allocated for this row")
     }
 
     pub fn flowgate_upper_slack_col(&self, hour: usize, row_idx: usize) -> usize {
-        self.col(hour, self.flowgate_upper_slack + row_idx)
+        self.flowgate_upper_slack_col_opt(hour, row_idx)
+            .expect("flowgate upper slack column not allocated for this row")
     }
 
     pub fn interface_lower_slack_col(&self, hour: usize, row_idx: usize) -> usize {
@@ -591,7 +624,7 @@ pub(super) struct ScucLayoutPlanInput<'a> {
     pub is_block_mode: bool,
     pub has_per_block_reserves: bool,
     pub n_branch_flow: usize,
-    pub n_fg_rows: usize,
+    pub fg_rows: Vec<usize>,
     pub n_iface_rows: usize,
     pub n_angle_diff_rows: usize,
 }
@@ -621,7 +654,7 @@ pub(super) fn build_layout_plan<'a>(input: ScucLayoutPlanInput<'a>) -> ScucLayou
         is_block_mode,
         has_per_block_reserves,
         n_branch_flow,
-        n_fg_rows,
+        fg_rows,
         n_iface_rows,
         n_angle_diff_rows: _,
     } = input;
@@ -898,6 +931,25 @@ pub(super) fn build_layout_plan<'a>(input: ScucLayoutPlanInput<'a>) -> ScucLayou
         } else {
             (0, 0)
         };
+    let mut flowgate_lower_slack_local = Vec::with_capacity(fg_rows.len());
+    let mut flowgate_upper_slack_local = Vec::with_capacity(fg_rows.len());
+    let mut next_lower = 0usize;
+    let mut next_upper = 0usize;
+    for &fg_idx in &fg_rows {
+        let breach_sides = &network.flowgates[fg_idx].breach_sides;
+        if breach_sides.allocates_lower_slack() {
+            flowgate_lower_slack_local.push(Some(next_lower));
+            next_lower += 1;
+        } else {
+            flowgate_lower_slack_local.push(None);
+        }
+        if breach_sides.allocates_upper_slack() {
+            flowgate_upper_slack_local.push(Some(next_upper));
+            next_upper += 1;
+        } else {
+            flowgate_upper_slack_local.push(None);
+        }
+    }
     layout.finish_post_reserve(
         reserve_layout.n_reserve_vars,
         n_blk_res_vars_per_hour,
@@ -909,7 +961,8 @@ pub(super) fn build_layout_plan<'a>(input: ScucLayoutPlanInput<'a>) -> ScucLayou
         n_pb_curt_segs,
         n_pb_excess_segs,
         n_branch_flow,
-        n_fg_rows,
+        flowgate_lower_slack_local,
+        flowgate_upper_slack_local,
         n_iface_rows,
         n_gen,
         input.n_angle_diff_rows,

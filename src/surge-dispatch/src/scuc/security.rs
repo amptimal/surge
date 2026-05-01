@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: LicenseRef-PolyForm-Noncommercial-1.0.0
 //! Security-constrained SCUC via iterative N-1 constraint generation.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use surge_network::Network;
-use surge_network::network::BranchRatingCondition;
+use surge_network::network::{BranchRatingCondition, Flowgate};
 use tracing::{debug, info, warn};
 
 use super::solve::{
@@ -19,7 +20,7 @@ use crate::common::spec::{
 };
 use crate::dispatch::{CommitmentMode, RawDispatchSolution};
 use crate::error::ScedError;
-use crate::request::SecurityPreseedMethod;
+use crate::request::{SecurityCutStrategy, SecurityPreseedMethod};
 use crate::result::{SecurityDispatchMetadata, SecurityIterationReport, SecuritySetupTimings};
 
 /// An HVDC security cut constraining a monitored branch flow under an HVDC link trip.
@@ -57,6 +58,327 @@ struct BranchSecurityViolation {
     /// See
     /// [`crate::common::security::BranchSecurityViolation::breach_upper`].
     breach_upper: bool,
+}
+
+#[derive(Debug)]
+struct BranchViolationScreen {
+    violations: Vec<BranchSecurityViolation>,
+    n_violations: usize,
+    max_violation_pu: Option<f64>,
+}
+
+#[derive(Debug)]
+struct BoundedBranchViolationSet {
+    cap: usize,
+    violations: Vec<BranchSecurityViolation>,
+    n_violations: usize,
+    max_violation_pu: Option<f64>,
+}
+
+impl BoundedBranchViolationSet {
+    fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            violations: Vec::with_capacity(cap.min(1024)),
+            n_violations: 0,
+            max_violation_pu: None,
+        }
+    }
+
+    fn push(&mut self, violation: BranchSecurityViolation) {
+        self.n_violations += 1;
+        self.max_violation_pu = Some(self.max_violation_pu.map_or(violation.severity_pu, |prev| {
+            prev.max(violation.severity_pu)
+        }));
+        if self.cap == 0 {
+            return;
+        }
+        self.violations.push(violation);
+        let prune_len = self.cap.saturating_mul(2).max(self.cap.saturating_add(1));
+        if self.violations.len() >= prune_len {
+            self.prune_to_cap();
+        }
+    }
+
+    fn merge(&mut self, mut other: Self) {
+        self.n_violations += other.n_violations;
+        self.max_violation_pu = match (self.max_violation_pu, other.max_violation_pu) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        if self.cap == 0 {
+            return;
+        }
+        self.violations.append(&mut other.violations);
+        self.prune_to_cap();
+    }
+
+    fn finish(mut self) -> BranchViolationScreen {
+        self.prune_to_cap();
+        self.violations
+            .sort_by(compare_branch_violation_severity_desc);
+        BranchViolationScreen {
+            violations: self.violations,
+            n_violations: self.n_violations,
+            max_violation_pu: self.max_violation_pu,
+        }
+    }
+
+    fn prune_to_cap(&mut self) {
+        if self.cap == 0 {
+            self.violations.clear();
+            return;
+        }
+        if self.violations.len() <= self.cap {
+            return;
+        }
+        self.violations
+            .select_nth_unstable_by(self.cap, compare_branch_violation_severity_desc);
+        self.violations.truncate(self.cap);
+    }
+}
+
+fn compare_branch_violation_severity_desc(
+    a: &BranchSecurityViolation,
+    b: &BranchSecurityViolation,
+) -> Ordering {
+    b.severity_pu
+        .partial_cmp(&a.severity_pu)
+        .unwrap_or(Ordering::Equal)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SecurityCutKey {
+    Branch {
+        period: usize,
+        contingency_branch_idx: usize,
+        monitored_branch_idx: usize,
+    },
+    Hvdc {
+        period: usize,
+        hvdc_link_idx: usize,
+        monitored_branch_idx: usize,
+    },
+}
+
+impl SecurityCutKey {
+    fn period(self) -> usize {
+        match self {
+            SecurityCutKey::Branch { period, .. } | SecurityCutKey::Hvdc { period, .. } => period,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ActiveSecurityCut {
+    key: SecurityCutKey,
+    flowgate: Flowgate,
+    stale_rounds: usize,
+    last_shadow_price_abs: f64,
+    last_slack_mw: f64,
+}
+
+#[derive(Debug, Default)]
+struct SecurityCutPool {
+    active: VecDeque<ActiveSecurityCut>,
+    retired_cuts: usize,
+}
+
+impl SecurityCutPool {
+    fn active_len(&self) -> usize {
+        self.active.len()
+    }
+
+    fn push(&mut self, key: SecurityCutKey, flowgate: Flowgate) {
+        self.active.push_back(ActiveSecurityCut {
+            key,
+            flowgate,
+            stale_rounds: 0,
+            last_shadow_price_abs: 0.0,
+            last_slack_mw: 0.0,
+        });
+    }
+
+    fn extend_network(&self, network: &mut Network) {
+        network
+            .flowgates
+            .extend(self.active.iter().map(|cut| cut.flowgate.clone()));
+    }
+
+    fn active_flowgates(&self) -> Vec<Flowgate> {
+        self.active.iter().map(|cut| cut.flowgate.clone()).collect()
+    }
+
+    fn refresh_activity(&mut self, sol: &RawDispatchSolution, base_flowgate_count: usize) {
+        const SHADOW_ACTIVE_TOL: f64 = 1e-7;
+        const SLACK_ACTIVE_TOL_MW: f64 = 1e-4;
+
+        let mut positive_slack_flowgates: Vec<HashSet<&str>> =
+            Vec::with_capacity(sol.periods.len());
+        for period in &sol.periods {
+            let mut positive = HashSet::new();
+            for constraint in &period.constraint_results {
+                if constraint.slack_mw.unwrap_or(0.0) <= SLACK_ACTIVE_TOL_MW {
+                    continue;
+                }
+                let Some(name) =
+                    constraint
+                        .constraint_id
+                        .strip_prefix("flowgate:")
+                        .and_then(|rest| {
+                            rest.strip_suffix(":reverse")
+                                .or_else(|| rest.strip_suffix(":forward"))
+                        })
+                else {
+                    continue;
+                };
+                positive.insert(name);
+            }
+            positive_slack_flowgates.push(positive);
+        }
+
+        for (active_idx, cut) in self.active.iter_mut().enumerate() {
+            let period = cut.key.period();
+            let shadow_abs = sol
+                .periods
+                .get(period)
+                .and_then(|period_result| {
+                    period_result
+                        .flowgate_shadow_prices
+                        .get(base_flowgate_count + active_idx)
+                })
+                .copied()
+                .unwrap_or(0.0)
+                .abs();
+            let has_positive_slack = positive_slack_flowgates
+                .get(period)
+                .is_some_and(|names| names.contains(cut.flowgate.name.as_str()));
+            cut.last_shadow_price_abs = shadow_abs;
+            cut.last_slack_mw = if has_positive_slack {
+                SLACK_ACTIVE_TOL_MW
+            } else {
+                0.0
+            };
+            if shadow_abs > SHADOW_ACTIVE_TOL || has_positive_slack {
+                cut.stale_rounds = 0;
+            } else {
+                cut.stale_rounds = cut.stale_rounds.saturating_add(1);
+            }
+        }
+    }
+
+    fn remove_pair_for_key(
+        key: SecurityCutKey,
+        constrained_pairs: &mut HashSet<(usize, usize, usize)>,
+        hvdc_constrained_pairs: &mut HashSet<(usize, usize, usize)>,
+    ) {
+        match key {
+            SecurityCutKey::Branch {
+                period,
+                contingency_branch_idx,
+                monitored_branch_idx,
+            } => {
+                constrained_pairs.remove(&(period, contingency_branch_idx, monitored_branch_idx));
+            }
+            SecurityCutKey::Hvdc {
+                period,
+                hvdc_link_idx,
+                monitored_branch_idx,
+            } => {
+                hvdc_constrained_pairs.remove(&(period, hvdc_link_idx, monitored_branch_idx));
+            }
+        }
+    }
+
+    fn retire_marked(
+        &mut self,
+        retire_indices: &HashSet<usize>,
+        constrained_pairs: &mut HashSet<(usize, usize, usize)>,
+        hvdc_constrained_pairs: &mut HashSet<(usize, usize, usize)>,
+    ) -> usize {
+        if retire_indices.is_empty() {
+            return 0;
+        }
+
+        let mut retained = VecDeque::with_capacity(self.active.len() - retire_indices.len());
+        let mut retired_this_round = 0usize;
+        for (idx, cut) in self.active.drain(..).enumerate() {
+            if retire_indices.contains(&idx) {
+                Self::remove_pair_for_key(cut.key, constrained_pairs, hvdc_constrained_pairs);
+                retired_this_round += 1;
+            } else {
+                retained.push_back(cut);
+            }
+        }
+        self.active = retained;
+        self.retired_cuts += retired_this_round;
+        retired_this_round
+    }
+
+    fn retire_inactive_and_enforce_cap(
+        &mut self,
+        max_active_cuts: Option<usize>,
+        cut_retire_after_rounds: Option<usize>,
+        constrained_pairs: &mut HashSet<(usize, usize, usize)>,
+        hvdc_constrained_pairs: &mut HashSet<(usize, usize, usize)>,
+    ) -> usize {
+        let mut retire_indices = HashSet::new();
+
+        if let Some(rounds) = cut_retire_after_rounds.filter(|rounds| *rounds > 0) {
+            for (idx, cut) in self.active.iter().enumerate() {
+                if cut.stale_rounds >= rounds {
+                    retire_indices.insert(idx);
+                }
+            }
+        }
+
+        if let Some(max_active_cuts) = max_active_cuts {
+            let remaining_after_age = self.active.len().saturating_sub(retire_indices.len());
+            if remaining_after_age > max_active_cuts {
+                let excess = remaining_after_age - max_active_cuts;
+                let mut ranked: Vec<(usize, usize)> = self
+                    .active
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, _)| !retire_indices.contains(idx))
+                    .map(|(idx, cut)| (idx, cut.stale_rounds))
+                    .collect();
+                ranked.sort_by(|a, b| {
+                    b.1.cmp(&a.1)
+                        // On equal staleness, retire older cuts first.
+                        .then_with(|| a.0.cmp(&b.0))
+                });
+                for (idx, _) in ranked.into_iter().take(excess) {
+                    retire_indices.insert(idx);
+                }
+            }
+        }
+
+        self.retire_marked(&retire_indices, constrained_pairs, hvdc_constrained_pairs)
+    }
+}
+
+fn effective_new_cut_cap(
+    options: &SecurityDispatchSpec,
+    n_branch_violations: usize,
+    n_hvdc_violations: usize,
+) -> usize {
+    let max_cap = options.max_cuts_per_iteration;
+    if max_cap == 0 {
+        return 0;
+    }
+    let remaining = n_branch_violations.saturating_add(n_hvdc_violations);
+    match options.cut_strategy {
+        SecurityCutStrategy::Fixed => max_cap,
+        SecurityCutStrategy::Adaptive
+            if remaining <= options.targeted_cut_threshold && options.targeted_cut_cap > 0 =>
+        {
+            max_cap.min(options.targeted_cut_cap)
+        }
+        SecurityCutStrategy::Adaptive => max_cap,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +430,93 @@ struct HourlySecurityContext {
 }
 
 const MAX_CONNECTIVITY_CUT_ROUNDS: usize = 3;
+
+fn max_dense_ptdf_cache_bytes() -> Option<usize> {
+    for var in [
+        "SURGE_SCUC_MAX_DENSE_PTDF_CACHE_BYTES",
+        "SURGE_SCUC_MAX_LOSS_PTDF_CACHE_BYTES",
+    ] {
+        if let Ok(value) = std::env::var(var)
+            && let Ok(bytes) = value.trim().parse::<usize>()
+            && bytes > 0
+        {
+            return Some(bytes);
+        }
+    }
+    for var in [
+        "SURGE_SCUC_MAX_DENSE_PTDF_CACHE_GIB",
+        "SURGE_SCUC_MAX_LOSS_PTDF_CACHE_GIB",
+    ] {
+        if let Ok(value) = std::env::var(var)
+            && let Ok(gib) = value.trim().parse::<f64>()
+            && gib.is_finite()
+            && gib > 0.0
+        {
+            return Some((gib * 1024.0 * 1024.0 * 1024.0) as usize);
+        }
+    }
+    None
+}
+
+fn estimate_dense_ptdf_bytes(hourly_networks: &[Network]) -> usize {
+    let n_values: u128 = hourly_networks
+        .iter()
+        .map(|network| network.n_branches() as u128 * network.n_buses() as u128)
+        .sum();
+    n_values
+        .saturating_mul(std::mem::size_of::<f64>() as u128)
+        .min(usize::MAX as u128) as usize
+}
+
+fn gib(bytes: usize) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+fn security_context_ptdf_fits_budget(hourly_networks: &[Network]) -> bool {
+    let Some(limit) = max_dense_ptdf_cache_bytes() else {
+        return true;
+    };
+    let estimate = estimate_dense_ptdf_bytes(hourly_networks);
+    if estimate <= limit {
+        return true;
+    }
+    warn!(
+        estimated_gib = gib(estimate),
+        limit_gib = gib(limit),
+        n_periods = hourly_networks.len(),
+        "SCUC security-context PTDF cache exceeds memory budget"
+    );
+    false
+}
+
+fn build_hourly_security_contexts(
+    hourly_networks: &[Network],
+    options: &SecurityDispatchSpec,
+    min_rate: f64,
+) -> Result<(Vec<HourlySecurityContext>, f64), ScedError> {
+    if !security_context_ptdf_fits_budget(hourly_networks) {
+        let limit = max_dense_ptdf_cache_bytes().expect("budget checked above");
+        return Err(ScedError::SolverError(format!(
+            "SCUC security screening requires an estimated {:.1} GiB dense PTDF cache, above the {:.1} GiB budget. Increase SURGE_SCUC_MAX_DENSE_PTDF_CACHE_GIB or reduce security screening scope.",
+            gib(estimate_dense_ptdf_bytes(hourly_networks)),
+            gib(limit)
+        )));
+    }
+    let start = std::time::Instant::now();
+    let contexts: Vec<HourlySecurityContext> = hourly_networks
+        .iter()
+        .map(|hourly_network| build_hourly_security_context(hourly_network, options, min_rate))
+        .collect::<Result<_, _>>()?;
+    let secs = start.elapsed().as_secs_f64();
+    info!(
+        stage = "security_setup",
+        hourly_contexts_secs = secs,
+        n_periods = hourly_networks.len(),
+        n_contingency_branches = options.contingency_branches.len(),
+        "Security SCUC setup: hourly contingency contexts built"
+    );
+    Ok((contexts, secs))
+}
 
 /// Per-unit magnitude cutoff below which a `(contingency, monitored
 /// branch)` LODF pair is not emitted as a contingency cut in the
@@ -246,16 +655,16 @@ pub(crate) fn solve_security_dispatch(
     network: &Network,
     options: &SecurityDispatchSpec,
 ) -> Result<RawDispatchSolution, ScedError> {
-    use surge_network::network::Flowgate;
-
     let base = network.base_mva;
     let scuc_spec = DispatchProblemSpec::from_request(&options.input, &options.commitment);
     let n_bus = network.n_buses();
     let n_periods = options.input.n_periods;
     let min_rate = options.input.min_rate_a;
 
-    // Accumulated flowgates from security screening
-    let mut security_flowgates: Vec<Flowgate> = Vec::new();
+    // Active flowgates from iterative security screening. The pool owns
+    // retention/retirement so the MIP model does not grow without bound on
+    // very large cases.
+    let mut security_cut_pool = SecurityCutPool::default();
 
     let mut last_solution: Option<RawDispatchSolution> = None;
     let mut total_cuts = 0usize;
@@ -263,6 +672,7 @@ pub(crate) fn solve_security_dispatch(
     let mut last_hvdc_violations = 0usize;
     let mut last_max_branch_violation_pu: Option<f64> = None;
     let mut last_max_hvdc_violation_pu: Option<f64> = None;
+    let mut last_solved_security_flowgates: Vec<Flowgate> = Vec::new();
 
     if options.max_iterations == 0 {
         let sol = solve_scuc_with_problem_spec(network, scuc_spec)?;
@@ -271,6 +681,8 @@ pub(crate) fn solve_security_dispatch(
             SecurityDispatchMetadata {
                 iterations: 0,
                 n_cuts: 0,
+                active_cuts: 0,
+                retired_cuts: 0,
                 converged: true,
                 last_branch_violations: 0,
                 last_hvdc_violations: 0,
@@ -290,20 +702,11 @@ pub(crate) fn solve_security_dispatch(
         .map(|hour| super::snapshot::network_at_hour_with_spec(network, &scuc_spec, hour))
         .collect();
     let hourly_networks_secs = _t_hourly_nets.elapsed().as_secs_f64();
-
-    let _t_hourly_ctx = std::time::Instant::now();
-    let hourly_contexts: Vec<HourlySecurityContext> = hourly_networks
-        .iter()
-        .map(|hourly_network| build_hourly_security_context(hourly_network, options, min_rate))
-        .collect::<Result<_, _>>()?;
-    let hourly_contexts_secs = _t_hourly_ctx.elapsed().as_secs_f64();
+    let mut hourly_contexts: Option<Vec<HourlySecurityContext>> = None;
+    let mut hourly_contexts_secs = 0.0_f64;
     info!(
         stage = "security_setup",
-        hourly_networks_secs,
-        hourly_contexts_secs,
-        n_periods,
-        n_contingency_branches = options.contingency_branches.len(),
-        "Security SCUC setup: hourly network snapshots + contingency contexts built"
+        hourly_networks_secs, n_periods, "Security SCUC setup: hourly network snapshots built"
     );
 
     let mut constrained_pairs: HashSet<(usize, usize, usize)> = HashSet::new();
@@ -336,15 +739,26 @@ pub(crate) fn solve_security_dispatch(
         && !matches!(options.preseed_method, SecurityPreseedMethod::None)
     {
         let preseed_start = std::time::Instant::now();
+        if hourly_contexts.is_none() {
+            let (contexts, secs) =
+                build_hourly_security_contexts(&hourly_networks, options, min_rate)?;
+            hourly_contexts_secs += secs;
+            hourly_contexts = Some(contexts);
+        }
+        let contexts = hourly_contexts
+            .as_ref()
+            .expect("hourly contexts built for security preseed");
         let preseeded = preseed_branch_flowgates(
             options,
             &hourly_networks,
-            &hourly_contexts,
+            contexts,
             n_periods,
             &mut constrained_pairs,
         );
         let n = preseeded.len();
-        security_flowgates.extend(preseeded);
+        for (key, flowgate) in preseeded {
+            security_cut_pool.push(key, flowgate);
+        }
         total_cuts += n;
         preseed_secs_total = preseed_start.elapsed().as_secs_f64();
         info!(
@@ -383,6 +797,17 @@ pub(crate) fn solve_security_dispatch(
     // 617-bus D2) because the lossless-MIP dispatch already matches
     // the warm-started optimum.
     let mut cached_loss_warm_start: Option<crate::scuc::losses::LossFactorWarmStart> = None;
+    // Whether `cached_loss_warm_start` reflects realized LFs from a
+    // prior iteration's repaired theta (true) or only the cold-start
+    // warm start / nothing (false). Set true after the first LF
+    // update block runs successfully. Used to suppress the normal
+    // "no violations on iter 0 → exit" early return until at least
+    // one SCUC solve has actually consumed realized LFs — without
+    // this, ScalarFeedback / PenaltyFactors silently no-op on
+    // scenarios with a clean contingency profile because they only
+    // refresh between iterations and the security loop exits before
+    // any feedback can land.
+    let mut cached_lfs_are_realized = false;
 
     // Cold-start loss-factor warm start for iter 0. Only runs when
     // loss factors are enabled AND the policy opts in via
@@ -427,7 +852,7 @@ pub(crate) fn solve_security_dispatch(
         }
     }
 
-    let setup_timings = SecuritySetupTimings {
+    let mut setup_timings = SecuritySetupTimings {
         hourly_networks_secs,
         hourly_contexts_secs,
         preseed_secs: preseed_secs_total,
@@ -441,9 +866,8 @@ pub(crate) fn solve_security_dispatch(
     //
     // For both `ScalarFeedback` and `PenaltyFactors` modes we need
     // realized total losses per period (cheap from repaired theta).
-    // `PenaltyFactors` additionally needs per-bus loss factors, which
-    // requires a per-period loss-PTDF (one expensive build, reused
-    // across security iterations).
+    // `PenaltyFactors` additionally computes per-bus loss factors via
+    // sparse adjoint solves, avoiding the old dense loss-PTDF cache.
     let sys_row_mode = scuc_spec.scuc_disable_bus_power_balance
         && scuc_spec.use_loss_factors
         && !matches!(
@@ -455,36 +879,6 @@ pub(crate) fn solve_security_dispatch(
             scuc_spec.scuc_loss_treatment,
             crate::request::network::ScucLossTreatment::PenaltyFactors,
         );
-    let pf_loss_ptdf_by_hour: Option<Vec<surge_dc::PtdfRows>> = if need_pf_lfs {
-        let _t = std::time::Instant::now();
-        let built: Result<Vec<_>, _> = hourly_networks
-            .iter()
-            .map(|net_t| {
-                let monitored: Vec<usize> = (0..net_t.n_branches()).collect();
-                surge_dc::compute_ptdf(net_t, &surge_dc::PtdfRequest::for_branches(&monitored))
-            })
-            .collect();
-        match built {
-            Ok(v) => {
-                info!(
-                    stage = "pf_loss_ptdf_build",
-                    secs = _t.elapsed().as_secs_f64(),
-                    n_periods = v.len(),
-                    "PenaltyFactors: per-period loss PTDF cached for security iterations"
-                );
-                Some(v)
-            }
-            Err(err) => {
-                warn!(
-                    %err,
-                    "PenaltyFactors: loss PTDF build failed; falling back to ScalarFeedback semantics for this run"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
     let pf_bus_maps_by_hour: Vec<HashMap<u32, usize>> = if sys_row_mode {
         hourly_networks.iter().map(|n| n.bus_index_map()).collect()
     } else {
@@ -493,10 +887,18 @@ pub(crate) fn solve_security_dispatch(
 
     for iter in 0..options.max_iterations {
         let iter_start = std::time::Instant::now();
+        // Snapshot whether the SCUC solve we're about to run is going
+        // to consume realized LFs from a prior iteration. Used by the
+        // post-screen "no violations" branch to decide whether the
+        // loss feedback has already had a chance to influence the
+        // commitment / dispatch (early-exit safe) or whether we need
+        // one more iteration to actually apply it.
+        let solved_with_realized_lfs = cached_lfs_are_realized;
         // Build network with accumulated security flowgates
         let _t_net_clone = std::time::Instant::now();
         let mut net = network.clone();
-        net.flowgates.extend(security_flowgates.iter().cloned());
+        security_cut_pool.extend_network(&mut net);
+        let solved_security_flowgates_this_iter = security_cut_pool.active_flowgates();
         let net_clone_secs = _t_net_clone.elapsed().as_secs_f64();
 
         // Build a per-iter CommitmentMode carrying the prior iter's
@@ -538,6 +940,15 @@ pub(crate) fn solve_security_dispatch(
         // period (or we hit the round cap).
         let mut sol: Option<RawDispatchSolution> = None;
         if iter_scuc_spec.allow_branch_switching {
+            if hourly_contexts.is_none() {
+                let (contexts, secs) =
+                    build_hourly_security_contexts(&hourly_networks, options, min_rate)?;
+                setup_timings.hourly_contexts_secs += secs;
+                hourly_contexts = Some(contexts);
+            }
+            let hourly_contexts_for_connectivity = hourly_contexts
+                .as_ref()
+                .expect("hourly contexts built for connectivity cuts");
             for refit_round in 0..MAX_CONNECTIVITY_CUT_ROUNDS {
                 let spec_with_cuts = iter_scuc_spec.with_connectivity_cuts(&connectivity_cuts);
                 // Thread the cached loss warm-start into every
@@ -552,7 +963,7 @@ pub(crate) fn solve_security_dispatch(
                 let new_cuts_added = add_connectivity_cuts_from_solution(
                     &round_sol,
                     &hourly_networks,
-                    &hourly_contexts,
+                    hourly_contexts_for_connectivity,
                     &mut connectivity_cuts,
                     "outer",
                     iter,
@@ -621,6 +1032,7 @@ pub(crate) fn solve_security_dispatch(
                 "Security SCUC: rebuilt theta via DC PF (disable_bus_power_balance mode)"
             );
         }
+        security_cut_pool.refresh_activity(&sol, network.flowgates.len());
 
         // System-row loss treatment update. After theta is repaired,
         // capture realized losses (and, in PenaltyFactors mode, per-bus
@@ -631,18 +1043,16 @@ pub(crate) fn solve_security_dispatch(
         let mut sys_row_loss_telemetry: Option<crate::result::SecurityIterationLossTelemetry> =
             None;
         if sys_row_mode && sol.bus_angles_rad.len() == hourly_networks.len() {
-            let realized = if let Some(loss_ptdfs) = pf_loss_ptdf_by_hour.as_ref() {
+            let realized = if need_pf_lfs {
                 // PenaltyFactors: full per-bus LFs.
                 crate::scuc::penalty_factors::compute_realized_loss_factors(
                     &hourly_networks,
                     &pf_bus_maps_by_hour,
                     &sol.bus_angles_rad,
-                    loss_ptdfs,
                 )
             } else {
-                // ScalarFeedback (or PF fallback when PTDF build
-                // failed): just per-period total losses; LFs left empty
-                // so the row builder skips the LHS coefficient update.
+                // ScalarFeedback: just per-period total losses; zero
+                // LFs keep the row builder's LHS at face value.
                 let mut total_losses_mw = Vec::with_capacity(hourly_networks.len());
                 let mut dloss_dp: Vec<Vec<f64>> = Vec::with_capacity(hourly_networks.len());
                 for (t, net_t) in hourly_networks.iter().enumerate() {
@@ -710,7 +1120,35 @@ pub(crate) fn solve_security_dispatch(
             });
 
             cached_loss_warm_start = Some(blended);
+            cached_lfs_are_realized = true;
         }
+
+        // If this is the last allowed solve, a fresh security screen
+        // can only produce diagnostics and cuts that no later SCUC
+        // iteration will consume. On very large cases the screen itself
+        // requires a dense PTDF context that can dwarf the MIP. Return
+        // the solved dispatch as security-incomplete instead of spending
+        // memory on an unused final cut wave.
+        if iter + 1 >= options.max_iterations {
+            info!(
+                iter,
+                max_iterations = options.max_iterations,
+                "Security SCUC: final solve reached; skipping unused final security screen"
+            );
+            last_solved_security_flowgates = solved_security_flowgates_this_iter;
+            last_solution = Some(sol);
+            break;
+        }
+
+        if hourly_contexts.is_none() {
+            let (contexts, secs) =
+                build_hourly_security_contexts(&hourly_networks, options, min_rate)?;
+            setup_timings.hourly_contexts_secs += secs;
+            hourly_contexts = Some(contexts);
+        }
+        let hourly_contexts = hourly_contexts
+            .as_ref()
+            .expect("hourly contexts built before security screening");
 
         // Check N-1 violations across all periods.
         //
@@ -721,57 +1159,70 @@ pub(crate) fn solve_security_dispatch(
         // large cases — per-iter screen on 8316 was ~98s serial.
         use rayon::prelude::*;
         let n_sol_periods = sol.bus_angles_rad.len();
-        let screen_results: Vec<(Vec<BranchSecurityViolation>, Vec<HvdcSecurityCut>)> = (0
-            ..n_sol_periods)
+        let branch_retention_cap = options.max_cuts_per_iteration;
+        let (branch_acc, mut hvdc_violations) = (0..n_sol_periods)
             .into_par_iter()
-            .map(|t| {
-                let angles = &sol.bus_angles_rad[t];
-                if angles.len() != n_bus {
-                    return (Vec::new(), Vec::new());
-                }
-                let Some(period) = sol.periods.get(t) else {
-                    return (Vec::new(), Vec::new());
-                };
-                let hourly_network = &hourly_networks[t];
-                let context = &hourly_contexts[t];
-                let br = screen_branch_violations(
-                    t,
-                    angles,
-                    hourly_network,
-                    context,
-                    base,
-                    options.violation_tolerance_pu,
-                    &constrained_pairs,
-                );
-                let hv = screen_hvdc_violations(
-                    t,
-                    angles,
-                    period,
-                    hourly_network,
-                    context,
-                    &options.input.hvdc_links,
-                    base,
-                    options.violation_tolerance_pu,
-                    &hvdc_constrained_pairs,
-                );
-                (br, hv)
-            })
-            .collect();
-        let mut violations: Vec<BranchSecurityViolation> = Vec::new();
-        let mut hvdc_violations: Vec<HvdcSecurityCut> = Vec::new();
-        for (br, hv) in screen_results {
-            violations.extend(br);
-            hvdc_violations.extend(hv);
-        }
+            .fold(
+                || {
+                    (
+                        BoundedBranchViolationSet::new(branch_retention_cap),
+                        Vec::<HvdcSecurityCut>::new(),
+                    )
+                },
+                |mut acc, t| {
+                    let angles = &sol.bus_angles_rad[t];
+                    if angles.len() != n_bus {
+                        return acc;
+                    }
+                    let Some(period) = sol.periods.get(t) else {
+                        return acc;
+                    };
+                    let hourly_network = &hourly_networks[t];
+                    let context = &hourly_contexts[t];
+                    screen_branch_violations_into(
+                        t,
+                        angles,
+                        hourly_network,
+                        context,
+                        base,
+                        options.violation_tolerance_pu,
+                        &constrained_pairs,
+                        &mut acc.0,
+                    );
+                    let hv = screen_hvdc_violations(
+                        t,
+                        angles,
+                        period,
+                        hourly_network,
+                        context,
+                        &options.input.hvdc_links,
+                        base,
+                        options.violation_tolerance_pu,
+                        &hvdc_constrained_pairs,
+                    );
+                    acc.1.extend(hv);
+                    acc
+                },
+            )
+            .reduce(
+                || {
+                    (
+                        BoundedBranchViolationSet::new(branch_retention_cap),
+                        Vec::<HvdcSecurityCut>::new(),
+                    )
+                },
+                |mut left, right| {
+                    left.0.merge(right.0);
+                    left.1.extend(right.1);
+                    left
+                },
+            );
+        let branch_screen = branch_acc.finish();
+        let mut violations = branch_screen.violations;
 
-        last_branch_violations = violations.len();
+        last_branch_violations = branch_screen.n_violations;
         last_hvdc_violations = hvdc_violations.len();
-        last_max_branch_violation_pu = violations
-            .iter()
-            .map(|violation| violation.severity_pu)
-            .fold(None::<f64>, |acc, severity| {
-                Some(acc.map_or(severity, |prev| prev.max(severity)))
-            });
+        last_max_branch_violation_pu = branch_screen.max_violation_pu;
         last_max_hvdc_violation_pu = hvdc_violations.iter().fold(None, |acc, cut| {
             let severity = cut.excess_pu;
             Some(acc.map_or(severity, |prev| prev.max(severity)))
@@ -787,7 +1238,7 @@ pub(crate) fn solve_security_dispatch(
             "Security SCUC iter breakdown"
         );
 
-        if violations.is_empty() && hvdc_violations.is_empty() {
+        if last_branch_violations == 0 && hvdc_violations.is_empty() {
             info!(
                 iterations = iter + 1,
                 n_security_cuts = total_cuts,
@@ -809,11 +1260,37 @@ pub(crate) fn solve_security_dispatch(
                 max_branch_violation_pu: last_max_branch_violation_pu,
                 max_hvdc_violation_pu: last_max_hvdc_violation_pu,
                 new_cuts: 0,
+                active_cuts: security_cut_pool.active_len(),
+                retired_cuts: 0,
                 inner_mip_trace: inner_mip_trace_this_iter,
                 sys_row_loss_telemetry: sys_row_loss_telemetry.clone(),
             });
-            let near_binding =
-                compute_near_binding_report(&sol, &hourly_networks, &hourly_contexts, base, n_bus);
+
+            // System-row loss feedback gate. If sys-row loss treatment
+            // (ScalarFeedback / PenaltyFactors) is active and this
+            // iter's solve was done with cold-start LFs only, we
+            // can't exit yet — the realized LFs cached at end of this
+            // iter haven't influenced any SCUC solve. Continue to the
+            // next iteration so the next SCUC build consumes them. If
+            // that iteration also finds no violations,
+            // `solved_with_realized_lfs` will be true on entry and the
+            // normal exit path runs.
+            if sys_row_mode && !solved_with_realized_lfs {
+                info!(
+                    iter,
+                    mode = ?scuc_spec.scuc_loss_treatment,
+                    "Security SCUC: no contingency violations, but sys-row loss feedback has not yet been applied. Continuing to consume realized LFs from this iter."
+                );
+                last_solved_security_flowgates = solved_security_flowgates_this_iter;
+                last_solution = Some(sol);
+                continue;
+            }
+
+            let near_binding = if options.near_binding_report {
+                compute_near_binding_report(&sol, &hourly_networks, hourly_contexts, base, n_bus)
+            } else {
+                Vec::new()
+            };
             return Ok(attach_near_binding_report(
                 attach_aux_flowgate_names(
                     attach_security_metadata(
@@ -821,6 +1298,8 @@ pub(crate) fn solve_security_dispatch(
                         SecurityDispatchMetadata {
                             iterations: iter + 1,
                             n_cuts: total_cuts,
+                            active_cuts: security_cut_pool.active_len(),
+                            retired_cuts: security_cut_pool.retired_cuts,
                             converged: true,
                             last_branch_violations,
                             last_hvdc_violations,
@@ -834,7 +1313,7 @@ pub(crate) fn solve_security_dispatch(
                         },
                     ),
                     network,
-                    &security_flowgates,
+                    &security_cut_pool.active_flowgates(),
                 ),
                 near_binding,
             ));
@@ -842,31 +1321,28 @@ pub(crate) fn solve_security_dispatch(
 
         let _t_cut_build = std::time::Instant::now();
         // Sort by severity (worst first) and take top max_cuts_per_iteration unique pairs
-        violations.sort_by(|a, b| {
-            b.severity_pu
-                .partial_cmp(&a.severity_pu)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        violations.sort_by(compare_branch_violation_severity_desc);
         hvdc_violations.sort_by(|a, b| {
             b.excess_pu
                 .partial_cmp(&a.excess_pu)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
+        let cut_cap = effective_new_cut_cap(options, last_branch_violations, last_hvdc_violations);
         let mut new_cuts = 0usize;
         for violation in &violations {
-            if new_cuts >= options.max_cuts_per_iteration {
+            if new_cuts >= cut_cap {
                 break;
             }
-            let key = (
+            let pair_key = (
                 violation.period,
                 violation.contingency_branch_idx,
                 violation.monitored_branch_idx,
             );
-            if constrained_pairs.contains(&key) {
+            if constrained_pairs.contains(&pair_key) {
                 continue;
             }
-            constrained_pairs.insert(key);
+            constrained_pairs.insert(pair_key);
 
             let context = &hourly_contexts[violation.period];
             let hourly_network = &hourly_networks[violation.period];
@@ -890,7 +1366,14 @@ pub(crate) fn solve_security_dispatch(
                 "Adding N-1 branch security flowgate"
             );
 
-            security_flowgates.push(fg);
+            security_cut_pool.push(
+                SecurityCutKey::Branch {
+                    period: violation.period,
+                    contingency_branch_idx: violation.contingency_branch_idx,
+                    monitored_branch_idx: violation.monitored_branch_idx,
+                },
+                fg,
+            );
             new_cuts += 1;
         }
 
@@ -899,16 +1382,16 @@ pub(crate) fn solve_security_dispatch(
         // hvdc_coefficients entry encoding the OTDF.
         // Constraint: b_dc_l*(θ_from - θ_to) + (-OTDF_lk)*P_hvdc[k] ∈ [-f_max, f_max]
         for cut in &hvdc_violations {
-            if new_cuts >= options.max_cuts_per_iteration {
+            if new_cuts >= cut_cap {
                 break;
             }
             let k = cut.hvdc_link_idx;
             let l = cut.monitored_branch_idx;
-            let key = (cut.period, k, l);
-            if hvdc_constrained_pairs.contains(&key) {
+            let pair_key = (cut.period, k, l);
+            if hvdc_constrained_pairs.contains(&pair_key) {
                 continue;
             }
-            hvdc_constrained_pairs.insert(key);
+            hvdc_constrained_pairs.insert(pair_key);
 
             let hourly_network = &hourly_networks[cut.period];
             let context = &hourly_contexts[cut.period];
@@ -925,19 +1408,34 @@ pub(crate) fn solve_security_dispatch(
                 "Adding N-1 HVDC security flowgate"
             );
 
-            security_flowgates.push(fg);
+            security_cut_pool.push(
+                SecurityCutKey::Hvdc {
+                    period: cut.period,
+                    hvdc_link_idx: k,
+                    monitored_branch_idx: l,
+                },
+                fg,
+            );
             new_cuts += 1;
         }
 
         total_cuts += new_cuts;
+        let retired_this_round = security_cut_pool.retire_inactive_and_enforce_cap(
+            options.max_active_cuts,
+            options.cut_retire_after_rounds,
+            &mut constrained_pairs,
+            &mut hvdc_constrained_pairs,
+        );
         let cut_build_secs = _t_cut_build.elapsed().as_secs_f64();
         info!(
             iter = iter + 1,
-            n_branch_violations = violations.len(),
-            n_hvdc_violations = hvdc_violations.len(),
+            n_branch_violations = last_branch_violations,
+            n_hvdc_violations = last_hvdc_violations,
             max_branch_violation_pu = last_max_branch_violation_pu.unwrap_or(0.0),
             max_hvdc_violation_pu = last_max_hvdc_violation_pu.unwrap_or(0.0),
             new_cuts,
+            active_cuts = security_cut_pool.active_len(),
+            retired_cuts = retired_this_round,
             total_cuts,
             inner_solve_secs,
             repair_theta_secs,
@@ -953,15 +1451,18 @@ pub(crate) fn solve_security_dispatch(
             repair_theta_secs,
             screen_secs,
             cut_build_secs,
-            n_branch_violations: violations.len(),
-            n_hvdc_violations: hvdc_violations.len(),
+            n_branch_violations: last_branch_violations,
+            n_hvdc_violations: last_hvdc_violations,
             max_branch_violation_pu: last_max_branch_violation_pu,
             max_hvdc_violation_pu: last_max_hvdc_violation_pu,
             new_cuts,
+            active_cuts: security_cut_pool.active_len(),
+            retired_cuts: retired_this_round,
             inner_mip_trace: inner_mip_trace_this_iter,
             sys_row_loss_telemetry: sys_row_loss_telemetry.clone(),
         });
 
+        last_solved_security_flowgates = solved_security_flowgates_this_iter;
         last_solution = Some(sol);
     }
 
@@ -972,13 +1473,21 @@ pub(crate) fn solve_security_dispatch(
         "Security SCUC: max iterations reached"
     );
     let last_solution = last_solution.expect("loop ran at least one iteration");
-    let near_binding = compute_near_binding_report(
-        &last_solution,
-        &hourly_networks,
-        &hourly_contexts,
-        base,
-        n_bus,
-    );
+    let near_binding = if options.near_binding_report {
+        if let Some(hourly_contexts) = hourly_contexts.as_ref() {
+            compute_near_binding_report(
+                &last_solution,
+                &hourly_networks,
+                hourly_contexts,
+                base,
+                n_bus,
+            )
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
     Ok(attach_near_binding_report(
         attach_aux_flowgate_names(
             attach_security_metadata(
@@ -986,6 +1495,8 @@ pub(crate) fn solve_security_dispatch(
                 SecurityDispatchMetadata {
                     iterations: options.max_iterations,
                     n_cuts: total_cuts,
+                    active_cuts: last_solved_security_flowgates.len(),
+                    retired_cuts: security_cut_pool.retired_cuts,
                     converged: false,
                     last_branch_violations,
                     last_hvdc_violations,
@@ -999,7 +1510,7 @@ pub(crate) fn solve_security_dispatch(
                 },
             ),
             network,
-            &security_flowgates,
+            &last_solved_security_flowgates,
         ),
         near_binding,
     ))
@@ -1010,7 +1521,7 @@ pub(crate) fn solve_security_dispatch(
 /// Called on iter 0 of the security loop when the caller opted in via
 /// `DispatchProblemSpec::loss_factor_warm_start_mode`. Dispatches to
 /// the appropriate loss-estimate source; handles all the per-period
-/// bus-load + loss-PTDF setup that the chosen source needs.
+/// bus-load setup that the chosen source needs.
 ///
 /// Returns `None` when loss factors are off or the mode is Disabled —
 /// callers should check this and skip the warm-start application.
@@ -1045,7 +1556,6 @@ fn build_cold_start_loss_warm_start(
     // plan for.
     let mut bus_load_mw_by_hour: Vec<Vec<f64>> = Vec::with_capacity(n_periods);
     let mut total_load_by_hour: Vec<f64> = Vec::with_capacity(n_periods);
-    let first_map = hourly_networks.first().map(|n| n.bus_index_map());
     for (hour, network_t) in hourly_networks.iter().enumerate() {
         let map_t = network_t.bus_index_map();
         let mut bus_load = network_t.bus_load_p_mw_with_map(&map_t);
@@ -1071,11 +1581,6 @@ fn build_cold_start_loss_warm_start(
         total_load_by_hour.push(bus_load.iter().map(|v| v.max(0.0)).sum());
         bus_load_mw_by_hour.push(bus_load);
     }
-    let _ = first_map;
-    // `bus_map` below is used by load_pattern / dc_pf for PTDF
-    // column-index → bus-index lookup. Use the first network's map —
-    // PTDF columns are keyed by that network's bus order.
-    let bus_map = hourly_networks.first()?.bus_index_map();
 
     match spec.loss_factor_warm_start_mode {
         LossFactorWarmStartMode::Disabled => None,
@@ -1083,67 +1588,20 @@ fn build_cold_start_loss_warm_start(
             crate::scuc::losses::build_uniform_loss_warm_start(n_bus, &total_load_by_hour, rate),
         ),
         LossFactorWarmStartMode::LoadPattern { rate } => {
-            // Loss-PTDF per period is needed for the load-pattern
-            // source. Build it once per period.
-            let loss_ptdf_by_hour: Result<Vec<_>, _> = hourly_networks
-                .iter()
-                .map(|net_t| {
-                    let monitored: Vec<usize> = (0..net_t.n_branches()).collect();
-                    surge_dc::compute_ptdf(net_t, &surge_dc::PtdfRequest::for_branches(&monitored))
-                })
-                .collect();
-            match loss_ptdf_by_hour {
-                Ok(loss_ptdf_by_hour) => {
-                    Some(crate::scuc::losses::build_load_pattern_loss_warm_start(
-                        hourly_networks,
-                        &bus_map,
-                        &loss_ptdf_by_hour,
-                        &bus_load_mw_by_hour,
-                        &total_load_by_hour,
-                        n_bus,
-                        rate,
-                    ))
-                }
-                Err(err) => {
-                    warn!(%err, "load-pattern cold-start: PTDF build failed; using Uniform(0.02)");
-                    Some(crate::scuc::losses::build_uniform_loss_warm_start(
-                        n_bus,
-                        &total_load_by_hour,
-                        0.02,
-                    ))
-                }
-            }
+            Some(crate::scuc::losses::build_load_pattern_loss_warm_start(
+                hourly_networks,
+                &bus_load_mw_by_hour,
+                &total_load_by_hour,
+                n_bus,
+                rate,
+            ))
         }
-        LossFactorWarmStartMode::DcPf => {
-            // DC-PF source also needs the loss-PTDF (for computing
-            // `dloss_dp` from solved theta). Same per-period build as
-            // LoadPattern above.
-            let loss_ptdf_by_hour: Result<Vec<_>, _> = hourly_networks
-                .iter()
-                .map(|net_t| {
-                    let monitored: Vec<usize> = (0..net_t.n_branches()).collect();
-                    surge_dc::compute_ptdf(net_t, &surge_dc::PtdfRequest::for_branches(&monitored))
-                })
-                .collect();
-            match loss_ptdf_by_hour {
-                Ok(loss_ptdf_by_hour) => Some(crate::scuc::losses::build_dc_pf_loss_warm_start(
-                    hourly_networks,
-                    &bus_map,
-                    &loss_ptdf_by_hour,
-                    &bus_load_mw_by_hour,
-                    &total_load_by_hour,
-                    n_bus,
-                )),
-                Err(err) => {
-                    warn!(%err, "dc-pf cold-start: PTDF build failed; using Uniform(0.02)");
-                    Some(crate::scuc::losses::build_uniform_loss_warm_start(
-                        n_bus,
-                        &total_load_by_hour,
-                        0.02,
-                    ))
-                }
-            }
-        }
+        LossFactorWarmStartMode::DcPf => Some(crate::scuc::losses::build_dc_pf_loss_warm_start(
+            hourly_networks,
+            &bus_load_mw_by_hour,
+            &total_load_by_hour,
+            n_bus,
+        )),
     }
 }
 
@@ -1499,6 +1957,8 @@ pub(crate) fn solve_explicit_security_dispatch(
         SecurityDispatchMetadata {
             iterations: 0,
             n_cuts: n_cuts + connectivity_cuts.len(),
+            active_cuts: n_cuts + connectivity_cuts.len(),
+            retired_cuts: 0,
             converged: true,
             last_branch_violations: 0,
             last_hvdc_violations: 0,
@@ -1814,6 +2274,7 @@ fn repair_theta_from_dc_pf(
 /// a dispatch-presence check upstream.
 const CONTINGENCY_FLOW_SKIP_PU: f64 = 1e-10;
 
+#[cfg(test)]
 fn screen_branch_violations(
     period: usize,
     angles: &[f64],
@@ -1822,10 +2283,35 @@ fn screen_branch_violations(
     _base: f64,
     tolerance_pu: f64,
     constrained_pairs: &HashSet<(usize, usize, usize)>,
-) -> Vec<BranchSecurityViolation> {
+    retention_cap: usize,
+) -> BranchViolationScreen {
+    let mut out = BoundedBranchViolationSet::new(retention_cap);
+    screen_branch_violations_into(
+        period,
+        angles,
+        _hourly_network,
+        context,
+        _base,
+        tolerance_pu,
+        constrained_pairs,
+        &mut out,
+    );
+    out.finish()
+}
+
+fn screen_branch_violations_into(
+    period: usize,
+    angles: &[f64],
+    _hourly_network: &Network,
+    context: &HourlySecurityContext,
+    _base: f64,
+    tolerance_pu: f64,
+    constrained_pairs: &HashSet<(usize, usize, usize)>,
+    out: &mut BoundedBranchViolationSet,
+) {
     let n_monitored = context.monitored.len();
     if n_monitored == 0 || context.contingencies.is_empty() {
-        return Vec::new();
+        return;
     }
 
     // Precompute pre-contingency flow on every monitored branch in p.u.
@@ -1858,8 +2344,6 @@ fn screen_branch_violations(
         flow_ctg.push(v);
         flow_ctg_abs.push(v.abs());
     }
-
-    let mut violations = Vec::new();
 
     // Loop order is flipped vs the original: outer over `l`, inner over
     // `k`. This keeps `ptdf_l` (a dense row of length n_bus) cache-hot
@@ -1914,7 +2398,7 @@ fn screen_branch_violations(
             let post_flow = flow_l + lodf_lk * flow_ctg[k_pos];
             let excess = post_flow.abs() - limit_pu;
             if excess > tolerance_pu {
-                violations.push(BranchSecurityViolation {
+                out.push(BranchSecurityViolation {
                     period,
                     contingency_branch_idx: k,
                     monitored_branch_idx: l,
@@ -1924,15 +2408,13 @@ fn screen_branch_violations(
             }
         }
     }
-
-    violations
 }
 
 /// Final-pass screen that records post-contingency flow on every
 /// `(period, k, l)` pair whose `|post_flow|` reaches
 /// `threshold_fraction × limit`. Cheaper than a full report (skips
 /// pairs well inside the limit) and meant to run ONCE on the final
-/// converged dispatch — not per iteration. Threshold of 0.7 surfaces
+/// dispatch — not per iteration. Threshold of 0.95 surfaces
 /// "near-binding" contingencies for diagnostic display without
 /// flooding the report on large networks.
 fn screen_near_binding_branch_contingencies(
@@ -2240,13 +2722,13 @@ fn preseed_branch_flowgates(
     hourly_contexts: &[HourlySecurityContext],
     n_periods: usize,
     constrained_pairs: &mut HashSet<(usize, usize, usize)>,
-) -> Vec<surge_network::network::Flowgate> {
+) -> Vec<(SecurityCutKey, surge_network::network::Flowgate)> {
     let per_period = options.preseed_count_per_period;
     if per_period == 0 || matches!(options.preseed_method, SecurityPreseedMethod::None) {
         return Vec::new();
     }
 
-    let mut out: Vec<surge_network::network::Flowgate> = Vec::new();
+    let mut out: Vec<(SecurityCutKey, surge_network::network::Flowgate)> = Vec::new();
 
     for (period, (hourly_network, context)) in hourly_networks
         .iter()
@@ -2307,12 +2789,19 @@ fn preseed_branch_flowgates(
                 // bounds layer keeps symmetric slacks.
                 breach_upper: true,
             };
-            out.push(build_branch_security_flowgate(
-                &violation,
-                hourly_network,
-                context,
-                n_periods,
-                true, // preseed
+            out.push((
+                SecurityCutKey::Branch {
+                    period,
+                    contingency_branch_idx: k,
+                    monitored_branch_idx: l,
+                },
+                build_branch_security_flowgate(
+                    &violation,
+                    hourly_network,
+                    context,
+                    n_periods,
+                    true, // preseed
+                ),
             ));
             taken += 1;
         }
@@ -2430,7 +2919,7 @@ fn build_branch_security_flowgate(
 /// PTDF rows averaged ~2,118 NZ at 1e-6 (essentially fully dense across
 /// all 617 buses); raising to 1e-4 sheds the bulk of that without
 /// changing which cuts are emitted or their economic meaning.
-const PTDF_PER_BUS_TOL: f64 = 1e-4;
+const PTDF_PER_BUS_TOL: f64 = 1e-3;
 
 /// Effective per-bus PTDF for an N-1 cut on monitored branch `l`
 /// post-contingency `k`: `eff_i = ptdf_l[i] + lodf_lk × ptdf_k[i]`.
@@ -2563,7 +3052,43 @@ mod tests {
             hvdc_contingency_indices,
             preseed_count_per_period: 0,
             preseed_method: SecurityPreseedMethod::None,
+            cut_strategy: SecurityCutStrategy::Fixed,
+            max_active_cuts: None,
+            cut_retire_after_rounds: None,
+            targeted_cut_threshold: 50_000,
+            targeted_cut_cap: 50_000,
+            near_binding_report: false,
         }
+    }
+
+    #[test]
+    fn bounded_branch_violation_set_counts_all_but_retains_worst() {
+        let mut set = BoundedBranchViolationSet::new(2);
+        for severity_pu in [0.10, 0.50, 0.30] {
+            set.push(BranchSecurityViolation {
+                period: 0,
+                contingency_branch_idx: 0,
+                monitored_branch_idx: 1,
+                severity_pu,
+                breach_upper: true,
+            });
+        }
+
+        let screen = set.finish();
+        assert_eq!(screen.n_violations, 3);
+        assert_eq!(screen.violations.len(), 2);
+        assert_eq!(screen.violations[0].severity_pu, 0.50);
+        assert_eq!(screen.violations[1].severity_pu, 0.30);
+    }
+
+    #[test]
+    fn dense_ptdf_estimate_counts_all_period_values() {
+        let network = triangle_security_network(100.0);
+        let expected = 2 * network.n_branches() * network.n_buses() * std::mem::size_of::<f64>();
+        assert_eq!(
+            estimate_dense_ptdf_bytes(&[network.clone(), network]),
+            expected
+        );
     }
 
     #[test]
@@ -2592,6 +3117,7 @@ mod tests {
             hour0.base_mva,
             1e-6,
             &HashSet::new(),
+            10,
         );
         let hour1_violations = screen_branch_violations(
             1,
@@ -2601,14 +3127,16 @@ mod tests {
             hour1.base_mva,
             1e-6,
             &HashSet::new(),
+            10,
         );
 
         assert!(
-            hour0_violations.is_empty(),
+            hour0_violations.violations.is_empty(),
             "80 MW monitored limit should clear the contingency, got {hour0_violations:?}"
         );
         assert!(
             hour1_violations
+                .violations
                 .iter()
                 .any(|violation| violation.contingency_branch_idx == 0
                     && violation.monitored_branch_idx == 2),

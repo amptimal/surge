@@ -716,7 +716,7 @@ pub(super) fn build_model_plan<'a>(
         is_block_mode,
         has_per_block_reserves,
         n_branch_flow: network_plan.constrained_branches.len(),
-        n_fg_rows: network_plan.fg_rows.len(),
+        fg_rows: network_plan.fg_rows.clone(),
         n_iface_rows: network_plan.iface_rows.len(),
         n_angle_diff_rows: network_plan.angle_constrained_branches.len(),
     });

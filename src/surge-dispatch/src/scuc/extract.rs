@@ -739,9 +739,18 @@ fn build_period_objective_terms(
     for (row_idx, &fg_idx) in input.fg_rows.iter().enumerate() {
         let flowgate = &input.network.flowgates[fg_idx];
         for (component_id, col) in [
-            ("reverse", input.layout.flowgate_lower_slack_col(t, row_idx)),
-            ("forward", input.layout.flowgate_upper_slack_col(t, row_idx)),
-        ] {
+            (
+                "reverse",
+                input.layout.flowgate_lower_slack_col_opt(t, row_idx),
+            ),
+            (
+                "forward",
+                input.layout.flowgate_upper_slack_col_opt(t, row_idx),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(component_id, col)| col.map(|col| (component_id, col)))
+        {
             let slack_mw = sol.x[col] * base;
             push_term(
                 &mut terms,
@@ -1394,10 +1403,16 @@ pub(super) fn build_period_results(input: PeriodAssemblyInput<'_>) -> PeriodAsse
         }
         for (row_idx, &fg_idx) in input.fg_rows.iter().enumerate() {
             let flowgate = &input.network.flowgates[fg_idx];
-            let reverse_slack_mw =
-                input.sol.x[input.layout.flowgate_lower_slack_col(t, row_idx)] * input.base;
-            let forward_slack_mw =
-                input.sol.x[input.layout.flowgate_upper_slack_col(t, row_idx)] * input.base;
+            let reverse_slack_mw = input
+                .layout
+                .flowgate_lower_slack_col_opt(t, row_idx)
+                .map(|col| input.sol.x[col] * input.base)
+                .unwrap_or(0.0);
+            let forward_slack_mw = input
+                .layout
+                .flowgate_upper_slack_col_opt(t, row_idx)
+                .map(|col| input.sol.x[col] * input.base)
+                .unwrap_or(0.0);
             let is_explicit_ctg_flowgate = input
                 .explicit_contingency
                 .and_then(|plan| plan.flowgate_row_cases.get(row_idx))

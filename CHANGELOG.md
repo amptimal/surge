@@ -6,6 +6,41 @@ this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows Semantic Versioning intent.
 
+## [0.1.8] — 2026-05-01
+
+`surge-dispatch` SCUC security loop: lower memory, faster solves, and
+adjoint loss sensitivities. Default policy retuned.
+
+### Added (`surge-dispatch`)
+
+- Lazy PTDF caching on the SCUC security path — caches build only
+  when a contingency actually binds, rather than eagerly per period.
+- Adjoint-based DC loss sensitivities replace the explicit per-branch
+  Jacobian build in `surge-opf`/`surge-dispatch`, simplifying the
+  loss-factor pipeline.
+
+### Fixed
+
+- `surge-dispatch`: SCUC security loop now defers early exit by one
+  iteration when sys-row loss treatment is active but no solve has
+  yet consumed realized loss factors. Previously both
+  `ScalarFeedback` and `PenaltyFactors` could silently no-op on
+  scenarios with a clean contingency profile.
+
+### Performance (`surge-dispatch`)
+
+- Lower SCUC security memory footprint at scale: per-period state is
+  released after use rather than retained for the full horizon.
+- Faster security wall time via tightened PTDF tolerance, lazy cache
+  construction, and adapter-side request reuse.
+
+### Changed (defaults)
+
+- `scuc_loss_treatment` defaulted to `penalty_factors` (was
+  `scalar_feedback`), paired with the security-loop fix above.
+- `scuc_thermal_penalty_multiplier` defaulted to `1.25` (was `10.0`)
+  to keep SCUC thermal penalties closer to the configured slack rate.
+
 ## [0.1.7] — 2026-04-26
 
 `surge-dispatch` polish release: end-to-end shadow prices, Q-LMPs,

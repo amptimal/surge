@@ -150,7 +150,7 @@ pub(crate) fn build_thermal_rows(
     col_base: usize,
     row_base: usize,
     theta_off: usize,
-    slack_layout: Option<SoftLimitSlackLayout>,
+    slack_layout: Option<SoftLimitSlackLayout<'_>>,
     base: f64,
     switching_pf_l_cols: Option<&[usize]>,
 ) -> LpBlock {
@@ -196,16 +196,16 @@ pub(crate) fn build_thermal_rows(
             val: -b_val,
         });
         if let Some(slack) = slack_layout {
-            block.triplets.push(Triplet {
-                row,
-                col: col_base + slack.lower_off + ci,
-                val: 1.0,
-            });
-            block.triplets.push(Triplet {
-                row,
-                col: col_base + slack.upper_off + ci,
-                val: -1.0,
-            });
+            if let Some(col) = slack.lower_col(col_base, ci) {
+                block.triplets.push(Triplet { row, col, val: 1.0 });
+            }
+            if let Some(col) = slack.upper_col(col_base, ci) {
+                block.triplets.push(Triplet {
+                    row,
+                    col,
+                    val: -1.0,
+                });
+            }
         }
 
         let fmax = br.rating_a_mva / base;
@@ -392,7 +392,7 @@ pub(crate) fn build_flowgate_rows(
     hvdc_band_offsets: &[usize],
     n_hvdc_links: usize,
     spec: &DispatchProblemSpec<'_>,
-    slack_layout: Option<SoftLimitSlackLayout>,
+    slack_layout: Option<SoftLimitSlackLayout<'_>>,
     base: f64,
     hour: usize,
     ptdf_ctx: Option<&FlowgatePtdfFormCtx<'_>>,
@@ -496,16 +496,20 @@ pub(crate) fn build_flowgate_rows(
             }
         }
         if let Some(slack) = slack_layout {
-            block.triplets.push(Triplet {
-                row,
-                col: col_base + slack.lower_off + ri,
-                val: 1.0,
-            });
-            block.triplets.push(Triplet {
-                row,
-                col: col_base + slack.upper_off + ri,
-                val: -1.0,
-            });
+            if fg.breach_sides.allocates_lower_slack()
+                && let Some(col) = slack.lower_col(col_base, ri)
+            {
+                block.triplets.push(Triplet { row, col, val: 1.0 });
+            }
+            if fg.breach_sides.allocates_upper_slack()
+                && let Some(col) = slack.upper_col(col_base, ri)
+            {
+                block.triplets.push(Triplet {
+                    row,
+                    col,
+                    val: -1.0,
+                });
+            }
         }
 
         let fg_limit = fg.effective_limit_mw(hour);
@@ -541,7 +545,7 @@ fn apply_ptdf_form_flowgate_row(
     fg: &surge_network::network::Flowgate,
     ri: usize,
     row: usize,
-    slack_layout: Option<SoftLimitSlackLayout>,
+    slack_layout: Option<SoftLimitSlackLayout<'_>>,
     block: &mut LpBlock,
     hour: usize,
 ) {
@@ -591,16 +595,20 @@ fn apply_ptdf_form_flowgate_row(
     // slack absorbs an upward (toward upper-bound) violation and a
     // positive lo-slack absorbs downward (toward lower-bound).
     if let Some(slack) = slack_layout {
-        block.triplets.push(Triplet {
-            row,
-            col: ctx.col_base + slack.lower_off + ri,
-            val: 1.0,
-        });
-        block.triplets.push(Triplet {
-            row,
-            col: ctx.col_base + slack.upper_off + ri,
-            val: -1.0,
-        });
+        if fg.breach_sides.allocates_lower_slack()
+            && let Some(col) = slack.lower_col(ctx.col_base, ri)
+        {
+            block.triplets.push(Triplet { row, col, val: 1.0 });
+        }
+        if fg.breach_sides.allocates_upper_slack()
+            && let Some(col) = slack.upper_col(ctx.col_base, ri)
+        {
+            block.triplets.push(Triplet {
+                row,
+                col,
+                val: -1.0,
+            });
+        }
     }
 
     let fg_limit_pu = fg.effective_limit_mw(hour) / ctx.base;
@@ -642,7 +650,7 @@ pub(crate) fn build_interface_rows(
     col_base: usize,
     row_base: usize,
     theta_off: usize,
-    slack_layout: Option<SoftLimitSlackLayout>,
+    slack_layout: Option<SoftLimitSlackLayout<'_>>,
     base: f64,
     hour: usize,
 ) -> LpBlock {
@@ -671,16 +679,16 @@ pub(crate) fn build_interface_rows(
             });
         }
         if let Some(slack) = slack_layout {
-            block.triplets.push(Triplet {
-                row,
-                col: col_base + slack.lower_off + ri,
-                val: 1.0,
-            });
-            block.triplets.push(Triplet {
-                row,
-                col: col_base + slack.upper_off + ri,
-                val: -1.0,
-            });
+            if let Some(col) = slack.lower_col(col_base, ri) {
+                block.triplets.push(Triplet { row, col, val: 1.0 });
+            }
+            if let Some(col) = slack.upper_col(col_base, ri) {
+                block.triplets.push(Triplet {
+                    row,
+                    col,
+                    val: -1.0,
+                });
+            }
         }
 
         block.row_lower[ri] =
@@ -708,9 +716,35 @@ pub(crate) struct PowerBalanceExtraTerm {
 
 /// Linear lower/upper violation slack columns for a row family.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct SoftLimitSlackLayout {
+pub(crate) struct SoftLimitSlackLayout<'a> {
     pub lower_off: usize,
     pub upper_off: usize,
+    pub lower_local_by_row: Option<&'a [Option<usize>]>,
+    pub upper_local_by_row: Option<&'a [Option<usize>]>,
+}
+
+impl SoftLimitSlackLayout<'_> {
+    fn lower_col(&self, col_base: usize, row_idx: usize) -> Option<usize> {
+        self.lower_local_by_row
+            .map(|rows| {
+                rows.get(row_idx)
+                    .copied()
+                    .flatten()
+                    .map(|local| col_base + self.lower_off + local)
+            })
+            .unwrap_or(Some(col_base + self.lower_off + row_idx))
+    }
+
+    fn upper_col(&self, col_base: usize, row_idx: usize) -> Option<usize> {
+        self.upper_local_by_row
+            .map(|rows| {
+                rows.get(row_idx)
+                    .copied()
+                    .flatten()
+                    .map(|local| col_base + self.upper_off + local)
+            })
+            .unwrap_or(Some(col_base + self.upper_off + row_idx))
+    }
 }
 
 /// Build power balance equality rows (`n_bus` rows).
@@ -1273,9 +1307,9 @@ pub(crate) struct DcNetworkRowsInput<'a> {
     pub sto_ch_off: usize,
     pub sto_dis_off: usize,
     pub hvdc_off: usize,
-    pub branch_slack: Option<SoftLimitSlackLayout>,
-    pub flowgate_slack: Option<SoftLimitSlackLayout>,
-    pub interface_slack: Option<SoftLimitSlackLayout>,
+    pub branch_slack: Option<SoftLimitSlackLayout<'a>>,
+    pub flowgate_slack: Option<SoftLimitSlackLayout<'a>>,
+    pub interface_slack: Option<SoftLimitSlackLayout<'a>>,
     pub dl_off: usize,
     pub vbid_off: usize,
     pub n_hvdc_links: usize,

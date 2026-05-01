@@ -133,6 +133,8 @@ def _extract_scuc_security_report(workflow_result: dict | None) -> dict | None:
                     "screen_secs": entry.get("screen_secs"),
                     "cut_build_secs": entry.get("cut_build_secs", 0.0),
                     "new_cuts": entry.get("new_cuts"),
+                    "active_cuts": entry.get("active_cuts"),
+                    "retired_cuts": entry.get("retired_cuts", 0),
                     "n_branch_violations": entry.get("n_branch_violations"),
                     "n_hvdc_violations": entry.get("n_hvdc_violations"),
                     "max_branch_violation_pu": entry.get("max_branch_violation_pu"),
@@ -149,6 +151,8 @@ def _extract_scuc_security_report(workflow_result: dict | None) -> dict | None:
         return {
             "iterations": security.get("iterations"),
             "n_cuts": security.get("n_cuts"),
+            "active_cuts": security.get("active_cuts", security.get("n_cuts")),
+            "retired_cuts": security.get("retired_cuts", 0),
             "converged": security.get("converged"),
             "last_branch_violations": security.get("last_branch_violations"),
             "last_hvdc_violations": security.get("last_hvdc_violations"),
