@@ -104,9 +104,9 @@ pub use request::{
     ReserveOfferSchedule, ResourceAreaAssignment, ResourceCommitmentSchedule,
     ResourceDispatchPoint, ResourceEligibility, ResourceEmissionRate, ResourceEnergyWindowLimit,
     ResourcePeriodCommitment, ResourceStartupWindowLimit, ScedAcBendersCut, ScedAcBendersRunParams,
-    ScedAcBendersRuntime, SecurityEmbedding, SecurityPolicy, SecurityPreseedMethod,
-    StoragePowerSchedule, StorageReserveSocImpact, StorageSocOverride, ThermalLimitPolicy,
-    TopologyControlMode, TopologyControlPolicy,
+    ScedAcBendersRuntime, SecurityCutStrategy, SecurityEmbedding, SecurityPolicy,
+    SecurityPreseedMethod, StoragePowerSchedule, StorageReserveSocImpact, StorageSocOverride,
+    ThermalLimitPolicy, TopologyControlMode, TopologyControlPolicy,
 };
 
 pub(crate) mod sced_ac_benders;

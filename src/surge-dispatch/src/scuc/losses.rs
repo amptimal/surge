@@ -5,7 +5,7 @@
 //! model in SCUC:
 //!
 //! 1. [`LossFactorPrep`] — the immutable setup data (original bus-balance
-//!    RHS, bus load allocations, loss-PTDF rows, and the per-period list
+//!    RHS, bus load allocations, and the per-period list
 //!    of `(a_value position, bus_idx, original coefficient)` injections).
 //!    Built once per `solve_problem` call from [`build_loss_factor_prep`].
 //!
@@ -34,6 +34,7 @@
 use std::collections::HashMap;
 
 use surge_network::Network;
+use surge_network::network::Load;
 use surge_opf::backends::{LpPrimalStart, LpResult, LpSolveStatus, LpSolver, SparseProblem};
 use tracing::{debug, info, warn};
 
@@ -91,8 +92,7 @@ pub(super) struct BusInjectionCoeff {
 /// [`build_loss_factor_prep`]. Reused for both pre-MIP warm-start
 /// application via [`apply_bus_loss_factors`] and the post-MIP
 /// refinement iteration inside [`iterate_loss_factors`], so the
-/// ~O(n_nz) walk of the problem's column data and the per-period
-/// loss-PTDF construction only happen once.
+/// ~O(n_nz) walk of the problem's column data only happens once.
 pub(super) struct LossFactorPrep {
     /// Per-period list of bus-balance-row coefficient entries (one per
     /// physical injection or withdrawal column). Ordered by the order
@@ -110,10 +110,6 @@ pub(super) struct LossFactorPrep {
     /// Per-period total load in MW. Precomputed for the loss-share
     /// weighted distribution.
     pub total_load_by_hour: Vec<f64>,
-    /// Per-period loss-PTDF rows. Needed by
-    /// [`surge_opf::advanced::compute_dc_loss_sensitivities`] when the
-    /// refinement iteration recomputes `dloss_dp` from solved angles.
-    pub loss_ptdf_by_hour: Vec<surge_dc::PtdfRows>,
     /// Number of bus-balance rows per period; matches `ScucBoundsInput::n_bus`.
     pub n_bus: usize,
     /// Number of periods on the horizon.
@@ -187,8 +183,7 @@ fn collect_bus_injection_coeffs(
 /// Build the immutable loss-factor setup from the pre-solve problem.
 ///
 /// Walks the column data to capture every physical injection/withdrawal
-/// coefficient in the bus-balance rows, precomputes per-period loads,
-/// and constructs the loss-PTDF rows needed by the refinement loop.
+/// coefficient in the bus-balance rows and precomputes per-period loads.
 ///
 /// Runs once per SCUC solve. The returned prep is passed unchanged to
 /// every subsequent [`apply_bus_loss_factors`] and
@@ -227,7 +222,6 @@ pub(super) fn build_loss_factor_prep(
     let mut orig_rhs_by_hour: Vec<Vec<f64>> = Vec::with_capacity(n_hours);
     let mut bus_load_mw_by_hour: Vec<Vec<f64>> = Vec::with_capacity(n_hours);
     let mut total_load_by_hour: Vec<f64> = Vec::with_capacity(n_hours);
-    let mut loss_ptdf_by_hour = Vec::with_capacity(n_hours);
 
     let dispatch = &layout.dispatch;
     let n_gen = gen_bus_idx.len();
@@ -254,15 +248,6 @@ pub(super) fn build_loss_factor_prep(
         }
         total_load_by_hour.push(bus_load_mw.iter().map(|v| v.max(0.0)).sum());
         bus_load_mw_by_hour.push(bus_load_mw);
-
-        let monitored_branches: Vec<usize> = (0..network_t.n_branches()).collect();
-        loss_ptdf_by_hour.push(
-            surge_dc::compute_ptdf(
-                network_t,
-                &surge_dc::PtdfRequest::for_branches(&monitored_branches),
-            )
-            .map_err(|e| ScedError::SolverError(format!("PTDF for SCUC loss factors: {e}")))?,
-        );
 
         // Allocate roughly enough room for every physical bus
         // injection / withdrawal column at this period.
@@ -342,7 +327,6 @@ pub(super) fn build_loss_factor_prep(
         orig_rhs_by_hour,
         bus_load_mw_by_hour,
         total_load_by_hour,
-        loss_ptdf_by_hour,
         n_bus,
         n_hours,
     })
@@ -633,12 +617,12 @@ pub(super) fn iterate_loss_factors(
             let theta: Vec<f64> = (0..input.n_bus)
                 .map(|bus_idx| input.solution.x[input.layout.theta_col(t, bus_idx)])
                 .collect();
-            let dloss = surge_opf::advanced::compute_dc_loss_sensitivities(
+            let dloss = surge_opf::advanced::compute_dc_loss_sensitivities_adjoint(
                 network_t,
                 &theta,
                 input.bus_map,
-                &prep.loss_ptdf_by_hour[t],
-            );
+            )
+            .map_err(|e| ScedError::SolverError(format!("adjoint SCUC loss sensitivities: {e}")))?;
             max_delta = max_delta.max(
                 dloss
                     .iter()
@@ -784,17 +768,15 @@ pub(super) fn iterate_loss_factors(
 //   baseline or when the network has no computable sensitivity
 //   (degenerate topology).
 //
-// * [`build_load_pattern_loss_warm_start`] — Option #4: PTDF-weighted
-//   loss sensitivity from the load vector alone, without a dispatch
-//   guess. Uses the network's loss-PTDF × load pattern to give buses
-//   near load centers lower `dloss` (closer to 0) and buses far from
-//   load higher `dloss` (closer to the system-average loss rate). No
-//   DC PF; ~O(n_bus × n_branch) per period.
+// * [`build_load_pattern_loss_warm_start`] — Option #4: loss sensitivity
+//   from the load vector alone, without an SCUC dispatch guess. Solves a
+//   synthetic load-pattern DC PF, then uses the sparse adjoint loss solve
+//   to give buses near load centers lower `dloss` and buses far from load
+//   higher `dloss`.
 //
 // * [`build_dc_pf_loss_warm_start`] — Option #3: run a DC PF on each
-//   hourly network using whatever gen setpoints it carries (initial
-//   condition / network-spec dispatch), take the solved theta, and
-//   derive `dloss_dp` from [`surge_opf::advanced::compute_dc_loss_sensitivities`].
+//   hourly network, take the solved theta, and derive `dloss_dp` from
+//   the sparse adjoint loss solve.
 //   Most accurate cold-start but ~O(DC PF cost) per period (ms-level
 //   on 617-bus).
 //
@@ -810,7 +792,7 @@ pub(super) fn iterate_loss_factors(
 /// caller usually already has this from
 /// [`LossFactorPrep::total_load_by_hour`] or equivalent.
 ///
-/// Cheapest cold-start — no PTDF work, no DC PF. Use as a sanity
+/// Cheapest cold-start — no sensitivity solve and no DC PF. Use as a sanity
 /// baseline or when per-bus variation isn't worth the extra
 /// computation.
 pub(crate) fn build_uniform_loss_warm_start(
@@ -829,7 +811,7 @@ pub(crate) fn build_uniform_loss_warm_start(
 /// Load-pattern warm start (Option #4): per-period marginal
 /// `dloss_dp[t, i] ≈ ∂losses/∂P_inj[i]` derived from the DC-loss
 /// sensitivity formula applied to the **per-period** bus load pattern.
-/// No dispatch guess, no DC PF.
+/// No SCUC dispatch guess.
 ///
 /// DC-loss formula: `losses = Σ_l r_l × flow_l²`. Differentiating wrt
 /// injection at bus `i` and using `flow_l = Σ_j PTDF[l,j] × P_inj[j]`:
@@ -838,33 +820,20 @@ pub(crate) fn build_uniform_loss_warm_start(
 ///   ∂losses/∂P_inj[i] = 2 × Σ_l r_l × flow_l × PTDF[l,i]
 /// ```
 ///
-/// To evaluate this without a dispatch guess we approximate the
-/// operating flows by treating the load pattern as the injection
-/// vector (gen implicitly absorbed at the slack):
+/// To evaluate this without a dispatch guess we solve one DC PF on a
+/// synthetic network whose load objects match the per-bus load pattern and
+/// whose generation is balanced proportionally to in-service generator pmax.
+/// We then compute the marginal-loss vector with the sparse adjoint loss solve.
 ///
-/// ```text
-///   flow_l ≈ -Σ_j PTDF[l,j] × load_mw[j] / base_mva
-/// ```
+/// `|dloss/dP_inj[i]|` ranks buses by how much their injection drives net
+/// branch flow through resistive lines. Magnitudes are calibrated so the
+/// max per-period `dloss` hits `2 × rate` (mirrors the observation that gen
+/// buses far from load typically see ~2× the mean loss fraction).
 ///
-/// Then `|dloss/dP_inj[i]|` ranks buses by how much their injection
-/// drives net branch flow through resistive lines. Buses on the
-/// generation side of the slack-to-load flow axis get large
-/// sensitivities; buses near loads get small ones (injecting at a
-/// load bus locally reduces flow). Magnitudes are calibrated so the
-/// max per-period `dloss` hits `2 × rate` (mirrors the observation
-/// that gen buses far from load typically see ~ 2× the mean loss
-/// fraction).
-///
-/// O(n_branch × n_ptdf_col) per period; no DC PF invocation. About
-/// 5× the work of the pure topology proxy (previous implementation)
-/// but the resulting `dloss` actually tracks the per-period load
-/// pattern — if the load concentrates at a different set of buses in
-/// a given hour, the sensitivity pattern shifts with it.
-#[allow(clippy::too_many_arguments)]
+/// This keeps the load-pattern source physically tied to each period while
+/// avoiding the old dense branch-by-bus loss-PTDF cache.
 pub(crate) fn build_load_pattern_loss_warm_start(
     hourly_networks: &[Network],
-    _bus_map: &HashMap<u32, usize>,
-    loss_ptdf_by_hour: &[surge_dc::PtdfRows],
     bus_load_mw_by_hour: &[Vec<f64>],
     total_load_by_hour: &[f64],
     n_bus: usize,
@@ -881,63 +850,29 @@ pub(crate) fn build_load_pattern_loss_warm_start(
         if total_load <= 1e-6 {
             continue;
         }
-        let loss_ptdf = &loss_ptdf_by_hour[t];
         let bus_load = &bus_load_mw_by_hour[t];
-        let base_mva = network_t.base_mva.max(1.0);
-
-        // Build a dense per-ptdf-column injection vector from the load
-        // pattern: `inj_pu[col_pos] = -load_mw[bus_indices[col_pos]] /
-        // base_mva`. Convention: positive P_inj = generation; loads
-        // enter as negative injections (slack absorbs the balance).
-        let bus_indices = loss_ptdf.bus_indices();
-        let n_col = bus_indices.len();
-        let mut inj_pu = vec![0.0_f64; n_col];
-        for (col_pos, &bus_idx) in bus_indices.iter().enumerate() {
-            if bus_idx < bus_load.len() {
-                inj_pu[col_pos] = -bus_load[bus_idx] / base_mva;
-            }
-        }
-
-        // First pass: approximate per-branch flow in pu from the
-        // load-pattern injection: flow_l = Σ_col PTDF[l, col] ×
-        // inj_pu[col]. Keep monitored branches that are in service;
-        // others contribute zero flow (they've been derated out).
-        let mut raw = vec![0.0_f64; n_bus];
-        for branch_idx in 0..network_t.n_branches() {
-            let branch = &network_t.branches[branch_idx];
-            if !branch.in_service {
-                continue;
-            }
-            let Some(row) = loss_ptdf.row(branch_idx) else {
-                continue;
-            };
-            // flow_l in pu, signed — sign conventions are PTDF-
-            // dependent but the magnitude is what matters for loss.
-            let mut flow_pu = 0.0_f64;
-            for col_pos in 0..n_col {
-                if let Some(&coeff) = row.get(col_pos) {
-                    flow_pu += coeff * inj_pu[col_pos];
+        let balanced = network_with_bus_load_pattern(network_t, bus_load);
+        let solution = surge_dc::solve_dc(&balanced);
+        let mut raw = match solution.and_then(|pf| {
+            let bus_map = balanced.bus_index_map();
+            surge_opf::advanced::compute_dc_loss_sensitivities_adjoint(
+                &balanced, &pf.theta, &bus_map,
+            )
+        }) {
+            Ok(raw) => raw,
+            Err(err) => {
+                tracing::debug!(
+                    period = t,
+                    error = %err,
+                    "scuc load-pattern loss warm start failed; falling back to uniform rate"
+                );
+                for i in 0..n_bus {
+                    dloss_dp[t][i] = clamped_rate;
                 }
-            }
-
-            // Coefficient of dloss/dP_inj[i] contributed by this
-            // branch: `2 × r_l × flow_l × PTDF[l, i]`. `r_l` is the
-            // per-unit resistance; `flow_pu` the approximate flow.
-            // The factor of 2 is absorbed by the later max-normalise
-            // so we can drop it and keep the scale implicit.
-            let r_pu = branch.r;
-            if r_pu <= 0.0 || flow_pu.abs() < 1e-12 {
+                total_losses_mw[t] = clamped_rate * total_load;
                 continue;
             }
-            let weight = r_pu * flow_pu;
-            for (col_pos, &bus_idx) in bus_indices.iter().enumerate() {
-                if let Some(&coeff) = row.get(col_pos)
-                    && bus_idx < n_bus
-                {
-                    raw[bus_idx] += weight * coeff;
-                }
-            }
-        }
+        };
 
         // Take magnitudes — the LP's loss term is `Σ_i dloss[i] ×
         // P_inj[i]`, and the per-bus signs follow from slack choice.
@@ -975,23 +910,18 @@ pub(crate) fn build_load_pattern_loss_warm_start(
 }
 
 /// DC-PF warm start (Option #3): run a DC power flow on each hourly
-/// network using whatever generator setpoints the network carries,
-/// then derive `dloss_dp` from the solved theta and `total_losses_mw`
-/// from `compute_total_dc_losses × base_mva`.
+/// network after rewriting load objects to the per-bus load pattern and
+/// balancing generation proportionally to in-service pmax. Then derive
+/// `dloss_dp` from the solved theta and `total_losses_mw` from
+/// `compute_total_dc_losses × base_mva`.
 ///
-/// The hourly networks carry the initial-condition dispatch
-/// (load-proportional or from-spec setpoints per hour), so the DC PF
-/// answers "if everyone were dispatched at their current setpoint,
-/// what angle pattern + losses would result?" Accuracy: typically
-/// within ~10% of the SCUC-converged loss pattern on stable networks;
-/// worse on heavily constrained cases where the optimal dispatch
-/// differs substantially from the initial one. Still a much better
-/// starting point than `dloss = 0`.
+/// This answers "what angle pattern + losses follow from the hour's
+/// expected load footprint under a broad load-proportional dispatch?"
+/// Accuracy is still bounded by the fact that the optimal SCUC dispatch
+/// can differ, but it is a much better starting point than `dloss = 0`.
 ///
-/// Cost: one DC PF per period (single KLU solve on a pre-factorised
-/// B', so ~1 ms on 617-bus). Dwarfs the [`build_load_pattern_*`]
-/// variant in accuracy but costs 2–3 ms per period instead of sub-ms.
-/// Negligible relative to the MIP wall it saves.
+/// Cost: one DC PF plus one adjoint sparse solve per period. Negligible
+/// relative to the MIP wall it can save on large cases.
 ///
 /// Falls back to `build_uniform_loss_warm_start(0.02)` on DC PF
 /// failure (island / slack issues / singular B'), so the caller can
@@ -1042,10 +972,22 @@ fn balance_dispatch_to_load(network: &Network) -> Network {
     out
 }
 
+fn network_with_bus_load_pattern(network: &Network, bus_load_mw: &[f64]) -> Network {
+    let mut out = network.clone();
+    out.loads.clear();
+    for (bus_idx, &load_mw) in bus_load_mw.iter().enumerate() {
+        if load_mw <= 1e-6 {
+            continue;
+        }
+        if let Some(bus) = network.buses.get(bus_idx) {
+            out.loads.push(Load::new(bus.number, load_mw.max(0.0), 0.0));
+        }
+    }
+    balance_dispatch_to_load(&out)
+}
+
 pub(crate) fn build_dc_pf_loss_warm_start(
     hourly_networks: &[Network],
-    bus_map: &HashMap<u32, usize>,
-    loss_ptdf_by_hour: &[surge_dc::PtdfRows],
     bus_load_mw_by_hour: &[Vec<f64>],
     total_load_by_hour: &[f64],
     n_bus: usize,
@@ -1070,17 +1012,31 @@ pub(crate) fn build_dc_pf_loss_warm_start(
         // PF can solve without large slack corrections, producing
         // angle patterns that track the network's natural flow
         // topology.
-        let balanced = balance_dispatch_to_load(network_t);
+        let balanced = network_with_bus_load_pattern(network_t, &bus_load_mw_by_hour[t]);
         let solution = surge_dc::solve_dc(&balanced);
         match solution {
             Ok(pf) => {
-                let dloss = surge_opf::advanced::compute_dc_loss_sensitivities(
-                    &balanced,
-                    &pf.theta,
-                    bus_map,
-                    &loss_ptdf_by_hour[t],
+                let bus_map = balanced.bus_index_map();
+                let dloss_result = surge_opf::advanced::compute_dc_loss_sensitivities_adjoint(
+                    &balanced, &pf.theta, &bus_map,
                 );
-                let losses_pu = surge_opf::compute_total_dc_losses(&balanced, &pf.theta, bus_map);
+                let dloss = match dloss_result {
+                    Ok(dloss) => dloss,
+                    Err(err) => {
+                        tracing::debug!(
+                            period = t,
+                            error = %err,
+                            "scuc loss-factor DC PF warm start: adjoint loss sensitivity failed; falling back to uniform rate"
+                        );
+                        let rate = FALLBACK_RATE;
+                        for i in 0..n_bus {
+                            dloss_dp[t][i] = rate;
+                        }
+                        total_losses_mw[t] = rate * total_load_by_hour[t];
+                        continue;
+                    }
+                };
+                let losses_pu = surge_opf::compute_total_dc_losses(&balanced, &pf.theta, &bus_map);
                 let losses_mw = losses_pu.max(0.0) * balanced.base_mva;
                 // Sanity cap: if the DC PF produces losses > 5% of
                 // total load, something is off (commitment state only
@@ -1147,10 +1103,6 @@ pub(crate) fn build_dc_pf_loss_warm_start(
             total_losses_mw[t] = rate * total_load_by_hour[t];
         }
     }
-
-    // Suppress unused-variable warnings on auxiliary inputs that
-    // downstream callers may want to pass unconditionally.
-    let _ = (bus_load_mw_by_hour, total_load_by_hour);
 
     LossFactorWarmStart {
         dloss_dp,

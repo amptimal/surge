@@ -672,6 +672,77 @@ impl<'a> PreparedDcStudy<'a> {
         )
     }
 
+    /// Compute DC marginal loss sensitivities without materializing a loss PTDF.
+    ///
+    /// This returns the same single-slack-gauge vector as
+    /// `Σ_l 2 * r_l * flow_l * PTDF[l, bus]`, but evaluates that product with
+    /// one sparse adjoint solve per island instead of a dense branch-by-bus PTDF
+    /// cache. `theta` is indexed by the network's internal bus order.
+    pub fn compute_loss_sensitivities_adjoint(
+        &mut self,
+        theta: &[f64],
+    ) -> Result<Vec<f64>, DcError> {
+        let n_bus = self.network.n_buses();
+        if theta.len() != n_bus {
+            return Err(DcError::InvalidNetwork(format!(
+                "loss sensitivity theta length {} does not match network bus count {}",
+                theta.len(),
+                n_bus
+            )));
+        }
+
+        let mut rhs_by_kernel: Vec<Vec<f64>> = self
+            .kernels
+            .iter()
+            .map(|kernel| vec![0.0_f64; kernel.bprime.dim])
+            .collect();
+
+        for (branch_idx, branch) in self.network.branches.iter().enumerate() {
+            let branch_meta = self.branch_metadata(branch_idx)?;
+            if !branch_meta.is_sensitivity_active() {
+                continue;
+            }
+            if branch.r.abs() < 1e-20 {
+                continue;
+            }
+            let Some(kernel_idx) = self.branch_kernel_indices[branch_idx] else {
+                continue;
+            };
+
+            let flow_pu =
+                branch_meta.b_dc * (theta[branch_meta.from_full] - theta[branch_meta.to_full]);
+            let weight = 2.0 * branch.r * flow_pu * branch_meta.b_dc;
+            if weight.abs() < 1e-20 {
+                continue;
+            }
+
+            let kernel = &self.kernels[kernel_idx];
+            let rhs = &mut rhs_by_kernel[kernel_idx];
+            if let Some(ri_from) = kernel.bprime.full_to_reduced[branch_meta.from_full] {
+                rhs[ri_from] += weight;
+            }
+            if let Some(ri_to) = kernel.bprime.full_to_reduced[branch_meta.to_full] {
+                rhs[ri_to] -= weight;
+            }
+        }
+
+        let mut dloss_dp = vec![0.0_f64; n_bus];
+        for (kernel_idx, kernel) in self.kernels.iter_mut().enumerate() {
+            let rhs = &mut rhs_by_kernel[kernel_idx];
+            if rhs.is_empty() {
+                continue;
+            }
+            kernel.klu.solve(rhs).map_err(|_| DcError::SingularMatrix)?;
+            for (ri, &full_bus_idx) in kernel.reduced_to_full.iter().enumerate() {
+                dloss_dp[full_bus_idx] = rhs[ri];
+            }
+            // The reduced slack row/column is absent, so the slack bus remains
+            // zero. That matches the default single-slack PTDF semantics.
+        }
+
+        Ok(dloss_dp)
+    }
+
     /// Compute PTDF rows from an explicit [`PtdfRequest`](crate::PtdfRequest).
     pub fn compute_ptdf_request(
         &mut self,
@@ -1348,6 +1419,18 @@ pub fn solve_dc(network: &Network) -> Result<DcPfSolution, DcError> {
 pub fn solve_dc_opts(network: &Network, opts: &DcPfOptions) -> Result<DcPfSolution, DcError> {
     let mut study = PreparedDcStudy::new(network)?;
     study.solve(opts)
+}
+
+/// Compute DC marginal loss sensitivities with one sparse adjoint solve.
+///
+/// Equivalent to multiplying branch loss gradients by the single-slack PTDF,
+/// but does not allocate a dense branch-by-bus PTDF matrix.
+pub fn compute_loss_sensitivities_adjoint(
+    network: &Network,
+    theta: &[f64],
+) -> Result<Vec<f64>, DcError> {
+    let mut study = PreparedDcStudy::new(network)?;
+    study.compute_loss_sensitivities_adjoint(theta)
 }
 
 /// Compute the canonical DC power flow + sensitivity workflow for one network.

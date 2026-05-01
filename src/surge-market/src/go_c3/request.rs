@@ -41,6 +41,7 @@ use surge_io::go_c3::types::{GoC3Bus, GoC3DeviceType};
 use surge_io::go_c3::{
     BranchRef as GoC3BranchRef, GoC3CommitmentMode, GoC3ConsumerMode, GoC3Context, GoC3Device,
     GoC3DeviceTimeSeries, GoC3Formulation, GoC3Policy, GoC3Problem, GoC3ScucLossTreatment,
+    GoC3SecurityCutStrategy,
 };
 use surge_network::market::OfferSchedule;
 use surge_opf::AcOpfOptions;
@@ -438,8 +439,8 @@ pub fn build_dispatch_request(
     network.loss_factors.enabled = true;
     network.loss_factors.max_iterations = policy.scuc_loss_factor_max_iterations.unwrap_or(1);
     network.loss_factors.tolerance = 1.0e-3;
-    // Cold-start loss-factor warm-start mode. Off by default; caller
-    // opts in via `GoC3Policy::scuc_loss_factor_warm_start`.
+    // Cold-start loss-factor warm-start mode. The dispatch-layer default is
+    // disabled; GO C3's policy default opts into load_pattern at 2%.
     //
     // * `Some(("uniform", rate))` → `LossFactorWarmStartMode::Uniform { rate }`
     // * `Some(("load_pattern", rate))` → `LossFactorWarmStartMode::LoadPattern { rate }`
@@ -847,6 +848,15 @@ fn build_security_screening(
         } else {
             surge_dispatch::SecurityPreseedMethod::None
         },
+        cut_strategy: match policy.scuc_security_cut_strategy {
+            GoC3SecurityCutStrategy::Fixed => surge_dispatch::SecurityCutStrategy::Fixed,
+            GoC3SecurityCutStrategy::Adaptive => surge_dispatch::SecurityCutStrategy::Adaptive,
+        },
+        max_active_cuts: policy.scuc_security_max_active_cuts,
+        cut_retire_after_rounds: policy.scuc_security_cut_retire_after_rounds,
+        targeted_cut_threshold: policy.scuc_security_targeted_cut_threshold,
+        targeted_cut_cap: policy.scuc_security_targeted_cut_cap,
+        near_binding_report: policy.scuc_security_near_binding_report,
     })
 }
 

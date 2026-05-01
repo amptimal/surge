@@ -80,7 +80,10 @@ pub use sensitivity::{
     N2LodfRequest, OtdfRequest, PtdfRequest, compute_lodf, compute_lodf_matrix, compute_lodf_pairs,
     compute_n2_lodf, compute_n2_lodf_batch, compute_otdf, compute_ptdf,
 };
-pub use solver::{PreparedDcStudy, run_dc_analysis, solve_dc, solve_dc_opts, to_pf_solution};
+pub use solver::{
+    PreparedDcStudy, compute_loss_sensitivities_adjoint, run_dc_analysis, solve_dc, solve_dc_opts,
+    to_pf_solution,
+};
 pub use surge_network::{AngleReference, DistributedAngleWeight};
 pub use types::{
     DcAnalysisRequest, DcAnalysisResult, DcError, DcPfOptions, DcPfSolution, LodfMatrixResult,

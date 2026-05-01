@@ -115,14 +115,20 @@ pub(super) fn build_problem(input: ScedProblemBuildInput<'_>) -> ScedProblemBuil
         branch_slack: Some(builders::SoftLimitSlackLayout {
             lower_off: layout.branch_lower_slack,
             upper_off: layout.branch_upper_slack,
+            lower_local_by_row: None,
+            upper_local_by_row: None,
         }),
         flowgate_slack: Some(builders::SoftLimitSlackLayout {
             lower_off: layout.flowgate_lower_slack,
             upper_off: layout.flowgate_upper_slack,
+            lower_local_by_row: None,
+            upper_local_by_row: None,
         }),
         interface_slack: Some(builders::SoftLimitSlackLayout {
             lower_off: layout.interface_lower_slack,
             upper_off: layout.interface_upper_slack,
+            lower_local_by_row: None,
+            upper_local_by_row: None,
         }),
         dl_off: layout.dispatch.dl,
         vbid_off: layout.dispatch.vbid,
@@ -689,18 +695,13 @@ pub(super) fn solve_problem(
 
         let pb_start = problem.n_flow;
         let orig_rhs: Vec<f64> = (0..n_bus).map(|i| prob.row_lower[pb_start + i]).collect();
-        let monitored_branches: Vec<usize> = (0..network.n_branches()).collect();
-        let loss_ptdf = surge_dc::compute_ptdf(
-            network,
-            &surge_dc::PtdfRequest::for_branches(&monitored_branches),
-        )
-        .map_err(|e| ScedError::SolverError(format!("PTDF for loss factors: {e}")))?;
         let mut prev_dloss = vec![0.0_f64; n_bus];
         for loss_iter in 0..spec.max_loss_factor_iters {
             let theta: Vec<f64> = solution.x[0..n_bus].to_vec();
-            dloss_dp_final = surge_opf::advanced::compute_dc_loss_sensitivities(
-                network, &theta, bus_map, &loss_ptdf,
-            );
+            dloss_dp_final = surge_opf::advanced::compute_dc_loss_sensitivities_adjoint(
+                network, &theta, bus_map,
+            )
+            .map_err(|e| ScedError::SolverError(format!("adjoint SCED loss factors: {e}")))?;
             let total_loss = surge_opf::compute_total_dc_losses(network, &theta, bus_map);
 
             let max_delta = dloss_dp_final

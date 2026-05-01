@@ -55,6 +55,19 @@ pub fn compute_dc_loss_sensitivities(
     dloss_dp
 }
 
+/// Compute DC marginal loss sensitivities without building a dense loss PTDF.
+///
+/// This is mathematically equivalent to [`compute_dc_loss_sensitivities`] under
+/// the default single-slack PTDF gauge, but it evaluates the PTDF-vector product
+/// through one sparse adjoint solve per island.
+pub fn compute_dc_loss_sensitivities_adjoint(
+    network: &Network,
+    theta: &[f64],
+    _bus_map: &HashMap<u32, usize>,
+) -> Result<Vec<f64>, surge_dc::DcError> {
+    surge_dc::compute_loss_sensitivities_adjoint(network, theta)
+}
+
 /// Compute total DC losses from branch flows: Σ r × flow².
 pub fn compute_total_dc_losses(
     network: &Network,
@@ -135,5 +148,27 @@ mod tests {
             dloss_dp[1],
             fd
         );
+    }
+
+    #[test]
+    fn adjoint_dc_loss_sensitivities_match_dense_ptdf() {
+        let net = make_3bus_loss_case();
+        let bus_map = net.bus_index_map();
+        let theta = solve_dc(&net).expect("base DC PF").theta;
+        let monitored_branches: Vec<usize> = (0..net.n_branches()).collect();
+        let ptdf = compute_ptdf(&net, &PtdfRequest::for_branches(&monitored_branches))
+            .expect("PTDF for loss sensitivities");
+
+        let dense = compute_dc_loss_sensitivities(&net, &theta, &bus_map, &ptdf);
+        let adjoint = compute_dc_loss_sensitivities_adjoint(&net, &theta, &bus_map)
+            .expect("adjoint loss sensitivities");
+
+        assert_eq!(adjoint.len(), dense.len());
+        for (bus_idx, (&a, &d)) in adjoint.iter().zip(dense.iter()).enumerate() {
+            assert!(
+                (a - d).abs() < 1e-10,
+                "bus {bus_idx} adjoint LF {a} should match dense LF {d}"
+            );
+        }
     }
 }

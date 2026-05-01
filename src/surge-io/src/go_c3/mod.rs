@@ -39,7 +39,7 @@ pub use issues::{GoC3Issue, GoC3IssueSeverity};
 pub use network::{to_network, to_network_with_policy};
 pub use policy::{
     GoC3AcReconcileMode, GoC3CommitmentMode, GoC3ConsumerMode, GoC3Formulation, GoC3Policy,
-    GoC3ScucLossTreatment, GoC3SlackInferenceMode,
+    GoC3ScucLossTreatment, GoC3SecurityCutStrategy, GoC3SlackInferenceMode,
 };
 pub use reserves::apply_reserves;
 pub use types::*;

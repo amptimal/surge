@@ -201,6 +201,38 @@ pub struct GoC3Policy {
     /// cap is irrelevant since no second solve consumes the added cuts.
     pub scuc_security_max_cuts_per_iteration: usize,
 
+    /// Strategy for selecting new cuts from each iterative screening pass.
+    /// `Adaptive` keeps the large early-wave cap, then switches to
+    /// `scuc_security_targeted_cut_cap` once the remaining violations are
+    /// small enough for a last-mile solve.
+    pub scuc_security_cut_strategy: GoC3SecurityCutStrategy,
+
+    /// Optional active-cut cap for iterative SCUC security. When set,
+    /// stale active cuts are retired first after each addition wave.
+    /// Retired pairs may be rediscovered by later screens if they become
+    /// violated again. `None` preserves append-only behavior.
+    pub scuc_security_max_active_cuts: Option<usize>,
+
+    /// Optional activity-aging threshold. Active iterative security cuts
+    /// whose slack and shadow price remain near zero for this many solved
+    /// rounds are retired. Retired pairs remain rediscoverable by later
+    /// screens, so this bounds stale model growth without making a final
+    /// correctness assumption.
+    pub scuc_security_cut_retire_after_rounds: Option<usize>,
+
+    /// Remaining violation count at or below which the adaptive selector
+    /// switches from bulk waves to targeted last-mile waves.
+    pub scuc_security_targeted_cut_threshold: usize,
+
+    /// Last-mile cap used by adaptive cut selection.
+    pub scuc_security_targeted_cut_cap: usize,
+
+    /// Emit the SCUC near-binding contingency diagnostic report. This can
+    /// be very large on contingency-dense networks, so it is disabled by
+    /// default and should be enabled only when that diagnostic payload is
+    /// explicitly needed.
+    pub scuc_security_near_binding_report: bool,
+
     /// Cold-start loss-factor warm-start mode used on the first SCUC
     /// security iteration. Subsequent iterations always warm-start
     /// from the prior iteration's converged `dloss_dp` regardless of
@@ -212,14 +244,13 @@ pub struct GoC3Policy {
     ///   `dloss = rate`, `total_losses = rate × total_load`. Crude but
     ///   free.
     /// * `Some(("load_pattern", rate))` (default `("load_pattern",
-    ///   0.02)`) — per-bus `dloss` from loss-PTDF applied to the load
-    ///   vector; calibrated to `rate × total_load`. Captures topology
-    ///   asymmetry without running DC PF.
-    /// * `Some(("dc_pf", 0.0))` — DC power flow on initial gen
-    ///   setpoints; most accurate cold-start, costs ~ms per period.
-    ///   Falls back to uniform if the resulting loss estimate exceeds
-    ///   5% of load (guards against degenerate PF with only a partial
-    ///   commitment available).
+    ///   0.02)`) — per-bus `dloss` from a synthetic load-pattern DC
+    ///   PF plus sparse adjoint loss sensitivities; calibrated to
+    ///   `rate × total_load`.
+    /// * `Some(("dc_pf", 0.0))` — DC power flow on the hourly load
+    ///   pattern with pmax-balanced generation; uses realized adjoint
+    ///   sensitivities and total losses. Falls back to uniform if the
+    ///   resulting loss estimate exceeds 5% of load.
     ///
     /// Serialized as a 2-tuple `(mode_str, rate)` for convenient
     /// Python-side construction; the rate is ignored for `dc_pf`.
@@ -359,7 +390,7 @@ pub struct GoC3Policy {
     /// iterations when running in `scuc_disable_bus_power_balance`
     /// (system-row) mode. Three modes:
     ///
-    /// * [`GoC3ScucLossTreatment::Static`] (default) — single scalar
+    /// * [`GoC3ScucLossTreatment::Static`] — single scalar
     ///   `rate × total_load` per period, baked into the system-row
     ///   RHS. Same value every security iteration. Cheapest, but
     ///   ignores realized dispatch.
@@ -368,12 +399,12 @@ pub struct GoC3Policy {
     ///   losses per period and feed back as next iteration's RHS.
     ///   Damped with asymmetric upward bias (under-commitment costs
     ///   more than over because AC SCED can't commit new units).
-    /// * [`GoC3ScucLossTreatment::PenaltyFactors`] — full marginal
-    ///   loss factors `(1 − LF_g)` on every injection coefficient,
-    ///   with linearization-point RHS correction. Distributed-load
-    ///   slack reference. Recovers locational signal — a renewable
-    ///   at a high-loss bus contributes effective MW < raw MW, so
-    ///   SCUC commits more thermal up front.
+    /// * [`GoC3ScucLossTreatment::PenaltyFactors`] (default) — full
+    ///   marginal loss factors `(1 − LF_g)` on every injection
+    ///   coefficient, with linearization-point RHS correction.
+    ///   Distributed-load slack reference. Recovers locational
+    ///   signal — a renewable at a high-loss bus contributes effective
+    ///   MW < raw MW, so SCUC commits more thermal up front.
     ///
     /// In per-bus-balance mode (`scuc_disable_bus_power_balance =
     /// false`) this knob is ignored — the existing per-bus
@@ -387,18 +418,33 @@ pub struct GoC3Policy {
 /// policy. Serialized as snake_case strings (`"static"`,
 /// `"scalar_feedback"`, `"penalty_factors"`).
 ///
-/// Default: `ScalarFeedback`. Validated 2026-04-25 on a 617-bus event4
-/// cut (6 scenarios across D1/D2/D3, SW0): scalar feedback beat
-/// `Static` on every scenario, +$1.81 M aggregate validator surplus
-/// (+0.094 %) at near-static wall cost. `PenaltyFactors` came in
-/// second on every scenario; available as an opt-in.
+/// Default: `PenaltyFactors`. The earlier 617-bus A/B (2026-04-25)
+/// that placed `ScalarFeedback` ahead of `PenaltyFactors` was run
+/// before the security-loop fix that ensures sys-row loss feedback is
+/// applied to a SCUC solve even when contingency screening converges
+/// in one iteration. With that fix, PF is the right default: on
+/// 73-bus D1 #303 it closed an open $58 k z-gap to the leaderboard
+/// winner down to $15 k (and to ~$2 k when paired with the winner's
+/// commitment). Re-validate the 617-bus suite when comparing against
+/// the prior log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GoC3ScucLossTreatment {
     Static,
-    #[default]
     ScalarFeedback,
+    #[default]
     PenaltyFactors,
+}
+
+/// Iterative SCUC security cut-selection strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoC3SecurityCutStrategy {
+    /// Historical fixed-size batches.
+    Fixed,
+    /// Large early batches, smaller last-mile batches.
+    #[default]
+    Adaptive,
 }
 
 impl Default for GoC3Policy {
@@ -411,7 +457,7 @@ impl Default for GoC3Policy {
             slack_mode: GoC3SlackInferenceMode::default(),
             allow_branch_switching: false,
             switchable_branch_uids: None,
-            scuc_thermal_penalty_multiplier: 10.0,
+            scuc_thermal_penalty_multiplier: 1.25,
             sced_thermal_penalty_multiplier: 1.0,
             scuc_reserve_penalty_multiplier: 1.0,
             relax_sced_branch_limits_to_dc_slack: false,
@@ -427,6 +473,12 @@ impl Default for GoC3Policy {
             scuc_security_preseed_count_per_period: 0,
             scuc_security_max_iterations: 5,
             scuc_security_max_cuts_per_iteration: 2_500,
+            scuc_security_cut_strategy: GoC3SecurityCutStrategy::default(),
+            scuc_security_max_active_cuts: None,
+            scuc_security_cut_retire_after_rounds: None,
+            scuc_security_targeted_cut_threshold: 50_000,
+            scuc_security_targeted_cut_cap: 50_000,
+            scuc_security_near_binding_report: false,
             scuc_loss_factor_warm_start: Some(("load_pattern".to_string(), 0.02)),
             scuc_loss_factor_max_iterations: Some(0),
             ac_sced_period_concurrency: None,

@@ -29,7 +29,8 @@ use pyo3::types::{PyAny, PyDict};
 use surge_io::go_c3 as io_go_c3;
 use surge_io::go_c3::{
     GoC3AcReconcileMode, GoC3CommitmentMode, GoC3ConsumerMode, GoC3Context, GoC3Formulation,
-    GoC3Policy, GoC3Problem, GoC3ScucLossTreatment, GoC3SlackInferenceMode,
+    GoC3Policy, GoC3Problem, GoC3ScucLossTreatment, GoC3SecurityCutStrategy,
+    GoC3SlackInferenceMode,
 };
 use surge_market::go_c3 as market_go_c3;
 
@@ -383,6 +384,44 @@ fn parse_policy(policy: Option<&Bound<'_, PyDict>>) -> PyResult<GoC3Policy> {
     if let Some(value) = policy.get_item("scuc_security_max_cuts_per_iteration")? {
         if !value.is_none() {
             out.scuc_security_max_cuts_per_iteration = value.extract::<usize>()?;
+        }
+    }
+    if let Some(value) = policy.get_item("scuc_security_cut_strategy")? {
+        if !value.is_none() {
+            out.scuc_security_cut_strategy = match value.extract::<String>()?.as_str() {
+                "fixed" => GoC3SecurityCutStrategy::Fixed,
+                "adaptive" => GoC3SecurityCutStrategy::Adaptive,
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "unknown GoC3Policy.scuc_security_cut_strategy: {other}"
+                    )));
+                }
+            };
+        }
+    }
+    if let Some(value) = policy.get_item("scuc_security_max_active_cuts")? {
+        if !value.is_none() {
+            out.scuc_security_max_active_cuts = Some(value.extract::<usize>()?);
+        }
+    }
+    if let Some(value) = policy.get_item("scuc_security_cut_retire_after_rounds")? {
+        if !value.is_none() {
+            out.scuc_security_cut_retire_after_rounds = Some(value.extract::<usize>()?);
+        }
+    }
+    if let Some(value) = policy.get_item("scuc_security_targeted_cut_threshold")? {
+        if !value.is_none() {
+            out.scuc_security_targeted_cut_threshold = value.extract::<usize>()?;
+        }
+    }
+    if let Some(value) = policy.get_item("scuc_security_targeted_cut_cap")? {
+        if !value.is_none() {
+            out.scuc_security_targeted_cut_cap = value.extract::<usize>()?;
+        }
+    }
+    if let Some(value) = policy.get_item("scuc_security_near_binding_report")? {
+        if !value.is_none() {
+            out.scuc_security_near_binding_report = value.extract::<bool>()?;
         }
     }
     // scuc_loss_factor_warm_start: accepts either None or a 2-tuple

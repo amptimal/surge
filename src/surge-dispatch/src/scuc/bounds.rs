@@ -1167,26 +1167,28 @@ pub(super) fn build_variable_bounds(input: ScucBoundsInput<'_>) -> ScucBoundsSta
                 input.spec.thermal_penalty_curve.marginal_cost_at(0.0) * input.base * dt_h
             };
 
-            let lower_idx = input.layout.flowgate_lower_slack_col(t, row_idx);
-            if allocate_lower {
-                col_lower[lower_idx] = 0.0;
-                col_upper[lower_idx] = f64::INFINITY;
-                col_cost[lower_idx] = slack_cost;
-            } else {
-                col_lower[lower_idx] = 0.0;
-                col_upper[lower_idx] = 0.0;
-                col_cost[lower_idx] = 0.0;
+            if let Some(lower_idx) = input.layout.flowgate_lower_slack_col_opt(t, row_idx) {
+                if allocate_lower {
+                    col_lower[lower_idx] = 0.0;
+                    col_upper[lower_idx] = f64::INFINITY;
+                    col_cost[lower_idx] = slack_cost;
+                } else {
+                    col_lower[lower_idx] = 0.0;
+                    col_upper[lower_idx] = 0.0;
+                    col_cost[lower_idx] = 0.0;
+                }
             }
 
-            let upper_idx = input.layout.flowgate_upper_slack_col(t, row_idx);
-            if allocate_upper {
-                col_lower[upper_idx] = 0.0;
-                col_upper[upper_idx] = f64::INFINITY;
-                col_cost[upper_idx] = slack_cost;
-            } else {
-                col_lower[upper_idx] = 0.0;
-                col_upper[upper_idx] = 0.0;
-                col_cost[upper_idx] = 0.0;
+            if let Some(upper_idx) = input.layout.flowgate_upper_slack_col_opt(t, row_idx) {
+                if allocate_upper {
+                    col_lower[upper_idx] = 0.0;
+                    col_upper[upper_idx] = f64::INFINITY;
+                    col_cost[upper_idx] = slack_cost;
+                } else {
+                    col_lower[upper_idx] = 0.0;
+                    col_upper[upper_idx] = 0.0;
+                    col_cost[upper_idx] = 0.0;
+                }
             }
         }
         t_flowgate_slacks.fetch_add(_t_flowgate_t0.elapsed().as_nanos() as u64, Ordering::Relaxed);

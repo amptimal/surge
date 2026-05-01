@@ -95,7 +95,7 @@ class MarketPolicy:
     # GO C3 scenarios (e.g. 73-bus D3/351 went from ~18s to 60s timeout
     # / no incumbent). Keep the knob available for opt-in use.
     commitment_mip_gap_schedule: tuple[tuple[float, float], ...] | None = None
-    scuc_thermal_penalty_multiplier: float = 10.0
+    scuc_thermal_penalty_multiplier: float = 1.25
     sced_thermal_penalty_multiplier: float = 1.0
     scuc_reserve_penalty_multiplier: float = 1.0
     relax_sced_branch_limits_to_dc_slack: bool = False
@@ -137,9 +137,13 @@ class MarketPolicy:
     # scenarios where iter 1 surfaces many binding pairs the
     # topology-only preseed missed.
     scuc_security_max_cuts_per_iteration: int = 2_500
+    # Informational final-pass contingency diagnostic. Disabled by
+    # default because large GO C3 networks can produce multi-GB reports.
+    scuc_security_near_binding_report: bool = False
     # SCUC loss-factor cold-start warm start for iter 0. Default
-    # ("load_pattern", 0.02): PTDF-weighted per-bus loss sensitivity,
-    # seeded into the MIP pre-solve. Modes: ``("uniform", rate)``,
+    # ("load_pattern", 0.02): per-bus loss sensitivity from a synthetic
+    # load-pattern DC PF plus sparse adjoint loss solve, seeded into the
+    # MIP pre-solve. Modes: ``("uniform", rate)``,
     # ``("load_pattern", rate)``, ``("dc_pf", 0.0)``. Pass None to
     # disable. Subsequent security iterations always warm-start from
     # the prior iteration's converged `dloss_dp` regardless of this.

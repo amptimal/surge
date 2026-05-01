@@ -45,9 +45,9 @@ pub mod switching;
 /// intentionally segregated from the ergonomic crate root.
 pub mod advanced {
     pub use crate::dc::{
-        IslandRefs, compute_dc_loss_sensitivities, decompose_lmp_lossless,
-        decompose_lmp_with_losses, detect_island_refs, find_split_ref_bus, fix_island_theta_bounds,
-        solve_dc_opf_lp, solve_dc_opf_lp_with_runtime, triplets_to_csc,
+        IslandRefs, compute_dc_loss_sensitivities, compute_dc_loss_sensitivities_adjoint,
+        decompose_lmp_lossless, decompose_lmp_with_losses, detect_island_refs, find_split_ref_bus,
+        fix_island_theta_bounds, solve_dc_opf_lp, solve_dc_opf_lp_with_runtime, triplets_to_csc,
     };
 }
 

@@ -16,6 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,8 @@ use surge_network::Network;
 /// process-global — concurrent solves would race, but the runner
 /// is single-threaded per process.
 static SCUC_EXTERNAL_WALL_BITS: AtomicU64 = AtomicU64::new(0);
+static AC_SCED_THREAD_POOLS: OnceLock<Mutex<HashMap<usize, Arc<rayon::ThreadPool>>>> =
+    OnceLock::new();
 use surge_network::market::DispatchableLoad;
 use surge_opf::AcOpfOptions;
 use surge_solution::{ObjectiveBucket, ObjectiveTerm, ObjectiveTermKind, OpfSolution};
@@ -5385,6 +5388,64 @@ fn record_ac_sced_period_into_accumulator(
     );
 }
 
+fn ac_sced_thread_pool(concurrency: usize) -> Result<Arc<rayon::ThreadPool>, ScedError> {
+    let pools = AC_SCED_THREAD_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let guard = pools.lock().map_err(|_| {
+            ScedError::SolverError("AC-SCED parallel: thread-pool cache poisoned".to_string())
+        })?;
+        if let Some(pool) = guard.get(&concurrency) {
+            return Ok(Arc::clone(pool));
+        }
+    }
+
+    let pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(concurrency)
+            .thread_name(|i| format!("ac-sced-{i}"))
+            .build()
+            .map_err(|err| {
+                ScedError::SolverError(format!(
+                    "AC-SCED parallel: failed to build rayon pool ({concurrency} threads): {err}"
+                ))
+            })?,
+    );
+    let mut guard = pools.lock().map_err(|_| {
+        ScedError::SolverError("AC-SCED parallel: thread-pool cache poisoned".to_string())
+    })?;
+    Ok(Arc::clone(guard.entry(concurrency).or_insert(pool)))
+}
+
+fn run_ac_sced_periods_sequential(
+    network: &Network,
+    problem_spec: DispatchProblemSpec<'_>,
+    ac_opf: &AcOpfOptions,
+    ac_opf_runtime: &surge_opf::AcOpfRuntime,
+    security_cuts_enabled: bool,
+    accumulator: &mut SequentialDispatchAccumulator,
+) -> Result<(), ScedError> {
+    let mut prev_solution: Option<OpfSolution> = None;
+    for t in 0..problem_spec.n_periods {
+        let net_t = apply_profiles(network, &problem_spec, t);
+        let period_spec = problem_spec.period(t);
+        let period_context = accumulator.period_context(t, period_spec.next_fixed_commitment());
+        let artifacts = solve_ac_sced_one_period(
+            t,
+            &net_t,
+            problem_spec,
+            ac_opf,
+            ac_opf_runtime,
+            period_context,
+            prev_solution.as_ref(),
+            security_cuts_enabled,
+        )?;
+        let opf_solution = artifacts.opf_solution.clone();
+        record_ac_sced_period_into_accumulator(accumulator, &net_t, artifacts);
+        prev_solution = Some(opf_solution);
+    }
+    Ok(())
+}
+
 fn dispatch_ac_sequential(
     network: &Network,
     problem_spec: DispatchProblemSpec<'_>,
@@ -5392,8 +5453,6 @@ fn dispatch_ac_sequential(
     ac_opf_runtime: &surge_opf::AcOpfRuntime,
 ) -> Result<RawDispatchSolution, ScedError> {
     let n_periods = problem_spec.n_periods;
-    #[allow(unused_assignments)]
-    let mut prev_solution: Option<OpfSolution> = None;
 
     // SCED-AC Benders opt-in: when the runtime contains an
     // `orchestration` block, run the Benders decomposition loop instead
@@ -5496,24 +5555,14 @@ fn dispatch_ac_sequential(
     };
 
     if concurrency <= 1 {
-        for t in 0..n_periods {
-            let net_t = apply_profiles(network, &problem_spec, t);
-            let period_spec = problem_spec.period(t);
-            let period_context = accumulator.period_context(t, period_spec.next_fixed_commitment());
-            let artifacts = solve_ac_sced_one_period(
-                t,
-                &net_t,
-                problem_spec,
-                ac_opf,
-                ac_opf_runtime,
-                period_context,
-                prev_solution.as_ref(),
-                security_cuts_enabled,
-            )?;
-            let opf_solution = artifacts.opf_solution.clone();
-            record_ac_sced_period_into_accumulator(&mut accumulator, &net_t, artifacts);
-            prev_solution = Some(opf_solution);
-        }
+        run_ac_sced_periods_sequential(
+            network,
+            problem_spec,
+            ac_opf,
+            ac_opf_runtime,
+            security_cuts_enabled,
+            &mut accumulator,
+        )?;
     } else {
         // Parallel per-period AC SCED. Pre-stage all per-period inputs so
         // each worker has self-contained data, then collect every period's
@@ -5522,15 +5571,7 @@ fn dispatch_ac_sequential(
         let owned_contexts =
             build_owned_period_contexts_for_parallel(&problem_spec, &anchor_dispatch);
 
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(concurrency)
-            .thread_name(|i| format!("ac-sced-{i}"))
-            .build()
-            .map_err(|err| {
-                ScedError::SolverError(format!(
-                    "AC-SCED parallel: failed to build rayon pool ({concurrency} threads): {err}"
-                ))
-            })?;
+        let pool = ac_sced_thread_pool(concurrency)?;
 
         info!(
             n_periods = n_periods,
@@ -5611,19 +5652,98 @@ fn dispatch_ac_sequential(
                 .map(|(t, e)| format!("period {t}: {e}"))
                 .collect::<Vec<_>>()
                 .join("; ");
-            return Err(ScedError::SolverError(format!(
-                "AC-SCED parallel: {} of {n_periods} period(s) failed: {detail}",
-                failures.len()
-            )));
-        }
+            tracing::warn!(
+                failed_periods = failures.len(),
+                n_periods,
+                detail = %detail,
+                "AC-SCED parallel failed; retrying failed periods sequentially with neighbor warm-starts"
+            );
+            let mut partial_failures: Vec<(usize, ScedError)> = Vec::new();
+            for (t, _) in &failures {
+                let net_t = apply_profiles(network, &problem_spec, *t);
+                let context = owned_contexts[*t].borrow();
+                let prev_solution_owned = if *t > 0 {
+                    artifacts_by_period[*t - 1]
+                        .as_ref()
+                        .map(|(_, artifacts)| artifacts.opf_solution.clone())
+                } else {
+                    None
+                };
+                match solve_ac_sced_one_period(
+                    *t,
+                    &net_t,
+                    problem_spec,
+                    ac_opf,
+                    ac_opf_runtime,
+                    context,
+                    prev_solution_owned.as_ref(),
+                    security_cuts_enabled,
+                ) {
+                    Ok(artifacts) => {
+                        tracing::info!(period = *t, "AC-SCED partial hybrid retry succeeded");
+                        artifacts_by_period[*t] = Some((net_t, artifacts));
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            period = *t,
+                            error = %err,
+                            "AC-SCED partial hybrid retry failed"
+                        );
+                        partial_failures.push((*t, err));
+                    }
+                }
+            }
 
-        // Fold per-period artifacts into the accumulator in chronological
-        // order. Single-threaded — the accumulator's state mutation is
-        // for downstream sequential consumers (DC routing, ramp ledger),
-        // not for AC-SCED feedback.
-        for slot in artifacts_by_period.iter_mut().take(n_periods) {
-            let (net_t, artifacts) = slot.take().expect("missing artifacts for period");
-            record_ac_sced_period_into_accumulator(&mut accumulator, &net_t, artifacts);
+            if partial_failures.is_empty() {
+                tracing::info!(
+                    retried_periods = failures.len(),
+                    "AC-SCED partial hybrid retry recovered all failed periods"
+                );
+                for slot in artifacts_by_period.iter_mut().take(n_periods) {
+                    let (net_t, artifacts) = slot.take().expect("missing artifacts for period");
+                    record_ac_sced_period_into_accumulator(&mut accumulator, &net_t, artifacts);
+                }
+            } else {
+                let partial_detail = partial_failures
+                    .iter()
+                    .map(|(t, e)| format!("period {t}: {e}"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                tracing::warn!(
+                    failed_periods = partial_failures.len(),
+                    detail = %partial_detail,
+                    "AC-SCED partial hybrid retry failed; retrying full sequence sequentially with AC warm-starts"
+                );
+                let mut retry_accumulator =
+                    SequentialDispatchAccumulator::new(network, problem_spec);
+                run_ac_sced_periods_sequential(
+                    network,
+                    problem_spec,
+                    ac_opf,
+                    ac_opf_runtime,
+                    security_cuts_enabled,
+                    &mut retry_accumulator,
+                )
+                .map_err(|retry_error| {
+                    ScedError::SolverError(format!(
+                        "AC-SCED hybrid retry failed after parallel failure: \
+                         parallel {} of {n_periods} period(s) failed: {detail}; \
+                         partial retry failed: {partial_detail}; \
+                         sequential retry error: {retry_error}",
+                        failures.len()
+                    ))
+                })?;
+                accumulator = retry_accumulator;
+            }
+        } else {
+            // Fold per-period artifacts into the accumulator in chronological
+            // order. Single-threaded — the accumulator's state mutation is
+            // for downstream sequential consumers (DC routing, ramp ledger),
+            // not for AC-SCED feedback.
+            for slot in artifacts_by_period.iter_mut().take(n_periods) {
+                let (net_t, artifacts) = slot.take().expect("missing artifacts for period");
+                record_ac_sced_period_into_accumulator(&mut accumulator, &net_t, artifacts);
+            }
         }
     }
 

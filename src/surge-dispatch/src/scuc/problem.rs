@@ -2098,14 +2098,20 @@ pub(super) fn build_problem(input: ScucProblemBuildInput<'_>) -> ScucProblemBuil
             branch_slack: Some(builders::SoftLimitSlackLayout {
                 lower_off: layout.branch_lower_slack,
                 upper_off: layout.branch_upper_slack,
+                lower_local_by_row: None,
+                upper_local_by_row: None,
             }),
             flowgate_slack: Some(builders::SoftLimitSlackLayout {
                 lower_off: layout.flowgate_lower_slack,
                 upper_off: layout.flowgate_upper_slack,
+                lower_local_by_row: Some(&layout.flowgate_lower_slack_local),
+                upper_local_by_row: Some(&layout.flowgate_upper_slack_local),
             }),
             interface_slack: Some(builders::SoftLimitSlackLayout {
                 lower_off: layout.interface_lower_slack,
                 upper_off: layout.interface_upper_slack,
+                lower_local_by_row: None,
+                upper_local_by_row: None,
             }),
             dl_off: offsets.dl,
             vbid_off: offsets.vbid,
@@ -5614,8 +5620,8 @@ pub(super) fn solve_problem(
     }
     // Build the loss-factor setup once per solve, to be shared between
     // the optional pre-MIP warm-start application and the post-MIP
-    // refinement iteration. Costs one O(n_nz) column walk + per-period
-    // loss-PTDF build — shared so the refinement loop doesn't rebuild.
+    // refinement iteration. Costs one O(n_nz) column walk; marginal loss
+    // sensitivities are computed later with sparse adjoint DC solves.
     // Loss factor prep requires per-bus KCL rows to read/adjust RHS
     // values. It is skipped when the caller has disabled per-bus
     // balance — those rows no longer exist in the LP.

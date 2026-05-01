@@ -497,6 +497,12 @@ pub(crate) struct ResolvedSecurityScreening {
     pub hvdc_contingency_indices: Vec<usize>,
     pub preseed_count_per_period: usize,
     pub preseed_method: SecurityPreseedMethod,
+    pub cut_strategy: crate::request::SecurityCutStrategy,
+    pub max_active_cuts: Option<usize>,
+    pub cut_retire_after_rounds: Option<usize>,
+    pub targeted_cut_threshold: usize,
+    pub targeted_cut_cap: usize,
+    pub near_binding_report: bool,
 }
 
 impl ResolvedSecurityScreening {
@@ -515,6 +521,12 @@ impl ResolvedSecurityScreening {
             hvdc_contingency_indices: self.hvdc_contingency_indices,
             preseed_count_per_period: self.preseed_count_per_period,
             preseed_method: self.preseed_method,
+            cut_strategy: self.cut_strategy,
+            max_active_cuts: self.max_active_cuts,
+            cut_retire_after_rounds: self.cut_retire_after_rounds,
+            targeted_cut_threshold: self.targeted_cut_threshold,
+            targeted_cut_cap: self.targeted_cut_cap,
+            near_binding_report: self.near_binding_report,
         }
     }
 }

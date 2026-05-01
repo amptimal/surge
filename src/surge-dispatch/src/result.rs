@@ -160,6 +160,14 @@ pub struct SecurityDispatchMetadata {
     pub iterations: usize,
     /// Total number of contingency cuts added.
     pub n_cuts: usize,
+    /// Number of iterative contingency cuts active in the final model.
+    /// Equals `n_cuts` for append-only runs; smaller when an active-cut
+    /// cap retires stale rows.
+    #[serde(default)]
+    pub active_cuts: usize,
+    /// Number of cuts retired from the active iterative model.
+    #[serde(default)]
+    pub retired_cuts: usize,
     /// Whether the security outer loop ended with no remaining violations.
     pub converged: bool,
     /// Number of branch-outage violations observed in the last screening pass.
@@ -198,12 +206,11 @@ pub struct SecurityDispatchMetadata {
     pub per_iteration: Vec<SecurityIterationReport>,
     /// Final-pass post-contingency flow report for `(period, ctg, mon)`
     /// pairs whose post-contingency flow on the converged dispatch
-    /// reaches a near-binding threshold (default 0.7 of the monitored
-    /// branch's emergency rating). Lets the dashboard show
+    /// reaches the near-binding threshold (currently 0.95 of the monitored
+    /// branch's emergency rating). Lets diagnostics show
     /// contingencies that are *close* to the limit but didn't trigger
-    /// a hard violation, without exploding the report with every
-    /// (k × l × period) tuple. Empty for non-iterative paths or when
-    /// near-binding screening is disabled.
+    /// a hard violation. Empty for non-iterative paths or when
+    /// near-binding reporting is disabled.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub near_binding_contingencies: Vec<NearBindingContingency>,
 }
@@ -303,6 +310,12 @@ pub struct SecurityIterationReport {
     /// Cuts added by this iteration (branch + HVDC, capped by
     /// `max_cuts_per_iteration`). `0` on the converged iteration.
     pub new_cuts: usize,
+    /// Active iterative cuts retained after this iteration.
+    #[serde(default)]
+    pub active_cuts: usize,
+    /// Cuts retired from the active set during this iteration.
+    #[serde(default)]
+    pub retired_cuts: usize,
     /// MIP trace for the inner SCUC solve — same shape as
     /// `DispatchDiagnostics::commitment_mip_trace`, but scoped to this
     /// iteration rather than the final one.

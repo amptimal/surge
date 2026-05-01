@@ -34,6 +34,12 @@ pub(crate) fn resolve_security(
             hvdc_contingency_indices: Vec::new(),
             preseed_count_per_period: security.preseed_count_per_period,
             preseed_method: security.preseed_method,
+            cut_strategy: security.cut_strategy,
+            max_active_cuts: security.max_active_cuts,
+            cut_retire_after_rounds: security.cut_retire_after_rounds,
+            targeted_cut_threshold: security.targeted_cut_threshold,
+            targeted_cut_cap: security.targeted_cut_cap,
+            near_binding_report: security.near_binding_report,
         }));
     };
 
@@ -86,5 +92,11 @@ pub(crate) fn resolve_security(
         hvdc_contingency_indices,
         preseed_count_per_period: security.preseed_count_per_period,
         preseed_method: security.preseed_method,
+        cut_strategy: security.cut_strategy,
+        max_active_cuts: security.max_active_cuts,
+        cut_retire_after_rounds: security.cut_retire_after_rounds,
+        targeted_cut_threshold: security.targeted_cut_threshold,
+        targeted_cut_cap: security.targeted_cut_cap,
+        near_binding_report: security.near_binding_report,
     }))
 }

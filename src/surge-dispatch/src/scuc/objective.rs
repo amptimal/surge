@@ -468,8 +468,12 @@ pub(super) fn build_objective(input: ScucObjectiveInput<'_>) -> Vec<f64> {
             } else {
                 thermal_penalty
             };
-            col_cost[input.layout.flowgate_lower_slack_col(t, row_idx)] = slack_penalty;
-            col_cost[input.layout.flowgate_upper_slack_col(t, row_idx)] = slack_penalty;
+            if let Some(col) = input.layout.flowgate_lower_slack_col_opt(t, row_idx) {
+                col_cost[col] = slack_penalty;
+            }
+            if let Some(col) = input.layout.flowgate_upper_slack_col_opt(t, row_idx) {
+                col_cost[col] = slack_penalty;
+            }
         }
         for row_idx in 0..input.n_iface_rows {
             col_cost[input.layout.interface_lower_slack_col(t, row_idx)] = thermal_penalty;
