@@ -4827,3 +4827,65 @@ pub(super) fn build_explicit_contingency_objective_rows(
         },
     )
 }
+
+// ----- peak-demand-charge rows ---------------------------------------------
+//
+// One row per `(charge, period_idx)` pair. The auxiliary `peak_mw` column
+// (allocated at `peak_demand_aux_base + i` for charge `i`) is bounded
+// below by the resource's per-period dispatch:
+//
+//     peak_mw[i] − pg[t][gen_idx[i]] ≥ 0    for t ∈ period_indices[i]
+//
+// Combined with the linear objective `charge_per_mw × peak_mw[i]`
+// (set by `build_variable_bounds`), this enforces an exact
+// coincident-peak demand charge: the LP minimizes the maximum dispatch
+// across the flagged periods at the cost rate, which is the canonical
+// $/MW transmission charge formulation (4-CP and friends). The MW base
+// applies to both sides of the inequality, so the row is identical
+// whether the LP works in MW or pu.
+
+pub(super) fn peak_demand_charge_rows_count(spec: &DispatchProblemSpec<'_>) -> usize {
+    spec.peak_demand_charges
+        .iter()
+        .map(|c| c.period_indices.len())
+        .sum()
+}
+
+pub(super) struct ScucPeakDemandChargeRowsInput<'a> {
+    pub spec: &'a DispatchProblemSpec<'a>,
+    pub layout: &'a ScucLayout,
+    pub peak_demand_aux_base: usize,
+    pub row_base: usize,
+}
+
+pub(super) fn build_peak_demand_charge_rows(input: ScucPeakDemandChargeRowsInput<'_>) -> LpBlock {
+    let n_rows = peak_demand_charge_rows_count(input.spec);
+    if n_rows == 0 {
+        return LpBlock::empty();
+    }
+    let mut block = LpBlock {
+        triplets: Vec::with_capacity(2 * n_rows),
+        row_lower: vec![0.0; n_rows],
+        row_upper: vec![BIG_M; n_rows],
+    };
+    let mut local_row = 0usize;
+    for (charge_idx, charge) in input.spec.peak_demand_charges.iter().enumerate() {
+        let aux_col = input.peak_demand_aux_base + charge_idx;
+        for &period in &charge.period_indices {
+            let row = input.row_base + local_row;
+            push_triplet(&mut block.triplets, row, aux_col, 1.0);
+            push_triplet(
+                &mut block.triplets,
+                row,
+                input.layout.pg_col(period, charge.gen_index),
+                -1.0,
+            );
+            // peak_mw − pg[t] ≥ 0
+            block.row_lower[local_row] = 0.0;
+            block.row_upper[local_row] = BIG_M;
+            local_row += 1;
+        }
+    }
+    debug_assert_eq!(local_row, n_rows);
+    block
+}

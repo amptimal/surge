@@ -159,6 +159,12 @@ pub(super) struct ScucBoundsInput<'a> {
     pub cut_slack_lower_base: usize,
     pub cut_slack_upper_base: usize,
     pub n_cut_rows: usize,
+    /// Base column index for the peak-demand-charge auxiliary variables.
+    /// Each `peak_demand_charge` entry gets one non-negative column
+    /// with no upper bound and a linear cost coefficient equal to
+    /// `charge_per_mw`. See [`super::plan::ScucVariablePlan`]. The
+    /// number of columns is `input.spec.peak_demand_charges.len()`.
+    pub peak_demand_aux_base: usize,
     pub base: f64,
     pub col_cost: &'a mut [f64],
 }
@@ -1853,6 +1859,23 @@ pub(super) fn build_variable_bounds(input: ScucBoundsInput<'_>) -> ScucBoundsSta
         col_lower[upper_col] = 0.0;
         col_upper[upper_col] = f64::INFINITY;
         input.col_cost[upper_col] = 0.0;
+    }
+
+    // Peak-demand-charge auxiliary variables. One non-negative column
+    // per entry in `spec.peak_demand_charges`. The objective term is
+    // priced at `charge_per_mw` (in MW), scaled by `base` so the LP's
+    // pu-space objective recovers the dollar coefficient. The
+    // constraint rows `peak_mw ≥ pg[t]` are emitted alongside the
+    // existing energy-window family in the rows builder.
+    for (i, charge) in input.spec.peak_demand_charges.iter().enumerate() {
+        let col = input.peak_demand_aux_base + i;
+        col_lower[col] = 0.0;
+        col_upper[col] = f64::INFINITY;
+        // The LP works in pu power; bus dispatch columns (`pg_col`)
+        // hold MW/base. Multiplying the dollar-per-MW rate by `base`
+        // makes the cost term `charge_per_mw * peak_mw` come out in
+        // dollars regardless of the per-unit base.
+        input.col_cost[col] = charge.charge_per_mw * input.base;
     }
 
     // When commitment states are already fixed by initial conditions, min-up/min-down

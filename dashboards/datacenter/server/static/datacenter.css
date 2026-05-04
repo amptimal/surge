@@ -1,0 +1,341 @@
+/* Datacenter-specific styles layered on top of the shared dashboard.css. */
+
+.config-section {
+  border-top: 1px solid var(--border-sub);
+  padding: 0.6rem 0;
+}
+.config-section > summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 0.5rem;
+  padding: 0;
+}
+.config-section > summary::-webkit-details-marker { display: none; }
+.config-section > summary::after {
+  content: "▾";
+  margin-left: 0.4rem;
+  color: var(--text-dim);
+  font-size: 0.7rem;
+  transition: transform 0.15s ease;
+}
+.config-section[open] > summary::after { transform: rotate(180deg); }
+
+.thermal-summary {
+  gap: 0.5rem;
+}
+.thermal-summary input[type="checkbox"] {
+  margin: 0;
+}
+.thermal-fields .field-stack { gap: 0.35rem; }
+
+.tier-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin: 0.4rem 0;
+}
+.tier-row {
+  border: 1px solid var(--border-sub);
+  border-radius: 6px;
+  padding: 0.5rem;
+  background: var(--bg-elevated);
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.72rem;
+}
+.tier-row .tier-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.4rem;
+}
+.tier-row input[type="text"],
+.tier-row input[type="number"] {
+  flex: 1;
+  font-size: 0.7rem;
+  padding: 3px 6px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+}
+.tier-row .tier-head input[type="text"] { font-weight: 600; color: var(--purple); }
+.tier-remove {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 0.9rem;
+  padding: 0 0.3rem;
+}
+.tier-remove:hover { color: var(--red); }
+
+.as-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin: 0.4rem 0;
+}
+.as-row {
+  display: grid;
+  grid-template-columns: auto 1fr 64px;
+  gap: 0.3rem;
+  align-items: center;
+  font-size: 0.72rem;
+}
+.as-row input[type="checkbox"] { margin: 0; }
+.as-row .as-name {
+  font-weight: 600;
+  color: var(--text);
+}
+.as-row input[type="number"] {
+  padding: 3px 6px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+  font-size: 0.7rem;
+}
+
+.field-note {
+  font-size: 0.65rem;
+  color: var(--text-dim);
+  padding: 0.4rem 0 0;
+  line-height: 1.4;
+}
+
+.tab-bar {
+  display: flex;
+  gap: 0.4rem;
+  padding: 0.6rem 1rem 0;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+}
+.tab-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-weight: 500;
+  padding: 0.55rem 0.95rem;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  transition: color 0.12s ease, border-color 0.12s ease;
+}
+.tab-btn:hover { color: var(--text); }
+.tab-btn.active {
+  color: var(--purple);
+  border-bottom-color: var(--purple);
+}
+
+.tab-pane {
+  display: none;
+  flex-direction: column;
+  gap: 1rem;
+  padding: 1rem 1.4rem 1.5rem;
+  height: calc(100vh - var(--nav-h) - var(--bar-h) - 38px);
+  overflow-y: auto;
+}
+.tab-pane.active { display: flex; }
+
+.chart-area {
+  background: var(--bg-card);
+  border: 1px solid var(--border-sub);
+  border-radius: var(--panel-radius);
+  padding: 0.6rem 0.8rem;
+  min-height: 280px;
+  flex-shrink: 0;
+}
+
+.pl-breakdown {
+  background: var(--bg-card);
+  border: 1px solid var(--border-sub);
+  border-radius: var(--panel-radius);
+  padding: 0.8rem 1rem;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.6rem;
+}
+.pl-cell {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-sub);
+  border-radius: 6px;
+  padding: 0.55rem 0.7rem;
+}
+.pl-cell-label {
+  font-size: 0.62rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 0.2rem;
+}
+.pl-cell-value {
+  font-family: var(--mono);
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--text);
+}
+.pl-cell-value.pos { color: var(--emerald); }
+.pl-cell-value.neg { color: var(--red); }
+.pl-cell-sub {
+  font-size: 0.62rem;
+  color: var(--text-dim);
+  margin-top: 0.18rem;
+  font-family: var(--mono);
+}
+
+/* Per-asset color stripes on the dispatch breakdown so cards
+ * visually echo their stacked-area trace. */
+.pl-cell.load-served    { border-top: 2px solid #ffffff; }
+.pl-cell.load-tier      { border-top: 2px solid #e2e8f0; }
+.pl-cell.load-curtailed { border-top: 2px solid #f87171; }
+.pl-cell.load-potential { border-top: 2px solid #5eead4; }
+.pl-cell.pl-system {
+  background: linear-gradient(180deg, var(--purple-dim2) 0%, var(--bg-elevated) 100%);
+  border-top: 2px solid var(--purple);
+}
+
+.field-row.readout-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.field-readout {
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--purple);
+  text-align: right;
+  letter-spacing: 0.04em;
+}
+
+/* Dispatch tab — chart fills remaining vertical space, summary grid
+ * takes only what its rows need. LMP forecast lives on the Forecasts
+ * tab; the dispatch tab stays focused on the supply / demand stack. */
+.tab-pane[data-tab="dispatch"] {
+  gap: 0.6rem;
+}
+.tab-pane[data-tab="dispatch"] #chart-dispatch {
+  flex: 1 1 auto;
+  min-height: 380px;
+}
+.tab-pane[data-tab="dispatch"] #dispatch-summary {
+  flex: 0 0 auto;
+}
+.pl-cell.asset.solar     { border-top: 2px solid #facc15; }
+.pl-cell.asset.wind      { border-top: 2px solid #22d3ee; }
+.pl-cell.asset.nuclear   { border-top: 2px solid #60a5fa; }
+.pl-cell.asset.bess      { border-top: 2px solid #34d399; }
+.pl-cell.asset.fuel-cell { border-top: 2px solid #e879f9; }
+.pl-cell.asset.gas-ct    { border-top: 2px solid #fb923c; }
+.pl-cell.asset.diesel    { border-top: 2px solid #f87171; }
+.pl-cell.asset.grid-imp  { border-top: 2px solid #cbd5e1; }
+.pl-cell.asset.grid-exp  { border-top: 2px solid #e2e8f0; }
+.pl-cell.load-served .pl-cell-value { color: #ffffff; font-size: 1.05rem; }
+
+.forecast-edit-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+.forecast-title {
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  padding: 0 0.4rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.forecast-sub {
+  font-size: 0.62rem;
+  font-weight: 400;
+  color: var(--text-dim);
+  letter-spacing: 0.02em;
+}
+.chart-strip {
+  flex: 0 0 80px;
+  min-height: 80px;
+  padding: 0.3rem 0.4rem;
+}
+/* Editable SVG-chart panel — drag the per-period dots to reshape
+ * the forecast directly. */
+.editable-chart {
+  position: relative;
+  min-height: 220px;
+  height: 220px;
+  padding: 0.4rem 0.6rem 0.2rem;
+}
+.cf-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(72px, 1fr));
+  gap: 0.3rem 0.4rem;
+  background: var(--bg-card);
+  border: 1px solid var(--border-sub);
+  border-radius: var(--panel-radius);
+  padding: 0.6rem 0.8rem;
+}
+.cf-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+}
+.cf-cell-label {
+  font-family: var(--mono);
+  font-size: 0.62rem;
+  color: var(--text-muted);
+  text-align: center;
+  letter-spacing: 0.04em;
+}
+.cf-cell input {
+  width: 100%;
+  padding: 4px 6px;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  text-align: center;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+  outline: none;
+}
+.cf-cell input:focus {
+  border-color: var(--purple);
+}
+.cf-cell.muted input {
+  color: var(--text-dim);
+}
+
+.inline-toggle {
+  flex-direction: row !important;
+  justify-content: space-between !important;
+}
+.inline-toggle input[type="checkbox"] {
+  margin: 0;
+  accent-color: var(--purple);
+}
+
+.ghost-btn-sm {
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  padding: 0.4rem 0.6rem;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: color 0.12s ease, border-color 0.12s ease;
+}
+.ghost-btn-sm:hover {
+  color: var(--purple);
+  border-color: var(--purple);
+}

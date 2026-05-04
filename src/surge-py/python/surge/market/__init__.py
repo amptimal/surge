@@ -78,6 +78,7 @@ from .reconcile import (
     thermal_slack_summary,
 )
 from .reserves import (
+    ECRS,
     NON_SPINNING,
     PRODUCT_BY_ID,
     RAMP_DOWN_OFF,
@@ -130,6 +131,7 @@ __all__ = [
     "REG_UP",
     "REG_DOWN",
     "SPINNING",
+    "ECRS",
     "NON_SPINNING",
     "RAMP_UP_ON",
     "RAMP_UP_OFF",

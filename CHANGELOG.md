@@ -6,6 +6,44 @@ this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows Semantic Versioning intent.
 
+## [0.1.9] — 2026-05-04
+
+New **Datacenter Operator** market — behind-the-meter SCUC for a
+microgridded datacenter — and three SCUC primitives that support it.
+
+### Added (`markets`, `dashboards`)
+
+- `markets/datacenter/` + `dashboards/datacenter/`: optimises
+  commitment + dispatch + AS awards across IT-load tiers (must-serve +
+  curtailable VOLL), BESS, solar, wind, fuel cell, gas CT, diesel,
+  optional must-run nuclear, and (optional) coincident-peak
+  transmission charges, against an exogenous LMP forecast and AS price
+  forecasts. Forecasts and asset specs editable live; re-solves in
+  seconds.
+
+### Added (`surge-dispatch`)
+
+- `peak_demand_charges`: SCUC primitive for coincident-peak demand
+  charges (e.g. ERCOT 4-CP). Adds an auxiliary `peak_mw` variable
+  bounded below by the resource's dispatch on the flagged periods,
+  with a linear `charge_per_mw × peak_mw` objective term.
+
+### Added (`surge.market`)
+
+- `generator_dispatch_bounds`: pin a resource's per-period dispatch
+  window directly in MW (set `p_min == p_max` for must-take fixed
+  output).
+- `must_run_units`: force `u[t]=1` for the listed resources. Paired
+  with `generator_dispatch_bounds` this removes both commitment and
+  dispatch freedom — the canonical pin for baseload nuclear /
+  must-take PPAs / fixed-output IPP contracts.
+- `ECRS` canonical reserve product.
+
+### Changed (defaults)
+
+- `markets.go_c3` default `lp_solver` flipped from `gurobi` → `highs`.
+  Default runs no longer require a commercial license.
+
 ## [0.1.8] — 2026-05-01
 
 `surge-dispatch` SCUC security loop: lower memory, faster solves, and

@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Datacenter · Surge Dashboard</title>
+<link rel="icon" type="image/svg+xml" href="static/favicon.svg?v=20260504">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="static/dashboard.css">
+<link rel="stylesheet" href="static/datacenter.css">
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+<script src="static/editable-chart.js"></script>
+</head>
+<body>
+
+<nav class="top-nav">
+  <a class="nav-logo" href="/">
+    <svg width="22" height="22" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+      <circle cx="256" cy="256" r="180" fill="none" stroke="#a78bfa" stroke-width="32"/>
+      <path d="M 60 380 Q 140 380, 200 200 Q 256 80, 312 200 Q 372 380, 452 380" fill="none" stroke="#a78bfa" stroke-width="32" stroke-linecap="round"/>
+    </svg>
+    <span class="nav-logo-name">AMPTIMAL</span>
+  </a>
+  <div class="nav-section-label">🏭 Datacenter Operator</div>
+  <div class="nav-right">
+    <a class="nav-link" href="/">← All dashboards</a>
+  </div>
+</nav>
+
+<div class="solve-bar">
+  <div class="mode-group">
+    <label>Commitment</label>
+    <select id="sel-commitment-mode">
+      <option value="optimize">Optimize (SCUC)</option>
+      <option value="fixed">Fixed</option>
+    </select>
+  </div>
+  <div class="mode-group">
+    <label>Coupling</label>
+    <select id="sel-period-coupling">
+      <option value="coupled">Coupled</option>
+      <option value="sequential">Sequential</option>
+    </select>
+  </div>
+  <div class="mode-group">
+    <label>Solver</label>
+    <select id="sel-lp-solver">
+      <option value="highs">HiGHS</option>
+      <option value="gurobi">Gurobi</option>
+    </select>
+  </div>
+  <div class="solve-bar-right">
+    <div id="solve-status" class="solve-status">ready</div>
+    <div class="net-rev-wrap">
+      <div class="net-rev-label">Net P&amp;L</div>
+      <div id="net-pnl" class="net-rev">—</div>
+      <div class="net-rev-sub" id="net-pnl-sub"></div>
+    </div>
+    <button id="btn-solve" class="solve-btn">▶ Solve</button>
+  </div>
+</div>
+
+<div id="error-banner" class="error-banner" role="alert" aria-live="polite">
+  <span class="error-banner-icon">⚠</span>
+  <span id="error-banner-text"></span>
+  <button id="error-banner-close" class="error-banner-close" aria-label="Dismiss">×</button>
+</div>
+
+<main class="shell">
+
+  <!-- LEFT SIDEBAR — config -->
+  <aside id="sidebar" class="sidebar">
+    <button class="sidebar-toggle" id="sidebar-toggle" title="Collapse sidebar" aria-label="Toggle configuration sidebar">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="15 18 9 12 15 6"></polyline>
+      </svg>
+    </button>
+    <div class="sidebar-collapsed-label">CONFIG</div>
+    <div class="sidebar-content">
+      <div class="sidebar-head">
+        <h2>Configure</h2>
+        <div class="panel-note" id="periods-display">—</div>
+      </div>
+      <div class="sidebar-body">
+
+        <!-- Time horizon -->
+        <details class="config-section" open>
+          <summary class="section-label">Time horizon</summary>
+          <div class="field-stack">
+            <label class="field-row"><span class="field-label">Horizon <em>h</em></span><input type="number" id="inp-horizon-h" min="1" max="744" step="1"></label>
+            <label class="field-row"><span class="field-label">Resolution <em>min</em></span>
+              <select id="sel-resolution-min">
+                <option value="5">5</option>
+                <option value="15">15</option>
+                <option value="30">30</option>
+                <option value="60">60</option>
+              </select>
+            </label>
+            <div class="field-row readout-row">
+              <span class="field-label">Periods</span>
+              <span id="readout-periods" class="field-readout">—</span>
+            </div>
+          </div>
+        </details>
+
+        <!-- Site -->
+        <details class="config-section" open>
+          <summary class="section-label">Site</summary>
+          <div class="field-stack">
+            <label class="field-row"><span class="field-label">POI limit <em>MW</em></span><input type="number" id="inp-poi-limit" min="0" step="10"></label>
+            <label class="field-row"><span class="field-label">Natural gas <em>$/MMBtu</em></span><input type="number" id="inp-gas-flat" min="0" step="0.25" title="Broadcasts to every period — shape per-period gas price on the forecasts tab"></label>
+          </div>
+        </details>
+
+        <!-- IT Load -->
+        <details class="config-section" open>
+          <summary class="section-label">IT Load</summary>
+          <div class="field-stack">
+            <label class="field-row"><span class="field-label">Must-serve baseline <em>MW</em></span><input type="number" id="inp-must-serve-base" min="0" step="10"></label>
+          </div>
+          <div class="tier-list" id="tier-list"></div>
+          <button class="ghost-btn-sm" type="button" id="btn-add-tier">+ Add curtailable tier</button>
+        </details>
+
+        <!-- BESS -->
+        <details class="config-section">
+          <summary class="section-label">BESS</summary>
+          <div class="field-stack">
+            <label class="field-row"><span class="field-label">Charge <em>MW</em></span><input type="number" id="inp-bess-charge" min="0" step="10"></label>
+            <label class="field-row"><span class="field-label">Discharge <em>MW</em></span><input type="number" id="inp-bess-discharge" min="0" step="10"></label>
+            <label class="field-row"><span class="field-label">Energy <em>MWh</em></span><input type="number" id="inp-bess-energy" min="0" step="10"></label>
+            <label class="field-row"><span class="field-label">η charge <em>%</em></span><input type="number" id="inp-bess-eff-charge" min="10" max="100" step="0.1"></label>
+            <label class="field-row"><span class="field-label">η discharge <em>%</em></span><input type="number" id="inp-bess-eff-discharge" min="10" max="100" step="0.1"></label>
+            <label class="field-row"><span class="field-label">SOC min <em>%</em></span><input type="number" id="inp-bess-soc-min" min="0" max="100" step="0.5"></label>
+            <label class="field-row"><span class="field-label">SOC max <em>%</em></span><input type="number" id="inp-bess-soc-max" min="0" max="100" step="0.5"></label>
+            <label class="field-row"><span class="field-label">Initial SOC <em>MWh</em></span><input type="number" id="inp-bess-soc-init" min="0" step="10"></label>
+            <label class="field-row"><span class="field-label">Degradation <em>$/MWh</em></span><input type="number" id="inp-bess-deg" min="0" step="0.5"></label>
+            <label class="field-row"><span class="field-label">Daily cycle limit</span><input type="number" id="inp-bess-cycle" min="0" step="0.5" placeholder="off"></label>
+          </div>
+        </details>
+
+        <!-- Solar -->
+        <details class="config-section">
+          <summary class="section-label">Solar PV</summary>
+          <div class="field-stack">
+            <label class="field-row"><span class="field-label">Nameplate <em>MW</em></span><input type="number" id="inp-solar-mw" min="0" step="10"></label>
+            <label class="field-row" title="Solar's negative marginal cost — each MWh generated credits the operator by this amount; each MWh curtailed forgoes it."><span class="field-label">REC value <em>$/MWh</em></span><input type="number" id="inp-solar-rec" min="0" step="1"></label>
+          </div>
+        </details>
+
+        <!-- Wind -->
+        <details class="config-section">
+          <summary class="section-label">Wind</summary>
+          <div class="field-stack">
+            <label class="field-row"><span class="field-label">Nameplate <em>MW</em></span><input type="number" id="inp-wind-mw" min="0" step="10"></label>
+            <label class="field-row" title="Wind's negative marginal cost — each MWh generated credits the operator by this amount; each MWh curtailed forgoes it."><span class="field-label">REC value <em>$/MWh</em></span><input type="number" id="inp-wind-rec" min="0" step="1"></label>
+          </div>
+        </details>
+
+        <!-- Fuel cell -->
+        <details class="config-section thermal-section" data-thermal="fuel_cell">
+          <summary class="section-label thermal-summary">
+            <span>Fuel Cell</span>
+            <input type="checkbox" class="thermal-enable" data-thermal="fuel_cell">
+          </summary>
+          <div class="thermal-fields"></div>
+        </details>
+
+        <!-- Gas CT -->
+        <details class="config-section thermal-section" data-thermal="gas_ct">
+          <summary class="section-label thermal-summary">
+            <span>Gas CT</span>
+            <input type="checkbox" class="thermal-enable" data-thermal="gas_ct">
+          </summary>
+          <div class="thermal-fields"></div>
+        </details>
+
+        <!-- Diesel -->
+        <details class="config-section thermal-section" data-thermal="diesel">
+          <summary class="section-label thermal-summary">
+            <span>Diesel</span>
+            <input type="checkbox" class="thermal-enable" data-thermal="diesel">
+          </summary>
+          <div class="thermal-fields"></div>
+        </details>
+
+        <!-- Nuclear -->
+        <details class="config-section thermal-section" data-thermal="nuclear">
+          <summary class="section-label thermal-summary">
+            <span>Nuclear</span>
+            <input type="checkbox" class="thermal-enable" data-thermal="nuclear">
+          </summary>
+          <div class="thermal-fields"></div>
+        </details>
+
+        <!-- Ancillary services -->
+        <details class="config-section">
+          <summary class="section-label">Ancillary Services</summary>
+          <div class="as-list" id="as-list"></div>
+        </details>
+
+        <!-- 4-CP -->
+        <details class="config-section">
+          <summary class="section-label">4-CP Demand Charge</summary>
+          <div class="field-stack">
+            <label class="field-row inline-toggle">
+              <span class="field-label">Enabled</span>
+              <input type="checkbox" id="inp-4cp-enabled">
+            </label>
+            <label class="field-row"><span class="field-label">$/MW-yr (annualised)</span><input type="number" id="inp-4cp-rate" min="0" step="500"></label>
+            <label class="field-row"><span class="field-label">Expected intervals/yr</span><input type="number" id="inp-4cp-expected" min="1" step="1"></label>
+          </div>
+          <div class="field-note">Click bars below the LMP chart to flag periods you expect to fall on a 4-CP interval.</div>
+        </details>
+
+        <!-- Solve options -->
+        <details class="config-section">
+          <summary class="section-label">Solver</summary>
+          <div class="field-stack">
+            <label class="field-row"><span class="field-label">MIP gap</span><input type="number" id="inp-mip-gap" min="0" step="0.0001"></label>
+            <label class="field-row"><span class="field-label">Time limit <em>s</em></span><input type="number" id="inp-mip-time" min="1" step="10"></label>
+            <label class="field-row inline-toggle"><span class="field-label">Firm AS headroom</span><input type="checkbox" id="inp-enforce-reserve"></label>
+          </div>
+        </details>
+
+      </div>
+    </div>
+  </aside>
+
+  <!-- MAIN PANE -->
+  <section class="main">
+    <nav class="tab-bar" role="tablist">
+      <button class="tab-btn active" data-tab="dispatch" role="tab">Dispatch stack</button>
+      <button class="tab-btn" data-tab="forecasts" role="tab">Forecasts</button>
+      <button class="tab-btn" data-tab="pl" role="tab">Resource P&amp;L</button>
+      <button class="tab-btn" data-tab="bess" role="tab">Storage &amp; AS</button>
+      <button class="tab-btn" data-tab="fourcp" role="tab">4-CP exposure</button>
+      <button class="tab-btn" data-tab="commitment" role="tab">Commitment</button>
+    </nav>
+
+    <div class="tab-pane active" data-tab="dispatch">
+      <div id="chart-dispatch" class="chart-area"></div>
+      <div id="dispatch-summary" class="pl-breakdown"></div>
+    </div>
+    <div class="tab-pane" data-tab="pl">
+      <div id="chart-pl-progression" class="chart-area"></div>
+      <div id="chart-pl" class="chart-area"></div>
+      <div id="pl-breakdown" class="pl-breakdown"></div>
+    </div>
+    <div class="tab-pane" data-tab="bess">
+      <div id="chart-soc" class="chart-area"></div>
+      <div id="chart-as" class="chart-area"></div>
+    </div>
+    <div class="tab-pane" data-tab="forecasts">
+      <div class="forecast-edit-section">
+        <div class="forecast-title">Prices <span class="forecast-sub">$/MWh · click a pill to edit</span></div>
+        <div class="price-tabs" id="price-tabs"></div>
+        <div id="chart-prices" class="chart-area editable-chart"></div>
+      </div>
+      <div class="forecast-edit-section">
+        <div class="forecast-title">4-CP day flags <span class="forecast-sub">click a bar to toggle a period</span></div>
+        <div id="chart-4cp-flags" class="chart-area chart-strip"></div>
+      </div>
+      <div class="forecast-edit-section">
+        <div class="forecast-title">Natural gas price <span class="forecast-sub">$/MMBtu · feeds gas CT + fuel cell</span></div>
+        <div id="chart-gas-price" class="chart-area editable-chart"></div>
+      </div>
+      <div class="forecast-edit-section">
+        <div class="forecast-title">IT load <span class="forecast-sub">MW · click a pill to edit</span></div>
+        <div class="price-tabs" id="load-tabs"></div>
+        <div id="chart-loads" class="chart-area editable-chart"></div>
+      </div>
+      <div class="forecast-edit-section">
+        <div class="forecast-title">Renewable capacity factors <span class="forecast-sub">click a pill to edit</span></div>
+        <div class="price-tabs" id="renewable-tabs"></div>
+        <div id="chart-renewables" class="chart-area editable-chart"></div>
+      </div>
+    </div>
+    <div class="tab-pane" data-tab="fourcp">
+      <div id="chart-4cp" class="chart-area"></div>
+      <div id="fourcp-summary" class="pl-breakdown"></div>
+    </div>
+    <div class="tab-pane" data-tab="commitment">
+      <div id="chart-commitment" class="chart-area"></div>
+    </div>
+
+  </section>
+</main>
+
+<script src="static/dashboard.js"></script>
+</body>
+</html>

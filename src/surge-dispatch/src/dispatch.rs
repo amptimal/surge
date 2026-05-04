@@ -475,6 +475,29 @@ pub struct IndexedEnergyWindowLimit {
     pub max_energy_mwh: Option<f64>,
 }
 
+/// Indexed (post-resource-resolution) form of [`crate::request::PeakDemandCharge`].
+///
+/// One auxiliary `peak_mw ≥ 0` column is allocated per entry, with rows
+/// `peak_mw ≥ pg[t]` for every `t ∈ period_indices` and a linear
+/// objective term `charge_per_mw * peak_mw`. Used by the SCUC builder
+/// to encode coincident-peak demand charges (e.g. ERCOT 4-CP).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexedPeakDemandCharge {
+    /// Caller-supplied identifier — surfaced in diagnostics.
+    pub name: String,
+    /// Index into the in-service generator list whose dispatch is
+    /// being capped by the peak variable. Storage and dispatchable
+    /// loads aren't supported (use the generator's `pmin = -charge`
+    /// pattern for storage; dispatchable-load peak charges can be
+    /// added if there's a use case).
+    pub gen_index: usize,
+    /// Period indices over which the peak is taken. Validated to be
+    /// in `0..n_periods`, non-empty, and de-duplicated.
+    pub period_indices: Vec<usize>,
+    /// Linear cost coefficient (`$ / MW`) applied to the peak variable.
+    pub charge_per_mw: f64,
+}
+
 // ---------------------------------------------------------------------------
 // RawDispatchSolution — the unified result type
 // ---------------------------------------------------------------------------
@@ -3706,6 +3729,7 @@ fn validate_dispatch_request_inputs(
     )?;
     validate_startup_window_limits(&problem_spec, n_in_service_gens)?;
     validate_energy_window_limits(&problem_spec, n_in_service_gens)?;
+    validate_peak_demand_charges(&problem_spec, n_in_service_gens)?;
     validate_commitment_constraints(&problem_spec, n_in_service_gens)?;
     validate_storage_inputs(network, &problem_spec)?;
     Ok(())
@@ -4838,6 +4862,41 @@ fn validate_startup_window_limits(
             return Err(ScedError::InvalidInput(format!(
                 "startup_window_limit for generator {} references end period {} outside n_periods {}",
                 limit.gen_index, limit.end_period_idx, problem_spec.n_periods
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_peak_demand_charges(
+    problem_spec: &DispatchProblemSpec<'_>,
+    n_in_service_gens: usize,
+) -> Result<(), ScedError> {
+    for charge in problem_spec.peak_demand_charges {
+        if charge.gen_index >= n_in_service_gens {
+            return Err(ScedError::InvalidInput(format!(
+                "peak_demand_charge {:?} references generator {} outside in-service generator count {}",
+                charge.name, charge.gen_index, n_in_service_gens
+            )));
+        }
+        if charge.period_indices.is_empty() {
+            return Err(ScedError::InvalidInput(format!(
+                "peak_demand_charge {:?} has empty period_indices",
+                charge.name
+            )));
+        }
+        for &period in &charge.period_indices {
+            if period >= problem_spec.n_periods {
+                return Err(ScedError::InvalidInput(format!(
+                    "peak_demand_charge {:?} references period {} outside n_periods {}",
+                    charge.name, period, problem_spec.n_periods
+                )));
+            }
+        }
+        if !charge.charge_per_mw.is_finite() {
+            return Err(ScedError::InvalidInput(format!(
+                "peak_demand_charge {:?} has non-finite charge_per_mw {}",
+                charge.name, charge.charge_per_mw
             )));
         }
     }
@@ -6365,6 +6424,7 @@ mod tests {
             startup_window_limits: normalized.input.startup_window_limits.clone(),
             energy_window_limits: normalized.input.energy_window_limits.clone(),
             commitment_constraints: normalized.input.commitment_constraints.clone(),
+            peak_demand_charges: normalized.input.peak_demand_charges.clone(),
             ph_head_curves: normalized.input.ph_head_curves.clone(),
             ph_mode_constraints: normalized.input.ph_mode_constraints.clone(),
             ac_generator_warm_start_p_mw: normalized.input.ac_generator_warm_start_p_mw.clone(),
@@ -6545,6 +6605,16 @@ mod tests {
                     end_period_idx: limit.end_period_idx,
                     min_energy_mwh: limit.min_energy_mwh,
                     max_energy_mwh: limit.max_energy_mwh,
+                })
+                .collect(),
+            peak_demand_charges: input
+                .peak_demand_charges
+                .into_iter()
+                .map(|charge| crate::request::PeakDemandCharge {
+                    name: charge.name,
+                    resource_id: test_local_resource_id(charge.gen_index),
+                    period_indices: charge.period_indices,
+                    charge_per_mw: charge.charge_per_mw,
                 })
                 .collect(),
             commitment_constraints: input

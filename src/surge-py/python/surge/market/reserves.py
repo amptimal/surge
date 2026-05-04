@@ -133,6 +133,22 @@ NON_SPINNING = ReserveProductDef(
     deploy_secs=600,
 )
 
+#: ERCOT Contingency Reserve Service. A 10-minute online contingency
+#: reserve product introduced by ERCOT in 2023, slotted between
+#: synchronous responsive reserve (RRS / ``SPINNING``) and offline
+#: non-spin (``NON_SPINNING``). Reg-up, RRS, and ECRS share online
+#: headroom; ECRS clears against contingency demand curves under RTC+B.
+ECRS = ReserveProductDef(
+    id="ecrs",
+    name="Contingency Reserve Service",
+    direction="Up",
+    qualification="Synchronized",
+    energy_coupling="Headroom",
+    shared_limit_products=("reg_up", "syn"),
+    balance_products=("reg_up", "syn"),
+    deploy_secs=600,
+)
+
 RAMP_UP_ON = ReserveProductDef(
     id="ramp_up_on",
     name="Ramping Reserve Up (Online)",
@@ -201,6 +217,7 @@ STANDARD_ACTIVE_PRODUCTS: tuple[ReserveProductDef, ...] = (
     REG_UP,
     REG_DOWN,
     SPINNING,
+    ECRS,
     NON_SPINNING,
     RAMP_UP_ON,
     RAMP_UP_OFF,

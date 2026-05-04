@@ -1,0 +1,8 @@
+{
+  "name": "datacenter",
+  "title": "Datacenter Operator",
+  "description": "Behind-the-meter SCUC for a microgridded datacenter — IT load tiers, BESS, solar, wind, fuel cell, gas CT, diesel, optional nuclear, ancillary services co-optimised, and 4-CP transmission demand charges. Edit forecasts and asset specs live; re-solve in seconds.",
+  "route": "datacenter",
+  "icon": "🏭",
+  "tag": "operator"
+}
