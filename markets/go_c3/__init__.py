@@ -17,7 +17,7 @@ Example::
     report = solve(
         problem_path=Path("scenario.json"),
         workdir=Path("out/run-1"),
-        policy=GoC3Policy(lp_solver="gurobi", ac_reconcile_mode="ac_dispatch"),
+        policy=GoC3Policy(lp_solver="highs", ac_reconcile_mode="ac_dispatch"),
     )
     print(report["status"], report["artifacts"]["solution"])
 

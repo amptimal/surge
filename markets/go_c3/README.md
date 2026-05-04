@@ -20,7 +20,7 @@ report = solve(
     policy=GoC3Policy(
         formulation="dc",
         ac_reconcile_mode="ac_dispatch",
-        lp_solver="gurobi",
+        lp_solver="highs",
         nlp_solver="ipopt",
     ),
 )

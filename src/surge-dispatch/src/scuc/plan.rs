@@ -119,6 +119,14 @@ pub(super) struct ScucVariablePlan<'a> {
     pub cut_slack_lower_base: usize,
     pub cut_slack_upper_base: usize,
     pub n_cut_rows: usize,
+    /// Base column index for the peak-demand-charge auxiliary variables.
+    /// One non-negative `peak_mw` column per entry in
+    /// `spec.peak_demand_charges`, with bounds `[0, +∞)` and a linear
+    /// objective coefficient equal to `charge_per_mw`. Encodes
+    /// coincident-peak demand charges (e.g. ERCOT 4-CP) without
+    /// distorting the per-period energy/cost trade-off.
+    pub peak_demand_aux_base: usize,
+    pub n_peak_demand_aux: usize,
     pub n_var: usize,
     pub dr_activation_loads: Vec<ScucDrActivationLoad>,
     pub dr_rebound_loads: Vec<ScucDrReboundLoad>,
@@ -217,6 +225,7 @@ pub(super) struct ScucColumnBuildInput<'spec, 'input> {
     pub cut_slack_lower_base: usize,
     pub cut_slack_upper_base: usize,
     pub n_cut_rows: usize,
+    pub peak_demand_aux_base: usize,
     pub base: f64,
 }
 
@@ -428,6 +437,7 @@ pub(super) fn build_problem_plan<'a>(input: ScucProblemPlanInput<'a, 'a>) -> Scu
         cut_slack_lower_base: variable.cut_slack_lower_base,
         cut_slack_upper_base: variable.cut_slack_upper_base,
         n_cut_rows: variable.n_cut_rows,
+        peak_demand_aux_base: variable.peak_demand_aux_base,
         base,
     });
     tracing::info!(
@@ -584,6 +594,7 @@ pub(super) fn build_column_state(input: ScucColumnBuildInput<'_, '_>) -> ScucCol
         cut_slack_lower_base: input.cut_slack_lower_base,
         cut_slack_upper_base: input.cut_slack_upper_base,
         n_cut_rows: input.n_cut_rows,
+        peak_demand_aux_base: input.peak_demand_aux_base,
         base: input.base,
         col_cost: &mut col_cost,
     });
@@ -1048,7 +1059,9 @@ pub(super) fn build_variable_plan<'spec>(
     let n_cut_rows = spec.contingency_cuts.len();
     let cut_slack_lower_base = post_explicit_ctg_end;
     let cut_slack_upper_base = cut_slack_lower_base + n_cut_rows;
-    let n_var = cut_slack_upper_base + n_cut_rows;
+    let peak_demand_aux_base = cut_slack_upper_base + n_cut_rows;
+    let n_peak_demand_aux = spec.peak_demand_charges.len();
+    let n_var = peak_demand_aux_base + n_peak_demand_aux;
 
     let explicit_contingency = if n_cases == 0 {
         None
@@ -1239,6 +1252,8 @@ pub(super) fn build_variable_plan<'spec>(
         cut_slack_lower_base,
         cut_slack_upper_base,
         n_cut_rows,
+        peak_demand_aux_base,
+        n_peak_demand_aux,
         n_var,
         dr_activation_loads,
         dr_rebound_loads,

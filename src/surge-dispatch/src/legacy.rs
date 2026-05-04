@@ -15,7 +15,7 @@ use crate::config::emissions::{CarbonPrice, EmissionProfile, MustRunUnits, TieLi
 use crate::config::frequency::FrequencySecurityOptions;
 use crate::dispatch::{
     CommitmentMode, Horizon, IndexedCommitmentConstraint, IndexedDispatchInitialState,
-    IndexedEnergyWindowLimit, IndexedPhHeadCurve, IndexedPhModeConstraint,
+    IndexedEnergyWindowLimit, IndexedPeakDemandCharge, IndexedPhHeadCurve, IndexedPhModeConstraint,
     IndexedStartupWindowLimit,
 };
 use crate::hvdc::HvdcDispatchLink;
@@ -108,6 +108,7 @@ pub(crate) struct DispatchOptions {
     pub startup_window_limits: Vec<IndexedStartupWindowLimit>,
     pub energy_window_limits: Vec<IndexedEnergyWindowLimit>,
     pub commitment_constraints: Vec<IndexedCommitmentConstraint>,
+    pub peak_demand_charges: Vec<IndexedPeakDemandCharge>,
     pub ph_head_curves: Vec<IndexedPhHeadCurve>,
     pub ph_mode_constraints: Vec<IndexedPhModeConstraint>,
     pub ac_generator_warm_start_p_mw: HashMap<usize, Vec<f64>>,
@@ -195,6 +196,7 @@ impl Default for DispatchOptions {
             startup_window_limits: Vec::new(),
             energy_window_limits: Vec::new(),
             commitment_constraints: Vec::new(),
+            peak_demand_charges: Vec::new(),
             ph_head_curves: Vec::new(),
             ph_mode_constraints: Vec::new(),
             ac_generator_warm_start_p_mw: HashMap::new(),

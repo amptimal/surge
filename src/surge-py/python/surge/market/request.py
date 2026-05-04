@@ -244,18 +244,50 @@ class DispatchRequestBuilder:
         self,
         *,
         resource: str,
-        values_mw: Sequence[float],
+        derate_factors: Sequence[float],
     ) -> "DispatchRequestBuilder":
-        """Add a per-resource MW cap profile (generator availability)."""
+        """Add a per-resource availability profile (0-1 fraction of pmax)."""
         self._require_periods("generator_derate")
-        caps = [float(v) for v in values_mw]
-        if len(caps) != self._periods:
+        factors = [float(v) for v in derate_factors]
+        if len(factors) != self._periods:
             raise ValueError(
-                f"generator_derate({resource!r}): values_mw has {len(caps)} "
+                f"generator_derate({resource!r}): derate_factors has {len(factors)} "
                 f"entries, expected {self._periods}"
             )
-        entry = {"resource_id": str(resource), "values_mw": caps}
+        entry = {"resource_id": str(resource), "derate_factors": factors}
         self._profiles.setdefault("generator_derates", {}).setdefault(
+            "profiles", []
+        ).append(entry)
+        return self
+
+    def generator_dispatch_bounds(
+        self,
+        *,
+        resource: str,
+        p_min_mw: Sequence[float],
+        p_max_mw: Sequence[float],
+    ) -> "DispatchRequestBuilder":
+        """Pin a resource's per-period dispatch window directly in MW.
+
+        Use for must-take / fixed-output resources (e.g. baseload nuclear)
+        where both the floor and ceiling are determined by the availability
+        schedule rather than the LP. Setting ``p_min_mw == p_max_mw`` pins
+        output exactly.
+        """
+        self._require_periods("generator_dispatch_bounds")
+        pmin = [float(v) for v in p_min_mw]
+        pmax = [float(v) for v in p_max_mw]
+        if len(pmin) != self._periods or len(pmax) != self._periods:
+            raise ValueError(
+                f"generator_dispatch_bounds({resource!r}): p_min_mw / p_max_mw "
+                f"must have {self._periods} entries"
+            )
+        entry = {
+            "resource_id": str(resource),
+            "p_min_mw": pmin,
+            "p_max_mw": pmax,
+        }
+        self._profiles.setdefault("generator_dispatch_bounds", {}).setdefault(
             "profiles", []
         ).append(entry)
         return self
@@ -314,6 +346,56 @@ class DispatchRequestBuilder:
         self._market["generator_reserve_offer_schedules"] = [
             s.to_request_dict(self._periods) for s in schedules
         ]
+        return self
+
+    def must_run_units(
+        self, resource_ids: Sequence[str]
+    ) -> "DispatchRequestBuilder":
+        """Pin the listed generators to be committed in every period.
+
+        The SCUC MIP forces ``u[t]=1`` for each listed resource at all
+        periods, so when paired with ``generator_dispatch_bounds`` that
+        also pins ``p_min == p_max``, the LP has no commitment or
+        dispatch freedom on the resource — exactly what's needed for
+        baseload nuclear / must-take PPAs / fixed-output IPP contracts.
+        """
+        ids = [str(r) for r in resource_ids]
+        self._market["must_run_units"] = {"resource_ids": ids}
+        return self
+
+    def peak_demand_charges(
+        self,
+        charges: Sequence[Mapping[str, Any]],
+    ) -> "DispatchRequestBuilder":
+        """Per-resource coincident-peak demand charges.
+
+        Each entry is a mapping with the keys ``name`` (caller-supplied
+        identifier), ``resource_id`` (the generator whose MW dispatch
+        feeds the peak — typically a virtual grid-import generator at
+        the POI bus), ``period_indices`` (list of integer period
+        indices to include in the peak set, e.g. the four expected
+        4-CP intervals), and ``charge_per_mw`` (linear cost coefficient
+        in ``$ / MW`` applied to the auxiliary peak variable).
+
+        The SCUC LP allocates one auxiliary ``peak_mw[i] ≥ 0`` column
+        per entry, emits ``peak_mw[i] ≥ pg[t][resource]`` for each
+        ``t ∈ period_indices``, and adds ``charge_per_mw * peak_mw[i]``
+        to the objective. This is the canonical formulation for
+        transmission demand charges (4-CP, NYISO ICAP coincident peak,
+        industrial tariff demand charges) — it minimises the *maximum*
+        dispatch across the flagged periods at the given $/MW rate.
+        """
+        rendered: list[dict[str, Any]] = []
+        for entry in charges:
+            rendered.append(
+                {
+                    "name": str(entry["name"]),
+                    "resource_id": str(entry["resource_id"]),
+                    "period_indices": [int(p) for p in entry["period_indices"]],
+                    "charge_per_mw": float(entry["charge_per_mw"]),
+                }
+            )
+        self._market["peak_demand_charges"] = rendered
         return self
 
     def storage_reserve_soc_impacts(

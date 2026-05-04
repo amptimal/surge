@@ -164,6 +164,39 @@ pub struct ResourceEnergyWindowLimit {
     pub max_energy_mwh: Option<f64>,
 }
 
+/// Peak-demand (coincident-peak) charge applied to a resource's MW dispatch
+/// across a list of flagged periods.
+///
+/// Adds an auxiliary variable `peak_mw ≥ 0` with the constraints
+/// `peak_mw ≥ pg[t]` for each `t ∈ period_indices`, plus the linear
+/// objective term `charge_per_mw * peak_mw`. This is the canonical
+/// formulation for transmission demand charges (e.g. ERCOT's 4-CP),
+/// industrial-tariff coincident-peak penalties, or any other "the
+/// utility charges you per MW of your maximum metered load during
+/// these intervals" policy.
+///
+/// For typical 4-CP modeling: pass the four expected interval indices
+/// across the horizon and `charge_per_mw` equal to the annual
+/// transmission rate divided by 4 (or scaled to the simulation's
+/// expected occurrence frequency).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PeakDemandCharge {
+    /// Identifier — used in result extraction and diagnostic output.
+    pub name: String,
+    /// Resource whose MW dispatch is bounded above by `peak_mw`. Must
+    /// resolve to an in-service generator (for now — dispatchable-load
+    /// peak charges can be added when there's a use case).
+    pub resource_id: String,
+    /// Period indices to include in the peak set. Must be in
+    /// `0..n_periods` and non-empty; duplicates are tolerated.
+    pub period_indices: Vec<usize>,
+    /// Linear cost coefficient on the auxiliary peak variable
+    /// (`$ / MW`). Typically set to the annualized $/MW transmission
+    /// rate scaled by the simulation's expected fraction of the year.
+    pub charge_per_mw: f64,
+}
+
 /// Generator cost approximation controls shared across dispatch formulations.
 ///
 /// Explicit piecewise-linear curves always use their native epiograph
@@ -239,6 +272,12 @@ pub struct DispatchMarket {
     pub startup_window_limits: Vec<ResourceStartupWindowLimit>,
     pub energy_window_limits: Vec<ResourceEnergyWindowLimit>,
     pub commitment_constraints: Vec<CommitmentConstraint>,
+    /// Peak (coincident-peak) demand charges applied during SCUC. Each
+    /// entry adds one auxiliary `peak_mw ≥ 0` variable, `peak_mw ≥
+    /// pg[t]` rows on the listed periods, and a linear objective term
+    /// `charge_per_mw * peak_mw`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peak_demand_charges: Vec<PeakDemandCharge>,
 }
 
 impl Default for DispatchMarket {
@@ -273,6 +312,7 @@ impl Default for DispatchMarket {
             startup_window_limits: Vec::new(),
             energy_window_limits: Vec::new(),
             commitment_constraints: Vec::new(),
+            peak_demand_charges: Vec::new(),
         }
     }
 }

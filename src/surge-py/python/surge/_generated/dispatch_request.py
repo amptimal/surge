@@ -329,6 +329,24 @@ class MustRunUnits(TypedDict, total=False):
     resource_ids: list[str]
 
 
+class PeakDemandCharge(TypedDict):
+    """Peak-demand (coincident-peak) charge applied to a resource's MW dispatch
+across a list of flagged periods.  Adds an auxiliary variable `peak_mw ≥ 0`
+with the constraints `peak_mw ≥ pg[t]` for each `t ∈ period_indices`, plus the
+linear objective term `charge_per_mw * peak_mw`. This is the canonical
+formulation for transmission demand charges (e.g. ERCOT's 4-CP), industrial-
+tariff coincident-peak penalties, or any other "the utility charges you per MW
+of your maximum metered load during these intervals" policy.  For typical 4-CP
+modeling: pass the four expected interval indices across the horizon and
+`charge_per_mw` equal to the annual transmission rate divided by 4 (or scaled
+to the simulation's expected occurrence frequency).
+"""
+    name: str
+    resource_id: str
+    period_indices: list[int]
+    charge_per_mw: float
+
+
 class PowerBalancePenalty(TypedDict, total=False):
     """Stepped penalty curves for power balance slack variables."""
     curtailment: list[tuple[float, float]]
@@ -429,6 +447,7 @@ class DispatchMarket(TypedDict, total=False):
     startup_window_limits: list[ResourceStartupWindowLimit]
     energy_window_limits: list[ResourceEnergyWindowLimit]
     commitment_constraints: list[CommitmentConstraint]
+    peak_demand_charges: list[PeakDemandCharge]
 
 
 class EnergyWindowPolicy(TypedDict, total=False):
@@ -497,12 +516,17 @@ class LossFactorWarmStartMode_Variant3(TypedDict):
 LossFactorWarmStartMode = Union[LossFactorWarmStartMode_Variant0, LossFactorWarmStartMode_Variant1, LossFactorWarmStartMode_Variant2, LossFactorWarmStartMode_Variant3]
 
 
+# How the SCUC system-balance row represents transmission losses across security iterations.
+ScucLossTreatment = Literal['static', 'scalar_feedback', 'penalty_factors']
+
+
 class LossFactorPolicy(TypedDict, total=False):
     """Iterative DC loss-factor policy."""
     enabled: bool
     max_iterations: int
     tolerance: float
     warm_start_mode: LossFactorWarmStartMode
+    scuc_loss_treatment: ScucLossTreatment
 
 
 class PhHeadCurve(TypedDict):
@@ -541,6 +565,10 @@ class HvdcLinkRef(TypedDict):
     link_id: str
 
 
+# Strategy for selecting iterative security cuts after each screening pass.
+SecurityCutStrategy = Literal['fixed', 'adaptive']
+
+
 # How N-1 contingencies are embedded into DC time-coupled dispatch.
 SecurityEmbedding = Literal['explicit_contingencies', 'iterative_screening']
 
@@ -559,6 +587,11 @@ class SecurityPolicy(TypedDict, total=False):
     hvdc_contingencies: list[HvdcLinkRef]
     preseed_count_per_period: int
     preseed_method: SecurityPreseedMethod
+    cut_strategy: SecurityCutStrategy
+    max_active_cuts: Union[int, None]
+    cut_retire_after_rounds: Union[int, None]
+    targeted_cut_threshold: int
+    targeted_cut_cap: int
     near_binding_report: bool
 
 
@@ -825,6 +858,7 @@ __all__ = [
     'LossFactorPolicy',
     'LossFactorWarmStartMode',
     'MustRunUnits',
+    'PeakDemandCharge',
     'PhHeadCurve',
     'PhModeConstraint',
     'PowerBalancePenalty',
@@ -845,6 +879,8 @@ __all__ = [
     'ScedAcBendersCut',
     'ScedAcBendersRunParams',
     'ScedAcBendersRuntime',
+    'ScucLossTreatment',
+    'SecurityCutStrategy',
     'SecurityEmbedding',
     'SecurityPolicy',
     'SecurityPreseedMethod',

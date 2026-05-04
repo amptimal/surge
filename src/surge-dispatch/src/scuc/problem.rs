@@ -1127,6 +1127,14 @@ fn describe_scuc_column(
             idx - variable_plan.energy_window_slack_base
         );
     }
+    if idx >= variable_plan.peak_demand_aux_base
+        && idx < variable_plan.peak_demand_aux_base + variable_plan.n_peak_demand_aux
+    {
+        return format!(
+            "peak_demand_charge_{}",
+            idx - variable_plan.peak_demand_aux_base
+        );
+    }
     if let Some(explicit_ctg) = variable_plan.explicit_contingency.as_ref() {
         if idx >= explicit_ctg.case_penalty_base && idx < explicit_ctg.worst_case_base {
             return format!("ctg_penalty_{}", idx - explicit_ctg.case_penalty_base);
@@ -1647,7 +1655,10 @@ fn count_rows(input: &ScucProblemBuildInput<'_>) -> (usize, usize, usize, usize,
         // after all the classical post-hourly row families. Each cut
         // emits a single post-contingency flow constraint with its
         // own σ⁻/σ⁺ slack pair (allocated in `ScucVariablePlan`).
-        + spec.contingency_cuts.len();
+        + spec.contingency_cuts.len()
+        // Peak-demand-charge rows: one per (charge, period_idx) pair,
+        // each enforcing `peak_mw − pg[t] ≥ 0`.
+        + super::rows::peak_demand_charge_rows_count(spec);
     (rows_per_hour, n_row, n_branch_flow, n_fg_rows, n_flow)
 }
 
@@ -3126,6 +3137,32 @@ pub(super) fn build_problem(input: ScucProblemBuildInput<'_>) -> ScucProblemBuil
         }
     }
     current_row += n_cut_rows;
+
+    // Peak-demand-charge rows. One inequality per (charge, period_idx) pair
+    // anchoring the auxiliary `peak_mw[i] ≥ pg[t][gen_idx[i]]` constraint.
+    // Empty when `spec.peak_demand_charges` is empty (the common case).
+    let n_peak_demand_rows = super::rows::peak_demand_charge_rows_count(spec);
+    if n_peak_demand_rows > 0 {
+        super::rows::build_peak_demand_charge_rows(super::rows::ScucPeakDemandChargeRowsInput {
+            spec,
+            layout,
+            peak_demand_aux_base: variable_plan.peak_demand_aux_base,
+            row_base: current_row,
+        })
+        .write_into_preallocated(
+            &mut triplets,
+            &mut row_lower,
+            &mut row_upper,
+            current_row,
+        );
+        for (i, label) in row_labels[current_row..current_row + n_peak_demand_rows]
+            .iter_mut()
+            .enumerate()
+        {
+            *label = format!("peak_demand_charge_{i}");
+        }
+        current_row += n_peak_demand_rows;
+    }
 
     assert_eq!(
         current_row, n_row,

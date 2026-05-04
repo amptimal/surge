@@ -121,6 +121,7 @@ pub(crate) fn build_input(
         startup_window_limits: Vec::new(),
         energy_window_limits: Vec::new(),
         commitment_constraints: Vec::new(),
+        peak_demand_charges: Vec::new(),
         ph_head_curves: Vec::new(),
         ph_mode_constraints: Vec::new(),
         ac_generator_warm_start_p_mw: HashMap::new(),
@@ -1029,6 +1030,23 @@ pub(crate) fn build_input(
             min_energy_mwh: limit.min_energy_mwh,
             max_energy_mwh: limit.max_energy_mwh,
         });
+    }
+
+    for charge in &request.market.peak_demand_charges {
+        let Some(local_idx) = catalog.resolve_local_gen(charge.resource_id.as_str()) else {
+            return Err(ScedError::InvalidInput(format!(
+                "peak_demand_charges references unknown resource {}",
+                charge.resource_id
+            )));
+        };
+        input
+            .peak_demand_charges
+            .push(crate::dispatch::IndexedPeakDemandCharge {
+                name: charge.name.clone(),
+                gen_index: local_idx,
+                period_indices: charge.period_indices.clone(),
+                charge_per_mw: charge.charge_per_mw,
+            });
     }
 
     let mut seen_ph_head_curves = HashSet::new();

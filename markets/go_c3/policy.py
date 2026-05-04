@@ -58,7 +58,7 @@ class GoC3Policy:
     scuc_only: bool = False
 
     # ── solver selection
-    lp_solver: str = "gurobi"
+    lp_solver: str = "highs"
     nlp_solver: str = "ipopt"
 
     # ── commitment MIP tuning
